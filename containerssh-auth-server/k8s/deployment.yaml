@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: containerssh-auth-server
+  namespace: containerssh
+  labels:
+    app: containerssh-auth-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: containerssh-auth-server
+  template:
+    metadata:
+      labels:
+        app: containerssh-auth-server
+    spec:
+      containers:
+      - name: auth-server
+        image: containerssh-auth-server:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        # 애플리케이션 설정
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: containerssh-auth-config
+              key: log_level
+        
+        # 데이터베이스 연결 설정
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: containerssh-auth-config
+              key: db_host
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: containerssh-auth-config
+              key: db_port
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: containerssh-auth-config
+              key: db_name
+        - name: DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-user
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-password
+        
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 60  # MySQL 시작 대기
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30  # MySQL 준비 대기
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      initContainers:
+      - name: wait-for-mysql
+        image: busybox:1.35
+        command: ['sh', '-c']
+        args:
+        - |
+          echo "Waiting for MySQL to be ready..."
+          until nc -z mysql-service 3306; do
+            echo "MySQL is not ready yet. Sleeping for 5 seconds..."
+            sleep 5
+          done
+          echo "MySQL is ready!"

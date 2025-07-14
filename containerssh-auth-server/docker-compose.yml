@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: containerssh-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword123
+      MYSQL_DATABASE: containerssh_auth
+      MYSQL_USER: containerssh
+      MYSQL_PASSWORD: containerssh123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./k8s/mysql-configmap.yaml:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "containerssh", "-pcontainerssh123"]
+      timeout: 20s
+      retries: 10
+      interval: 10s
+    networks:
+      - containerssh-net
+
+  auth-server:
+    build: .
+    container_name: containerssh-auth-server
+    environment:
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: containerssh_auth
+      DB_USER: containerssh
+      DB_PASSWORD: containerssh123
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./app:/app/app
+    networks:
+      - containerssh-net
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  adminer:
+    image: adminer:4.8.1
+    container_name: containerssh-adminer
+    environment:
+      ADMINER_DEFAULT_SERVER: mysql
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql
+    networks:
+      - containerssh-net
+
+volumes:
+  mysql_data:
+
+networks:
+  containerssh-net:
+    driver: bridge

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: containerssh-auth-config
+  namespace: containerssh
+data:
+  # 애플리케이션 설정
+  log_level: "INFO"
+  
+  # 데이터베이스 설정
+  db_host: "mysql-service"
+  db_port: "3306"
+  db_name: "containerssh_auth"

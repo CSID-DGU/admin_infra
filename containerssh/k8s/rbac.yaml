@@ -1,0 +1,33 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: containerssh
+  name: containerssh-role
+  labels:
+    app: containerssh
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: containerssh-rolebinding
+  namespace: containerssh
+  labels:
+    app: containerssh
+subjects:
+- kind: ServiceAccount
+  name: containerssh
+  namespace: containerssh
+roleRef:
+  kind: Role
+  name: containerssh-role
+  apiGroup: rbac.authorization.k8s.io

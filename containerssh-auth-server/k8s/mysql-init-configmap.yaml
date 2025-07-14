@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-init-config
+  namespace: containerssh
+data:
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS containerssh_auth;
+    USE containerssh_auth;
+    
+    -- 사용자 테이블 생성
+    CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        is_active TINYINT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_username (username),
+        INDEX idx_active (is_active)
+    );
+    
+    -- 사용자 공개키 테이블 생성
+    CREATE TABLE IF NOT EXISTS user_keys (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) NOT NULL,
+        public_key TEXT NOT NULL,
+        key_name VARCHAR(100),
+        is_active TINYINT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_username (username),
+        INDEX idx_active (is_active)
+    );
+    
+    -- 기본 사용자 추가 (새로운 해시된 패스워드)
+    INSERT IGNORE INTO users (username, password_hash) VALUES 
+    ('admin', ''),
+    ('user1', '');
+    
+    -- 주의: 아래의 공개키들은 예시입니다. 실제 공개키로 교체하세요!
+    INSERT IGNORE INTO user_keys (username, public_key, key_name) VALUES 
+    ('admin', 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7vbqajDhj...', 'admin-key-REPLACE-ME'),
+    ('user1', 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD8xyz123...', 'user1-key-REPLACE-ME');
+    
+    FLUSH PRIVILEGES;

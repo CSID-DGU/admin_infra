@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  namespace: containerssh
+data:
+  mysql.cnf: |
+    [mysql]
+    default-character-set=utf8mb4
+    
+    [mysqld]
+    character-set-server=utf8mb4
+    collation-server=utf8mb4_unicode_ci
+    default-storage-engine=INNODB
+    max_connections=200
+    innodb_buffer_pool_size=128M
+    innodb_log_file_size=64M
+    
+    # 보안 설정
+    bind-address=0.0.0.0
+    skip-name-resolve
+  
+  init.sql: |
+    CREATE DATABASE IF NOT EXISTS containerssh_auth;
+    USE containerssh_auth;
+    
+    -- 사용자 테이블 생성
+    CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        is_active TINYINT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_username (username),
+        INDEX idx_active (is_active)
+    );
+    
+    -- 사용자 공개키 테이블 생성
+    CREATE TABLE IF NOT EXISTS user_keys (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(50) NOT NULL,
+        public_key TEXT NOT NULL,
+        key_name VARCHAR(100),
+        is_active TINYINT DEFAULT 1,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_username (username),
+        INDEX idx_active (is_active)
+    );
+    
+    -- 기본 사용자 추가 (패스워드: secret)
+    INSERT IGNORE INTO users (username, password_hash) VALUES 
+    ('admin', '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW'),
+    ('user1', '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxn96p36WQoeG6Lruj3vjPGga31lW');
+    
+    -- 기본 공개키 추가 (예시 - 실제 키로 교체 필요)
+    INSERT IGNORE INTO user_keys (username, public_key, key_name) VALUES 
+    ('admin', 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC7vbqajDhj...', 'admin-key'),
+    ('user1', 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD8xyz123...', 'user1-key');
+    
+    FLUSH PRIVILEGES;
