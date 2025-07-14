@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: containerssh
+  namespace: {{ .Values.config.namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: containerssh
+  template:
+    metadata:
+      labels:
+        app: containerssh
+    spec:
+      serviceAccountName: containerssh
+      containers:
+        - name: containerssh
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - containerPort: 2222
+              name: ssh
+              protocol: TCP
+          volumeMounts:
+            - name: hostkey
+              mountPath: /etc/containerssh/host.key
+              subPath: host.key
+              readOnly: true
+            - name: config
+              mountPath: /etc/containerssh/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+      volumes:
+        - name: hostkey
+          secret:
+            secretName: containerssh-hostkey
+        - name: config
+          configMap:
+            name: containerssh-config
+

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: containerssh-backend
+description: A Helm chart for deploying ContainerSSH backend
+version: 0.1.0
+appVersion: "0.5"
+

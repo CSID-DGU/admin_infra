@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: containerssh-config
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app: containerssh
+
+data:
+  config.yaml: |
+    ssh:
+      listen: "0.0.0.0:2222"
+      hostkeys:
+        - /etc/containerssh/host.key
+      banner: |
+        Welcome to ContainerSSH!
+        Enter any username and password to continue.
+
+    auth:
+      password:
+        webhook:
+          url: {{ .Values.config.authPasswordUrl }}
+      pubkey:
+        webhook:
+          url: {{ .Values.config.authPubkeyUrl }}
+      timeout: 60s
+
+    backend: kubernetes
+    kubernetes:
+      connection:
+        host: kubernetes.default.svc
+        cacertFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+      pod:
+        metadata:
+          namespace: {{ .Values.config.namespace }}
+          labels:
+            app: containerssh-guest
+            managed-by: containerssh
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+          - name: shell
+            image: {{ .Values.image }}
+            command:
+              - /bin/bash
+            stdin: true
+            tty: true
+            env:
+              - name: USER
+                value: {{ .Values.username }}
+              - name: HOME
+                value: "/home/{{ .Values.username }}"
+              - name: SHELL
+                value: "/bin/bash"
+            resources:
+              requests:
+                cpu: {{ .Values.resources.requests.cpu }}
+                memory: {{ .Values.resources.requests.memory }}
+              limits:
+                cpu: {{ .Values.resources.limits.cpu }}
+                memory: {{ .Values.resources.limits.memory }}
+            volumeMounts:
+              - name: user-home
+                mountPath: /home/share
+                readOnly: false
+          volumes:
+            - name: user-home
+              persistentVolumeClaim:
+                claimName: pvc-{{ .Values.username }}-share
+          restartPolicy: Never
+{{- if .Values.config.podTtlSeconds }}
+          activeDeadlineSeconds: {{ .Values.config.podTtlSeconds }}
+{{- end }}
+
+    log:
+      level: info
+      format: text
+

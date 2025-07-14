@@ -1,0 +1,22 @@
+image:
+  repository: containerssh/containerssh
+  tag: v0.5
+
+config:
+  authPasswordUrl: http://containerssh-auth-service.containerssh.svc.cluster.local/password
+  authPubkeyUrl: http://containerssh-auth-service.containerssh.svc.cluster.local/pubkey
+  configServerUrl: http://containerssh-config-service
+  namespace: containerssh
+  podTtlSeconds: null
+
+service:
+  nodePort: 9730
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
