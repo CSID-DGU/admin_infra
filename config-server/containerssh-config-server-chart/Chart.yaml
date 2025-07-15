@@ -1,0 +1,6 @@
+apiVersion: v2
+name: containerssh-config-server
+description: A Helm chart for ContainerSSH Config Server
+version: 0.1.0
+appVersion: "1.0"
+

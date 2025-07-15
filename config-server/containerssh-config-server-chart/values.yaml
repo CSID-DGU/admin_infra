@@ -1,0 +1,22 @@
+image:
+  repository: containerssh-config-server
+  tag: latest
+  pullPolicy: Never
+
+service:
+  type: NodePort
+  port: 80
+  targetPort: 8000
+  nodePort: 30082
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+env:
+  nfsAddress: "100.100.100.120"
+
