@@ -1,3 +1,5 @@
+username: guest
+
 image:
   repository: containerssh/containerssh
   tag: v0.5
@@ -8,6 +10,7 @@ config:
   configServerUrl: http://containerssh-config-service
   namespace: containerssh
   podTtlSeconds: null
+  authTimeout: 60s
 
 service:
   nodePort: 9730
@@ -19,4 +22,8 @@ resources:
   limits:
     cpu: 500m
     memory: 512Mi
+
+log:
+  level: info
+  format: text
 
