@@ -1,11 +1,4 @@
 apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: containerssh-config
-  namespace: {{ .Values.config.namespace }}
-  labels:
-    app: containerssh
-
 data:
   config.yaml: |
     ssh:
@@ -19,11 +12,11 @@ data:
     auth:
       password:
         webhook:
-          url: "{{ .Values.config.authPasswordUrl }}"
-      publicKey:
+          url: http://containerssh-auth-service.containerssh.svc.cluster.local/password
+      pubkey:
         webhook:
-          url: "{{ .Values.config.authPubkeyUrl }}"
-      timeout: {{ .Values.config.authTimeout }}
+          url: http://containerssh-auth-service.containerssh.svc.cluster.local/pubkey
+      timeout: 60s
 
     backend: kubernetes
     kubernetes:
@@ -34,7 +27,7 @@ data:
 
       pod:
         metadata:
-          namespace: {{ .Values.config.namespace }}
+          namespace: containerssh
           labels:
             app: containerssh-guest
             managed-by: containerssh
@@ -45,25 +38,25 @@ data:
             fsGroup: 1000
           containers:
           - name: shell
-            image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+            image: containerssh/containerssh:v0.5
             command:
               - /bin/bash
             stdin: true
             tty: true
             env:
               - name: USER
-                value: {{ .Values.username }}
+                value: guest
               - name: HOME
-                value: "/home/{{ .Values.username }}"
+                value: "/home/guest"
               - name: SHELL
                 value: "/bin/bash"
             resources:
               requests:
-                cpu: {{ .Values.resources.requests.cpu }}
-                memory: {{ .Values.resources.requests.memory }}
+                cpu: 100m
+                memory: 128Mi
               limits:
-                cpu: {{ .Values.resources.limits.cpu }}
-                memory: {{ .Values.resources.limits.memory }}
+                cpu: 500m
+                memory: 512Mi
             volumeMounts:
               - name: user-home
                 mountPath: /home/share
@@ -71,13 +64,22 @@ data:
           volumes:
             - name: user-home
               persistentVolumeClaim:
-                claimName: pvc-{{ .Values.username }}-share
+                claimName: pvc-guest-share
           restartPolicy: Never
-{{- if .Values.config.podTtlSeconds }}
-          activeDeadlineSeconds: {{ .Values.config.podTtlSeconds }}
-{{- end }}
 
     log:
-      level: "{{ .Values.log.level }}"
-      format: "{{ .Values.log.format }}"
-
+      level: "info"
+      format: "text"
+kind: ConfigMap
+metadata:
+  annotations:
+    meta.helm.sh/release-name: containerssh
+    meta.helm.sh/release-namespace: containerssh
+  creationTimestamp: "2025-07-14T14:56:55Z"
+  labels:
+    app: containerssh
+    app.kubernetes.io/managed-by: Helm
+  name: containerssh-config
+  namespace: containerssh
+  resourceVersion: "5740586"
+  uid: d0cd662e-a36c-4cec-aed4-7fd08990b7af

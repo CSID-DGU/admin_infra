@@ -1,0 +1,201 @@
+---
+# Source: containerssh-backend/templates/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: containerssh
+  labels:
+    name: containerssh
+---
+# Source: containerssh-backend/templates/serviceaccount.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: containerssh
+  namespace: containerssh
+  labels:
+    app: containerssh
+---
+# Source: containerssh-backend/templates/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: containerssh-config
+  namespace: containerssh
+  labels:
+    app: containerssh
+
+data:
+  config.yaml: |
+    ssh:
+      listen: "0.0.0.0:2222"
+      hostkeys:
+        - /etc/containerssh/host.key
+      banner: |
+        Welcome to ContainerSSH!
+        Enter any username and password to continue.
+
+    auth:
+      password:
+        webhook:
+          url: http://containerssh-auth-service.containerssh.svc.cluster.local/password
+      pubkey:
+        webhook:
+          url: http://containerssh-auth-service.containerssh.svc.cluster.local/pubkey
+      timeout: 60s
+
+    backend: kubernetes
+    kubernetes:
+      connection:
+        host: kubernetes.default.svc
+        cacertFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+      pod:
+        metadata:
+          namespace: containerssh
+          labels:
+            app: containerssh-guest
+            managed-by: containerssh
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+          - name: shell
+            image: containerssh/containerssh:v0.5
+            command:
+              - /bin/bash
+            stdin: true
+            tty: true
+            env:
+              - name: USER
+                value: guest
+              - name: HOME
+                value: "/home/guest"
+              - name: SHELL
+                value: "/bin/bash"
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+            volumeMounts:
+              - name: user-home
+                mountPath: /home/share
+                readOnly: false
+          volumes:
+            - name: user-home
+              persistentVolumeClaim:
+                claimName: pvc-guest-share
+          restartPolicy: Never
+
+    log:
+      level: "info"
+      format: "text"
+---
+# Source: containerssh-backend/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: containerssh
+  name: containerssh-role
+  labels:
+    app: containerssh
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "create", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+# Source: containerssh-backend/templates/rbac.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: containerssh-rolebinding
+  namespace: containerssh
+  labels:
+    app: containerssh
+subjects:
+- kind: ServiceAccount
+  name: containerssh
+  namespace: containerssh
+roleRef:
+  kind: Role
+  name: containerssh-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: containerssh-backend/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: containerssh
+  namespace: containerssh
+  labels:
+    app: containerssh
+spec:
+  type: NodePort  # 필요에 따라 ClusterIP, LoadBalancer로 변경 가능
+  selector:
+    app: containerssh
+  ports:
+    - name: ssh
+      port: 2222
+      targetPort: 2222
+      protocol: TCP
+      nodePort: 9730  # 예: 9700~9797 중 하나
+---
+# Source: containerssh-backend/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: containerssh
+  namespace: containerssh
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: containerssh
+  template:
+    metadata:
+      labels:
+        app: containerssh
+    spec:
+      serviceAccountName: containerssh
+      containers:
+        - name: containerssh
+          image: "containerssh/containerssh:v0.5"
+          ports:
+            - containerPort: 2222
+              name: ssh
+              protocol: TCP
+          volumeMounts:
+            - name: hostkey
+              mountPath: /etc/containerssh/host.key
+              subPath: host.key
+              readOnly: true
+            - name: config
+              mountPath: /etc/containerssh/config.yaml
+              subPath: config.yaml
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+      volumes:
+        - name: hostkey
+          secret:
+            secretName: containerssh-hostkey
+        - name: config
+          configMap:
+            name: containerssh-config
