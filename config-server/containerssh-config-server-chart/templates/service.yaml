@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: containerssh-config-service
+  namespace: containerssh
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    app: containerssh-config-server
+  ports:
+    - name: http
+      protocol: TCP
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      nodePort: {{ .Values.service.nodePort }}
+
