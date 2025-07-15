@@ -18,9 +18,11 @@ data:
 
     auth:
       password:
+        method: webhook
         webhook:
           url: "{{ .Values.config.authPasswordUrl }}"
       publicKey:
+        method: webhook
         webhook:
           url: "{{ .Values.config.authPubkeyUrl }}"
       timeout: {{ .Values.config.authTimeout }}
