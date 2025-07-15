@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: pv-{{ .Values.username }}-share
+spec:
+  capacity:
+    storage: {{ .Values.storageSize }}
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: "nfs-nas-v3"
+  mountOptions:
+    - vers=3
+  nfs:
+    server: {{ .Values.nfsServer }}
+    path: {{ printf "%s/%s" .Values.basePath .Values.username }}
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-{{ .Values.username }}-share
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: {{ .Values.storageSize }}
+  volumeName: pv-{{ .Values.username }}-share
+  storageClassName: "nfs-nas-v3"
