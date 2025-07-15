@@ -1,9 +1,3 @@
-
-# containerssh
-cd ~/admin_infra
-helm upgrade --install containerssh ./containerssh -n containerssh --create-namespace
-
-
 # auth server
 ## rebuild
 cd ~/admin_infra/auth-server

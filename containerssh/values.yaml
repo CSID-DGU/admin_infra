@@ -1,4 +1,4 @@
-username: guest
+username: jy
 
 image:
   repository: containerssh/containerssh
@@ -6,7 +6,7 @@ image:
 
 config:
   authPasswordUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
-  authPubkeyUrl: http://containerssh-auth-service.containerssh.svc.cluster.local/pubkey
+  authPubkeyUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
   configServerUrl: http://containerssh-config-service
   namespace: containerssh
   podTtlSeconds: null
