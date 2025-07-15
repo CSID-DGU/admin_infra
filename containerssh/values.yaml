@@ -5,7 +5,7 @@ image:
   tag: v0.5
 
 config:
-  authPasswordUrl: http://containerssh-auth-service.containerssh.svc.cluster.local/password
+  authPasswordUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
   authPubkeyUrl: http://containerssh-auth-service.containerssh.svc.cluster.local/pubkey
   configServerUrl: http://containerssh-config-service
   namespace: containerssh
