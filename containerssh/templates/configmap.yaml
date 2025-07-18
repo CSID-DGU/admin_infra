@@ -47,7 +47,8 @@ data:
             fsGroup: 1000
           containers:
           - name: shell
-            image: {{ .Values.image.repository }}:{{ .Values.image.tag }}
+            image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
+            #image: containerssh-guest:ubuntu22.04
             command:
               - /bin/bash
             stdin: true
