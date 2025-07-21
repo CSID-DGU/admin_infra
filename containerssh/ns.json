@@ -1,0 +1,18 @@
+{
+    "apiVersion": "v1",
+    "kind": "Namespace",
+    "metadata": {
+        "creationTimestamp": "2025-07-19T05:38:38Z",
+        "labels": {
+            "kubernetes.io/metadata.name": "containerssh",
+            "name": "containerssh"
+        },
+        "name": "containerssh",
+        "resourceVersion": "6789330",
+        "uid": "05f21215-23d5-48a4-8eaf-82831255586e"
+    },
+    "spec": {},
+    "status": {
+        "phase": "Active"
+    }
+}

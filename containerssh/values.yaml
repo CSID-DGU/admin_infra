@@ -12,7 +12,7 @@ guestImage:
 config:
   authPasswordUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
   authPubkeyUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
-  configServerUrl: http://containerssh-config-service
+  configServerUrl: http://containerssh-config-service.containerssh.svc.cluster.local/config
   namespace: containerssh
   podTtlSeconds: null
   authTimeout: 60s
@@ -31,4 +31,9 @@ resources:
 log:
   level: info
   format: text
+
+hostKey:
+  enabled: true
+  privateKeyPath: files/host_ed25519
+  secretName: containerssh-hostkey
 

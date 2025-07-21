@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: containerssh
+  name: {{ .Release.Name }}
   namespace: {{ .Values.config.namespace }}
 spec:
   replicas: 1
