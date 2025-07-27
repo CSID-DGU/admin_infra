@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pvc-{{ .Values.username }}-share
+  namespace: containerssh
+  annotations:
+    nfs.io/username: "{{ .Values.username }}"
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: "{{ .Values.storageSize }}"
+  storageClassName: "{{ .Values.storageClass }}"
+  volumeMode: Filesystem
+

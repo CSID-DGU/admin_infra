@@ -1,0 +1,21 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-nas-v3-expandable
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: nfs.csi.k8s.io
+allowVolumeExpansion: true
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+mountOptions:
+  - hard
+  - nfsvers=3
+  - rsize=1048576
+  - wsize=1048576
+  - timeo=600
+parameters:
+  server: 100.100.100.120
+  share: /volume1/share
+  subdir: user-share/${pvc.annotations.nfs.io/username}
+
