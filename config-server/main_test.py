@@ -20,6 +20,29 @@ DB_PORT = int(os.getenv("DB_PORT", 3306))
 def health():
     return "OK", 200
 
+def get_user_approval_info(username):
+    conn = pymysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        db=DB_NAME,
+        port=DB_PORT,
+        charset='utf8mb4',
+        cursorclass=pymysql.cursors.DictCursor
+    )
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+            SELECT username, server_name, volume_size
+            FROM approval
+            WHERE username = %s
+            """
+            cursor.execute(sql, (username,))
+            result = cursor.fetchone()
+            return result
+    finally:
+        conn.close()
+
 
 @app.route("/config", methods=["POST"])
 def config():
@@ -28,14 +51,20 @@ def config():
     if not username:
         return jsonify({"error": "username is required"}), 400
 
-    # Spring WAS로 사용자 승인정보 요청
-    try:
-        was_url = f"http://<WAS_URL>:<PORT>/api/userinfo/{username}"  # TODO: 실제 주소로 변경
-        was_response = requests.get(was_url, timeout=3)
-        was_response.raise_for_status()
-        user_info = was_response.json()
-    except Exception as e:
-        return jsonify({"error": f"Failed to fetch user info from WAS: {str(e)}"}), 500
+    # ✅ Spring WAS mock 처리
+    user_info = {
+        "username": username,
+        "image": "dguailab/containerssh-guest:cuda12.2-cudnn8-dev-ubuntu22.04",
+        "uid": 1000,
+        "gid": 1000,
+        "volume_size": 20,
+        "gpu_required": True,
+        "gpu_group": "A5000",
+        "server_type": "FARM",
+        "gpu_nodes": [
+            {"node_name": "FARM8", "num_gpu": 3}
+        ]
+    }
 
     try:
         node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
@@ -55,23 +84,18 @@ def config():
             num_gpu = node.get("num_gpu", 0)
             break
 
-    volume_mounts = [
-        {
-            "name": "user-home",
-            "mountPath": "/home/share",
-            "readOnly": False
+    volume_mounts = [{
+        "name": "user-home",
+        "mountPath": "/home/share",
+        "readOnly": False
+    }]
+    volumes = [{
+        "name": "user-home",
+        "persistentVolumeClaim": {
+            "claimName": f"pvc-{username}-share"
         }
-    ]
-    volumes = [
-        {
-            "name": "user-home",
-            "persistentVolumeClaim": {
-                "claimName": f"pvc-{username}-share"
-            }
-        }
-    ]
+    }]
 
-    # GPU 장치 마운트 추가
     if gpu_required and num_gpu > 0:
         for i in range(num_gpu):
             volume_mounts.append({
@@ -85,15 +109,13 @@ def config():
                     "type": "CharDevice"
                 }
             })
-
         for dev in ["nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"]:
-            mount_name = dev.replace("-", "")
             volume_mounts.append({
-                "name": mount_name,
+                "name": dev,
                 "mountPath": f"/dev/{dev}"
             })
             volumes.append({
-                "name": mount_name,
+                "name": dev,
                 "hostPath": {
                     "path": f"/dev/{dev}",
                     "type": "CharDevice"
@@ -132,14 +154,8 @@ def config():
                                     {"name": "SHELL", "value": "/bin/bash"}
                                 ],
                                 "resources": {
-                                    "requests": {
-                                        "cpu": "1000m",
-                                        "memory": "1024Mi"
-                                    },
-                                    "limits": {
-                                        "cpu": "1000m",
-                                        "memory": "1024Mi"
-                                    }
+                                    "requests": {"cpu": "1000m", "memory": "1024Mi"},
+                                    "limits": {"cpu": "1000m", "memory": "1024Mi"}
                                 },
                                 "volumeMounts": volume_mounts
                             }
@@ -347,7 +363,7 @@ def resize_pvc():
 
 
 def select_best_node_from_prometheus(node_list):
-    PROM_URL = "http://210.94.179.19:9750"
+    PROM_URL = "http://<PROMETHEUS_URL>:9750"  # TODO: 실제 주소로 변경
     best_node = None
     best_score = float("inf")
 
