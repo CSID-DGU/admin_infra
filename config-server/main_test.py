@@ -361,31 +361,8 @@ def resize_pvc():
         return jsonify({"error": str(e)}), 500
 
 
-
 def select_best_node_from_prometheus(node_list):
-    PROM_URL = "http://<PROMETHEUS_URL>:9750"  # TODO: 실제 주소로 변경
-    best_node = None
-    best_score = float("inf")
-
-    for node in node_list:
-        query = f"""
-        (
-          (sum(k8s_namespace_pod_count_total{{hostname="{node}"}}) or vector(0)) +
-          (count(gpu_process_memory_used_bytes{{hostname="{node}"}}) or vector(0))
-        ) / (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
-        """
-        try:
-            response = requests.get(f"{PROM_URL}/api/v1/query", params={"query": query}, timeout=2)
-            value = float(response.json()["data"]["result"][0]["value"][1])
-        except:
-            value = float("inf")
-
-        if value < best_score:
-            best_score = value
-            best_node = node
-
-    return best_node
-
+    return node_list[0]  # 무조건 첫 번째 노드 선택(임시)
 
 
 if __name__ == "__main__":

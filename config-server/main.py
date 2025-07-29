@@ -30,7 +30,7 @@ def config():
 
     # Spring WAS로 사용자 승인정보 요청
     try:
-        was_url = f"http://<WAS_URL>:<PORT>/api/userinfo/{username}"  # TODO: 실제 주소로 변경
+        was_url = f"http://<WAS_URL>:<PORT>/api/acceptinfo/{username}"  # TODO: 실제 주소로 변경
         was_response = requests.get(was_url, timeout=3)
         was_response.raise_for_status()
         user_info = was_response.json()
@@ -48,6 +48,17 @@ def config():
     gid = user_info["gid"]
     gpu_required = user_info.get("gpu_required", False)
     gpu_nodes = user_info.get("gpu_nodes", [])
+
+    # best_node의 CPU/Memory limit 추출
+    cpu_limit = "1000m"
+    memory_limit = "1024Mi"
+    num_gpu = 0
+    for node in gpu_nodes:
+        if node["node_name"] == best_node:
+            cpu_limit = node.get("cpu_limit", "1000m")
+            memory_limit = node.get("memory_limit", "1024Mi")
+            num_gpu = node.get("num_gpu", 0)
+            break
 
     num_gpu = 0
     for node in gpu_nodes:
@@ -137,8 +148,8 @@ def config():
                                         "memory": "1024Mi"
                                     },
                                     "limits": {
-                                        "cpu": "1000m",
-                                        "memory": "1024Mi"
+                                        "cpu": "cpu_limit",
+                                        "memory": "memory_limit"
                                     }
                                 },
                                 "volumeMounts": volume_mounts
