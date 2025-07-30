@@ -212,7 +212,7 @@ def create_or_resize_pvc():
             spec=client.V1PersistentVolumeSpec(
                 capacity={"storage": storage},
                 access_modes=["ReadWriteMany"],
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 persistent_volume_reclaim_policy="Retain",
                 nfs=client.V1NFSVolumeSource(
                     server="100.100.100.120",
@@ -228,7 +228,7 @@ def create_or_resize_pvc():
                 resources=client.V1ResourceRequirements(
                     requests={"storage": storage}
                 ),
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 volume_name=pv_name
             )
         )
@@ -288,7 +288,7 @@ def resize_pvc():
             spec=client.V1PersistentVolumeSpec(
                 capacity={"storage": storage},
                 access_modes=["ReadWriteMany"],
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 persistent_volume_reclaim_policy="Retain",
                 nfs=client.V1NFSVolumeSource(
                     server="100.100.100.120",
@@ -304,7 +304,7 @@ def resize_pvc():
                 resources=client.V1ResourceRequirements(
                     requests={"storage": storage}
                 ),
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 volume_name=pv_name
             )
         )
