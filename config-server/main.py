@@ -8,14 +8,6 @@ load_dotenv()
 
 app = Flask(__name__)
 
-# DB 연결 설정 (수정필요)
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
-DB_NAME = os.getenv("DB_NAME", "web_admin")
-DB_PORT = int(os.getenv("DB_PORT", 3306))
-
-
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
@@ -172,31 +164,6 @@ def config():
     })
 
 
-
-def update_volume_size_in_db(username, new_size):
-    conn = pymysql.connect(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        db=DB_NAME,
-        port=DB_PORT,
-        charset='utf8mb4',
-        cursorclass=pymysql.cursors.DictCursor
-    )
-    try:
-        with conn.cursor() as cursor:
-            sql = """
-            UPDATE approval
-            SET volume_size = %s
-            WHERE username = %s
-            """
-            # "Gi" -> int 변환 후 저장
-            cursor.execute(sql, (int(new_size.replace("Gi", "")), username))
-
-        conn.commit()
-    finally:
-        conn.close()
-
 @app.route("/pvc", methods=["POST"])
 def create_or_resize_pvc():
     data = request.get_json(force=True)
@@ -232,7 +199,7 @@ def create_or_resize_pvc():
                 }
             }
             core_v1.patch_namespaced_persistent_volume_claim(pvc_name, namespace, patch_body)
-            update_volume_size_in_db(username, storage)
+            
             return jsonify({"status": "resized", "message": f"{pvc_name} resized to {storage}"})
 
         except client.exceptions.ApiException as e:
@@ -267,7 +234,7 @@ def create_or_resize_pvc():
         )
         core_v1.create_persistent_volume(body=pv_body)
         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-        update_volume_size_in_db(username, storage)
+        
 
         return jsonify({"status": "created", "message": f"{pvc_name} created with {storage}"})
 
@@ -344,9 +311,7 @@ def resize_pvc():
 
         core_v1.create_persistent_volume(body=pv_body)
         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-
-        # DB에 반영
-        update_volume_size_in_db(username, storage)
+        
 
         return jsonify({"status": "resized", "message": f"{pvc_name} resized by recreating with {storage}"}), 200
 
