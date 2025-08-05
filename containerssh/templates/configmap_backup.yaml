@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: containerssh-config
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app: containerssh
+
+data:
+  config.yaml: |
+    ssh:
+      listen: "0.0.0.0:2222"
+      hostkeys:
+        - /etc/containerssh/host.key
+      banner: |
+        Welcome to ContainerSSH!
+        Enter any username and password to continue.
+
+    auth:
+      password:
+        method: webhook
+        webhook:
+          url: "{{ .Values.config.authPasswordUrl }}"
+      publicKey:
+        method: webhook
+        webhook:
+          url: "{{ .Values.config.authPubkeyUrl }}"
+      timeout: {{ .Values.config.authTimeout }}
+
+
+        # configserver:
+        # url: "{{ .Values.config.configServerUrl }}"
+        # timeout: 10s
+
+    backend: kubernetes
+    kubernetes:
+      connection:
+        host: kubernetes.default.svc
+        cacertFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+        bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+
+      pod:
+        metadata:
+          namespace: {{ .Values.config.namespace }}
+          labels:
+            app: containerssh-guest
+            managed-by: containerssh
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          containers:
+          - name: shell
+            image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
+            #image: containerssh-guest:ubuntu22.04
+            command:
+              - /bin/bash
+            stdin: true
+            tty: true
+            env:
+              - name: USER
+                value: {{ .Values.username }}
+              - name: HOME
+                value: "/home/{{ .Values.username }}"
+              - name: SHELL
+                value: "/bin/bash"
+            resources:
+              requests:
+                cpu: {{ .Values.resources.requests.cpu }}
+                memory: {{ .Values.resources.requests.memory }}
+              limits:
+                cpu: {{ .Values.resources.limits.cpu }}
+                memory: {{ .Values.resources.limits.memory }}
+            volumeMounts:
+              - name: user-home
+                mountPath: /home/share
+                readOnly: false
+              - name: nvidia0
+                mountPath: /dev/nvidia0
+              - name: nvidia1
+                mountPath: /dev/nvidia1
+              - name: nvidia2
+                mountPath: /dev/nvidia2
+              - name: nvidia3
+                mountPath: /dev/nvidia3
+              - name: nvidiactl
+                mountPath: /dev/nvidiactl
+              - name: nvidiauvm
+                mountPath: /dev/nvidia-uvm
+              - name: nvidiauvmtools
+                mountPath: /dev/nvidia-uvm-tools
+              - name: nvidiamodeset
+                mountPath: /dev/nvidia-modeset
+          volumes:
+            - name: user-home
+              persistentVolumeClaim:
+                claimName: pvc-{{ .Values.username }}-share
+            - name: nvidia0
+              hostPath:
+                path: /dev/nvidia0
+                type: CharDevice
+            - name: nvidia1
+              hostPath:
+                path: /dev/nvidia1
+                type: CharDevice
+            - name: nvidia2
+              hostPath:
+                path: /dev/nvidia2
+                type: CharDevice
+            - name: nvidia3
+              hostPath:
+                path: /dev/nvidia3
+                type: CharDevice
+            - name: nvidiactl
+              hostPath:
+                path: /dev/nvidiactl
+                type: CharDevice
+            - name: nvidiauvm
+              hostPath:
+                path: /dev/nvidia-uvm
+                type: CharDevice
+            - name: nvidiauvmtools
+              hostPath:
+                path: /dev/nvidia-uvm-tools
+                type: CharDevice
+            - name: nvidiamodeset
+              hostPath:
+                path: /dev/nvidia-modeset
+                type: CharDevice
+          restartPolicy: Never
+{{- if .Values.config.podTtlSeconds }}
+          activeDeadlineSeconds: {{ .Values.config.podTtlSeconds }}
+{{- end }}
+
+    log:
+      level: "{{ .Values.log.level }}"
+      format: "{{ .Values.log.format }}"
+

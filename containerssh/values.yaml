@@ -5,8 +5,8 @@ image:
   tag: v0.5
 
 guestImage:
-  repository: containerssh-guest
-  tag: ubuntu22.04 
+  repository: dguailab/containerssh-guest
+  tag: cuda11.8-cudnn8-dev-ubuntu22.04
 
 
 config:
@@ -34,6 +34,6 @@ log:
 
 hostKey:
   enabled: true
-  privateKeyPath: files/host_ed25519
+  privateKeyPath: files/containerssh_host_ed25519
   secretName: containerssh-hostkey
 
