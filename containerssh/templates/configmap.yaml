@@ -52,8 +52,8 @@ data:
             fsGroup: 1000
           containers:
           - name: shell
-            image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
-            #image: containerssh-guest:ubuntu22.04
+            #image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
+            image: containerssh-guest:cuda11.8-cudnn8-dev-ubuntu22.04
             command:
               - /bin/bash
             stdin: true
@@ -76,10 +76,58 @@ data:
               - name: user-home
                 mountPath: /home/share
                 readOnly: false
+              - name: nvidia0
+                mountPath: /dev/nvidia0
+              - name: nvidia1
+                mountPath: /dev/nvidia1
+              - name: nvidia2
+                mountPath: /dev/nvidia2
+              - name: nvidia3
+                mountPath: /dev/nvidia3
+              - name: nvidiactl
+                mountPath: /dev/nvidiactl
+              - name: nvidiauvm
+                mountPath: /dev/nvidia-uvm
+              - name: nvidiauvmtools
+                mountPath: /dev/nvidia-uvm-tools
+              - name: nvidiamodeset
+                mountPath: /dev/nvidia-modeset
           volumes:
             - name: user-home
               persistentVolumeClaim:
                 claimName: pvc-{{ .Values.username }}-share
+            - name: nvidia0
+              hostPath:
+                path: /dev/nvidia0
+                type: CharDevice
+            - name: nvidia1
+              hostPath:
+                path: /dev/nvidia1
+                type: CharDevice
+            - name: nvidia2
+              hostPath:
+                path: /dev/nvidia2
+                type: CharDevice
+            - name: nvidia3
+              hostPath:
+                path: /dev/nvidia3
+                type: CharDevice
+            - name: nvidiactl
+              hostPath:
+                path: /dev/nvidiactl
+                type: CharDevice
+            - name: nvidiauvm
+              hostPath:
+                path: /dev/nvidia-uvm
+                type: CharDevice
+            - name: nvidiauvmtools
+              hostPath:
+                path: /dev/nvidia-uvm-tools
+                type: CharDevice
+            - name: nvidiamodeset
+              hostPath:
+                path: /dev/nvidia-modeset
+                type: CharDevice
           restartPolicy: Never
 {{- if .Values.config.podTtlSeconds }}
           activeDeadlineSeconds: {{ .Values.config.podTtlSeconds }}

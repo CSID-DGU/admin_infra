@@ -13,7 +13,7 @@ config:
   authPasswordUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
   authPubkeyUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
   configServerUrl: http://containerssh-config-service.containerssh.svc.cluster.local/config
-  namespace: containerssh
+  namespace: cssh
   podTtlSeconds: null
   authTimeout: 60s
 
