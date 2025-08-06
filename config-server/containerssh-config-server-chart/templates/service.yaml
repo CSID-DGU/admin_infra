@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: containerssh-config-service
-  namespace: cssh
+  namespace: {{ .Values.config.namespace }}
 spec:
   type: {{ .Values.service.type }}
   selector:

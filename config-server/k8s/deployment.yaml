@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: containerssh-config-server
-  namespace: containerssh
+  namespace: {{ .Values.config.namespace }}
 spec:
   replicas: 1
   selector:

@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "containerssh-config-server.fullname" . }}
-  namespace: cssh
+  namespace: {{ .Values.config.namespace }}
   labels:
     app: containerssh-config-server
 spec:
@@ -24,6 +24,10 @@ spec:
           env:
             - name: NFS_ADDRESS
               value: "{{ .Values.env.nfsAddress }}"
+
+            - name: NAMESPACE
+              value: "{{ .Values.config.namespace }}"
+
           readinessProbe:
             httpGet:
               path: /health

@@ -20,17 +20,17 @@ data:
       password:
         method: webhook
         webhook:
-          url: "{{ .Values.config.authPasswordUrl }}"
+          url: {{ include "containerssh.authPasswordUrl" . }}
       publicKey:
         method: webhook
         webhook:
-          url: "{{ .Values.config.authPubkeyUrl }}"
+          url: {{ include "containerssh.authPubkeyUrl" . }}
       timeout: {{ .Values.config.authTimeout }}
 
 
-    configserver:
-      url: "{{ .Values.config.configServerUrl }}"
-      timeout: 10s
+        #configserver:
+        #url: {{ include "containerssh.configServerUrl" . }}
+        #timeout: {{ .Values.config.configServerTimeout }}
 
     backend: kubernetes
     kubernetes:
@@ -54,6 +54,7 @@ data:
           - name: shell
             #image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
             image: containerssh-guest:cuda11.8-cudnn8-dev-ubuntu22.04
+            imagePullPolicy: Never
             command:
               - /bin/bash
             stdin: true

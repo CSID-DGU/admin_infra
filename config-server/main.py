@@ -2,9 +2,12 @@ from flask import Flask, request, jsonify
 from kubernetes import client, config as k8s_config
 import pymysql
 import os
+import requests
 
 from dotenv import load_dotenv
 load_dotenv()
+
+NAMESPACE = os.getenv("NAMESPACE", "default")
 
 app = Flask(__name__)
 
@@ -109,7 +112,7 @@ def config():
             "kubernetes": {
                 "pod": {
                     "metadata": {
-                        "namespace": "containerssh",
+                        "namespace": NAMESPACE,
                         "labels": {
                             "app": "containerssh-guest",
                             "managed-by": "containerssh"
