@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: containerssh-auth-config
-  namespace: containerssh
+  namespace: cssh
 data:
   # 애플리케이션 설정
   log_level: "INFO"

@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mysql-config
-  namespace: containerssh
+  namespace: cssh
 data:
   mysql.cnf: |
     [mysql]

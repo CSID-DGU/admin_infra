@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "containerssh-config-server.fullname" . }}
-  namespace: containerssh
+  namespace: cssh
   labels:
     app: containerssh-config-server
 spec:

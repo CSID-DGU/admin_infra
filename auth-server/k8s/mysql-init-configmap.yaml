@@ -2,7 +2,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: mysql-init-config
-  namespace: containerssh
+  namespace: cssh
 data:
   init.sql: |
     CREATE DATABASE IF NOT EXISTS containerssh_auth;
