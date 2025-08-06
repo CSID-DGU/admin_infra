@@ -2,7 +2,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: pvc-{{ .Values.username }}-share
-  namespace: containerssh
+  namespace: {{ .Values.config.namespace }}
   annotations:
     nfs.io/username: "{{ .Values.username }}"
 spec:

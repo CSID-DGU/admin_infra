@@ -16,6 +16,7 @@ config:
   namespace: cssh
   podTtlSeconds: null
   authTimeout: 60s
+  configServerTimeout: 10s
 
 service:
   nodePort: 9730
