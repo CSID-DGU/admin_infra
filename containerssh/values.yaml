@@ -10,9 +10,9 @@ guestImage:
 
 
 config:
-  authPasswordUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
-  authPubkeyUrl: http://containerssh-auth-service.containerssh.svc.cluster.local
-  configServerUrl: http://containerssh-config-service.containerssh.svc.cluster.local/config
+  authPasswordUrl: http://containerssh-auth-service.cssh.svc.cluster.local
+  authPubkeyUrl: http://containerssh-auth-service.cssh.svc.cluster.local
+  configServerUrl: http://containerssh-config-service.cssh.svc.cluster.local/config
   namespace: cssh
   podTtlSeconds: null
   authTimeout: 60s
