@@ -54,7 +54,7 @@ data:
         idleCommand:
           - /bin/bash
           - -c
-          - /entrypoint.sh; exec /usr/bin/containerssh-agent wait-signal --signal INT --signal TERM
+          - /entrypoint.sh && /usr/bin/containerssh-agent wait-signal --signal INT --signal TERM
           #- /entrypoint.sh
           #- /usr/bin/containerssh-agent
           #- wait-signal
@@ -64,9 +64,9 @@ data:
           #- TERM
         spec:
           securityContext:
-            runAsNonRoot: true
-            runAsUser: 1000
-            fsGroup: 1000
+            #runAsNonRoot: false
+            runAsUser: 0
+            fsGroup: 0
           containers:
           - name: shell
             #image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
