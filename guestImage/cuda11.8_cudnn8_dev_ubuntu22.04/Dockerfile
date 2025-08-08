@@ -22,3 +22,8 @@ ENV PATH=/opt/anaconda3/bin:$PATH
 # 로그인 환경에도 적용되도록 profile에 PATH 추가 및 conda init
 RUN echo "export PATH=/opt/anaconda3/bin:\$PATH" >> /etc/profile \
     && /opt/anaconda3/bin/conda init
+
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["bash", "/entrypoint.sh"]

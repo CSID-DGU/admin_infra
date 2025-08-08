@@ -27,6 +27,12 @@ data:
           url: {{ include "containerssh.authPubkeyUrl" . }}
       timeout: {{ .Values.config.authTimeout }}
 
+    security:
+      forwarding:
+        reverseForwardingMode: enable
+        forwardingMode: enable
+        socketForwardingMode: enable
+        socketListenMode: enable
 
         #configserver:
         #url: {{ include "containerssh.configServerUrl" . }}
@@ -45,6 +51,17 @@ data:
           labels:
             app: containerssh-guest
             managed-by: containerssh
+        idleCommand:
+          - /bin/bash
+          - -c
+          - /entrypoint.sh; exec /usr/bin/containerssh-agent wait-signal --signal INT --signal TERM
+          #- /entrypoint.sh
+          #- /usr/bin/containerssh-agent
+          #- wait-signal
+          #- --signal
+          #- INT
+          #- --signal
+          #- TERM
         spec:
           securityContext:
             runAsNonRoot: true
@@ -53,15 +70,19 @@ data:
           containers:
           - name: shell
             #image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
-            image: containerssh-guest:cuda11.8-cudnn8-dev-ubuntu22.04
+            image: dguailab/containerssh-guest:cuda11.8-cudnn8-dev-ubuntu22.04
             imagePullPolicy: Never
-            command:
-              - /bin/bash
             stdin: true
             tty: true
             env:
               - name: USER
                 value: {{ .Values.username }}
+              - name: USER_ID
+                value: {{ .Values.username }}
+              - name: USER_PW
+                value: "1234"
+              - name: UID
+                value: "10000"
               - name: HOME
                 value: "/home/{{ .Values.username }}"
               - name: SHELL
@@ -75,7 +96,7 @@ data:
                 memory: {{ .Values.resources.limits.memory }}
             volumeMounts:
               - name: user-home
-                mountPath: /home/share
+                mountPath: /home/jy
                 readOnly: false
               - name: nvidia0
                 mountPath: /dev/nvidia0
