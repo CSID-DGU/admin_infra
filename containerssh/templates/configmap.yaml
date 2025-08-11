@@ -51,22 +51,17 @@ data:
           labels:
             app: containerssh-guest
             managed-by: containerssh
-        idleCommand:
-          - /bin/bash
-          - -c
-          - /entrypoint.sh && /usr/bin/containerssh-agent wait-signal --signal INT --signal TERM
-          #- /entrypoint.sh
-          #- /usr/bin/containerssh-agent
-          #- wait-signal
-          #- --signal
-          #- INT
-          #- --signal
-          #- TERM
+        #idleCommand:
+          #- /bin/bash
+          #- -c
+          #- /entrypoint.sh && /usr/bin/containerssh-agent wait-signal --signal INT --signal TERM
         spec:
           securityContext:
             #runAsNonRoot: false
-            runAsUser: 0
-            fsGroup: 0
+            runAsUser: 1001
+            runAsGroup: 1001
+            fsGroup: 1001
+            #allowPrivilegeEscalation: true
           containers:
           - name: shell
             #image: {{ .Values.guestImage.repository }}:{{ .Values.guestImage.tag }}
@@ -82,7 +77,7 @@ data:
               - name: USER_PW
                 value: "1234"
               - name: UID
-                value: "10000"
+                value: "1001"
               - name: HOME
                 value: "/home/{{ .Values.username }}"
               - name: SHELL
@@ -114,10 +109,30 @@ data:
                 mountPath: /dev/nvidia-uvm-tools
               - name: nvidiamodeset
                 mountPath: /dev/nvidia-modeset
+              - name: host-etc
+                mountPath: /etc/passwd
+                subPath: passwd
+                readOnly: true
+              - name: host-etc
+                mountPath: /etc/group
+                subPath: group
+                readOnly: true
+              - name: host-etc
+                mountPath: /etc/shadow
+                subPath: shadow
+                readOnly: true
+              - name: host-etc
+                mountPath: /etc/sudoers.d/jy
+                subPath: sudoers.d/jy
+                readOnly: true
           volumes:
             - name: user-home
               persistentVolumeClaim:
                 claimName: pvc-{{ .Values.username }}-share
+            - name: host-etc
+              hostPath:
+                path: /etc
+                type: Directory
             - name: nvidia0
               hostPath:
                 path: /dev/nvidia0
