@@ -7,6 +7,8 @@ import requests
 from dotenv import load_dotenv
 load_dotenv()
 
+from bg_redis import save_background_status
+
 NAMESPACE = os.getenv("NAMESPACE", "default")
 
 app = Flask(__name__)
@@ -165,6 +167,25 @@ def config():
         "metadata": {},
         "files": {}
     })
+
+
+@app.route("/report-background", methods=["POST"])
+def report_background():
+
+    data = request.get_json(force=True)
+    username = data.get("username")
+    pod_name = data.get("pod_name")
+    has_background = data.get("has_background", False)
+
+    if not username or not pod_name:
+        return jsonify({"error": "username and pod_name are required"}), 400
+
+    save_background_status(username, pod_name, has_background)
+    return jsonify({
+        "status": "saved",
+        "username": username,
+        "has_background": has_background
+    }), 200
 
 
 @app.route("/pvc", methods=["POST"])
