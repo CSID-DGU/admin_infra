@@ -246,7 +246,6 @@ def report_background():
     }), 200
 
 
-
 @app.route("/pvc", methods=["POST"])
 def create_or_resize_pvc():
     data = request.get_json(force=True)
@@ -258,7 +257,6 @@ def create_or_resize_pvc():
 
     storage = f"{storage_raw}Gi"
     pvc_name = f"pvc-{username}-share"
-    pv_name = f"pv-{username}-share"
     namespace = NAMESPACE
 
     try:
@@ -269,9 +267,10 @@ def create_or_resize_pvc():
 
         core_v1 = client.CoreV1Api()
 
+        # PVC 존재 여부 확인
         try:
-            existing_pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-            # 존재하면 resize
+            _ = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+            # 존재 → resize
             patch_body = {
                 "spec": {
                     "resources": {
@@ -281,48 +280,33 @@ def create_or_resize_pvc():
                     }
                 }
             }
-            core_v1.patch_namespaced_persistent_volume_claim(pvc_name, namespace, patch_body)
-            
+            core_v1.patch_namespaced_persistent_volume_claim(
+                name=pvc_name,
+                namespace=namespace,
+                body=patch_body
+            )
             return jsonify({"status": "resized", "message": f"{pvc_name} resized to {storage}"})
-
         except client.exceptions.ApiException as e:
             if e.status != 404:
                 return jsonify({"error": f"Kubernetes API error: {e.body}"}), 500
 
-        # 존재하지 않으면 새로 만들기
-        pv_body = client.V1PersistentVolume(
-            metadata=client.V1ObjectMeta(name=pv_name),
-            spec=client.V1PersistentVolumeSpec(
-                capacity={"storage": storage},
-                access_modes=["ReadWriteMany"],
-                storage_class_name="nfs-nas-v3",
-                persistent_volume_reclaim_policy="Retain",
-                nfs=client.V1NFSVolumeSource(
-                    server="100.100.100.120",
-                    path=f"/volume1/share/user-share/{username}"
-                ),
-                mount_options=["vers=3"]
-            )
-        )
+        # PVC 없으면 새로 생성
         pvc_body = client.V1PersistentVolumeClaim(
-            metadata=client.V1ObjectMeta(name=pvc_name),
+            metadata=client.V1ObjectMeta(
+                name=pvc_name,
+                annotations={"nfs.io/username": username}  # optional
+            ),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=["ReadWriteMany"],
                 resources=client.V1ResourceRequirements(
                     requests={"storage": storage}
                 ),
-                storage_class_name="nfs-nas-v3",
-                volume_name=pv_name
+                storage_class_name="nfs-nas-v3-expandable"
             )
         )
-        core_v1.create_persistent_volume(body=pv_body)
         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-        
-
         return jsonify({"status": "created", "message": f"{pvc_name} created with {storage}"})
 
-    except client.exceptions.ApiException as e:
-        return jsonify({"error": f"Kubernetes API error: {e.body}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -339,7 +323,6 @@ def resize_pvc():
 
     storage = f"{storage_raw}Gi"
     pvc_name = f"pvc-{username}-share"
-    pv_name = f"pv-{username}-share"
     namespace = NAMESPACE
 
     try:
@@ -350,58 +333,27 @@ def resize_pvc():
 
         core_v1 = client.CoreV1Api()
 
-        # 기존 PVC, PV 삭제
-        try:
-            core_v1.delete_namespaced_persistent_volume_claim(pvc_name, namespace)
-        except client.exceptions.ApiException as e:
-            if e.status != 404:
-                return jsonify({"error": f"Failed to delete PVC: {e.body}"}), 500
-        try:
-            core_v1.delete_persistent_volume(pv_name)
-        except client.exceptions.ApiException as e:
-            if e.status != 404:
-                return jsonify({"error": f"Failed to delete PV: {e.body}"}), 500
-
-        import time
-        time.sleep(3)  # 삭제 반영 대기
-
-        # 새 PV/PVC 생성
-        pv_body = client.V1PersistentVolume(
-            metadata=client.V1ObjectMeta(name=pv_name),
-            spec=client.V1PersistentVolumeSpec(
-                capacity={"storage": storage},
-                access_modes=["ReadWriteMany"],
-                storage_class_name="nfs-nas-v3",
-                persistent_volume_reclaim_policy="Retain",
-                nfs=client.V1NFSVolumeSource(
-                    server="100.100.100.120",
-                    path=f"/volume1/share/user-share/{username}"
-                ),
-                mount_options=["vers=3"]
-            )
+        patch_body = {
+            "spec": {
+                "resources": {
+                    "requests": {
+                        "storage": storage
+                    }
+                }
+            }
+        }
+        core_v1.patch_namespaced_persistent_volume_claim(
+            name=pvc_name,
+            namespace=namespace,
+            body=patch_body
         )
-        pvc_body = client.V1PersistentVolumeClaim(
-            metadata=client.V1ObjectMeta(name=pvc_name),
-            spec=client.V1PersistentVolumeClaimSpec(
-                access_modes=["ReadWriteMany"],
-                resources=client.V1ResourceRequirements(
-                    requests={"storage": storage}
-                ),
-                storage_class_name="nfs-nas-v3",
-                volume_name=pv_name
-            )
-        )
-
-        core_v1.create_persistent_volume(body=pv_body)
-        core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-        
-
-        return jsonify({"status": "resized", "message": f"{pvc_name} resized by recreating with {storage}"}), 200
+        return jsonify({"status": "resized", "message": f"{pvc_name} resized to {storage}"})
 
     except client.exceptions.ApiException as e:
         return jsonify({"error": f"Kubernetes API error: {e.body}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 
 
