@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from bg_redis import save_background_status
+from utils import get_existing_pod
+
 
 NAMESPACE = os.getenv("NAMESPACE", "default")
 
@@ -25,9 +27,35 @@ def config():
     if not username:
         return jsonify({"error": "username is required"}), 400
 
+    # 현재 실행 중인 Pod가 있는지 확인
+    existing_pod = get_existing_pod(NAMESPACE, username)
+    if existing_pod:
+        # Pod가 이미 있으면 attach
+        return jsonify({
+            "config": {
+                "backend": "kubernetes",
+                "kubernetes": {
+                    "pod": {
+                        "attach": {
+                            "podName": existing_pod,
+                            "namespace": NAMESPACE,
+                            "container": "shell"
+                        }
+                    }
+                }
+            },
+            "environment": {
+                "USER": {"value": username, "sensitive": False}
+            },
+            "metadata": {},
+            "files": {}
+        })
+
+    # Pod 없으면 새로 생성
+
     # Spring WAS로 사용자 승인정보 요청
     try:
-        was_url = f"http://<WAS_URL>:<PORT>/api/acceptinfo/{username}"  # TODO: 실제 주소로 변경
+        was_url = f"http://210.94.179.19:9796/api/acceptinfo/{username}"  
         was_response = requests.get(was_url, timeout=3)
         was_response.raise_for_status()
         user_info = was_response.json()
@@ -108,6 +136,26 @@ def config():
                 }
             })
 
+    # host-etc 마운트 추가
+    host_etc_mounts = [
+        {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
+        {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
+        {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
+        {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
+        {"name": "host-etc", "mountPath": "/etc/bash.bash_logout", "subPath": "bash.bash_logout", "readOnly": True}
+    ]
+    volume_mounts.extend(host_etc_mounts)
+
+    volumes.append({
+        "name": "host-etc",
+        "hostPath": {
+            "path": "/etc",
+            "type": "Directory"
+        }
+    })
+
+
+
     return jsonify({
         "config": {
             "backend": "kubernetes",
@@ -117,7 +165,8 @@ def config():
                         "namespace": NAMESPACE,
                         "labels": {
                             "app": "containerssh-guest",
-                            "managed-by": "containerssh"
+                            "managed-by": "containerssh",
+                            "user": username
                         }
                     },
                     "spec": {
@@ -145,8 +194,8 @@ def config():
                                         "memory": "1024Mi"
                                     },
                                     "limits": {
-                                        "cpu": "cpu_limit",
-                                        "memory": "memory_limit"
+                                        "cpu": cpu_limit,
+                                        "memory": memory_limit
                                     }
                                 },
                                 "volumeMounts": volume_mounts
@@ -171,7 +220,6 @@ def config():
 
 @app.route("/report-background", methods=["POST"])
 def report_background():
-
     data = request.get_json(force=True)
     username = data.get("username")
     pod_name = data.get("pod_name")
@@ -180,12 +228,23 @@ def report_background():
     if not username or not pod_name:
         return jsonify({"error": "username and pod_name are required"}), 400
 
-    save_background_status(username, pod_name, has_background)
+    # 실제 프로세스 확인
+    still_running = pod_has_process(pod_name, NAMESPACE, username)
+
+    if not still_running:
+        # 즉시 Pod 삭제
+        delete_pod(pod_name, NAMESPACE)
+        delete_user_status(username)  # Redis 정리
+        return jsonify({"status": "deleted", "username": username}), 200
+
+    # 백그라운드 있으면 Redis에 저장
+    save_background_status(username, pod_name, True)
     return jsonify({
-        "status": "saved",
+        "status": "background",
         "username": username,
-        "has_background": has_background
+        "has_background": True
     }), 200
+
 
 
 @app.route("/pvc", methods=["POST"])
@@ -200,7 +259,7 @@ def create_or_resize_pvc():
     storage = f"{storage_raw}Gi"
     pvc_name = f"pvc-{username}-share"
     pv_name = f"pv-{username}-share"
-    namespace = "containerssh"
+    namespace = NAMESPACE
 
     try:
         try:
@@ -281,7 +340,7 @@ def resize_pvc():
     storage = f"{storage_raw}Gi"
     pvc_name = f"pvc-{username}-share"
     pv_name = f"pv-{username}-share"
-    namespace = "containerssh"
+    namespace = NAMESPACE
 
     try:
         try:

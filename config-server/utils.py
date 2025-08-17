@@ -44,6 +44,24 @@ def pod_has_process(namespace, pod_name, username):
         print(f"[ERROR] Failed to check processes in Pod: {e}")
         return False
 
+# 기존 Pod가 있는지 확인 -> username당 Pod 1개만 유지
+def get_existing_pod(namespace, username):
+    try:
+        k8s_config.load_incluster_config()
+    except:
+        k8s_config.load_kube_config()
+
+    core_v1 = client.CoreV1Api()
+    pods = core_v1.list_namespaced_pod(
+        namespace=namespace,
+        label_selector=f"user={username}"
+    )
+    for pod in pods.items:
+        if pod.status.phase == "Running":
+            return pod.metadata.name
+    return None
+
+
 
 def delete_pod(pod_name, namespace):
     # Pod 삭제

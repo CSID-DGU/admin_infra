@@ -6,15 +6,7 @@ import os
 from dotenv import load_dotenv
 load_dotenv()
 
-app = Flask(__name__)
-
-# DB 연결 설정 (수정필요)
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
-DB_NAME = os.getenv("DB_NAME", "web_admin")
-DB_PORT = int(os.getenv("DB_PORT", 3306))
-
+app = Flask(__name__
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -51,7 +43,7 @@ def config():
     if not username:
         return jsonify({"error": "username is required"}), 400
 
-    # ✅ Spring WAS mock 처리
+    # Spring WAS mock 처리
     user_info = {
         "username": username,
         "image": "dguailab/containerssh-guest:cuda12.2-cudnn8-dev-ubuntu22.04",
@@ -250,7 +242,7 @@ def create_or_resize_pvc():
             spec=client.V1PersistentVolumeSpec(
                 capacity={"storage": storage},
                 access_modes=["ReadWriteMany"],
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 persistent_volume_reclaim_policy="Retain",
                 nfs=client.V1NFSVolumeSource(
                     server="100.100.100.120",
@@ -266,7 +258,7 @@ def create_or_resize_pvc():
                 resources=client.V1ResourceRequirements(
                     requests={"storage": storage}
                 ),
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 volume_name=pv_name
             )
         )
@@ -326,7 +318,7 @@ def resize_pvc():
             spec=client.V1PersistentVolumeSpec(
                 capacity={"storage": storage},
                 access_modes=["ReadWriteMany"],
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 persistent_volume_reclaim_policy="Retain",
                 nfs=client.V1NFSVolumeSource(
                     server="100.100.100.120",
@@ -342,7 +334,7 @@ def resize_pvc():
                 resources=client.V1ResourceRequirements(
                     requests={"storage": storage}
                 ),
-                storage_class_name="nfs-nas-v3-expandable",
+                storage_class_name="nfs-nas-v3",
                 volume_name=pv_name
             )
         )
