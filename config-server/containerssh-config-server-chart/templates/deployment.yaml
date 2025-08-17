@@ -15,6 +15,7 @@ spec:
       labels:
         app: containerssh-config-server
     spec:
+      serviceAccountName: containerssh
       containers:
         - name: config-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

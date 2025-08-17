@@ -1,7 +1,11 @@
 
-storageClass: nfs-nas-v3
+storageClass: nfs-nas-v3-expandable
 
 basePath: /volume1/share
 username: jy
 nfsServer: 100.100.100.120
 storageSize: 20Gi
+
+config:
+  namespace: cssh
+
