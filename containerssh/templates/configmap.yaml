@@ -47,6 +47,7 @@ data:
 
       pod:
         metadata:
+          name: containerssh-{{ .Values.username }}
           namespace: {{ .Values.config.namespace }}
           labels:
             app: containerssh-guest

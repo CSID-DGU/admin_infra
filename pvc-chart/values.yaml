@@ -1,5 +1,5 @@
 
-storageClass: nfs-nas-v3-expandable
+storageClass: nfs-nas-v3
 
 basePath: /volume1/share
 username: jy
