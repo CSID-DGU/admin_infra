@@ -119,11 +119,7 @@ def config():
             num_gpu = node.get("num_gpu", 0)
             break
 
-    num_gpu = 0
-    for node in gpu_nodes:
-        if node["node_name"] == best_node:
-            num_gpu = node.get("num_gpu", 0)
-            break
+    pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
 
     volume_mounts = [
         {
@@ -136,7 +132,7 @@ def config():
         {
             "name": "user-home",
             "persistentVolumeClaim": {
-                "claimName": f"pvc-{username}-share"
+                "claimName": pvc_name
             }
         }
     ]
@@ -156,7 +152,7 @@ def config():
                 }
             })
 
-        for dev in ["nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"]:
+        for dev in app.config["NVIDIA_AUX_DEVICES"]:
             mount_name = dev.replace("-", "")
             volume_mounts.append({
                 "name": mount_name,
