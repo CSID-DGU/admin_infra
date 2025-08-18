@@ -67,3 +67,159 @@ def delete_pod(pod_name, namespace):
     # Pod 삭제
     v1 = client.CoreV1Api()
     v1.delete_namespaced_pod(pod_name, namespace)
+
+
+# ---- File lock helpers ----
+class LockedFile:
+    """Context manager for POSIX advisory file locks using fcntl.flock."""
+    def __init__(self, path: str, mode: str):
+        self.path = path
+        self.mode = mode
+        self.f = None
+
+    def __enter__(self):
+        self.f = open(self.path, self.mode)
+        # Exclusive lock for writes, shared lock for reads
+        lock_type = fcntl.LOCK_SH if "r" in self.mode and "+" not in self.mode and "w" not in self.mode and "a" not in self.mode else fcntl.LOCK_EX
+        fcntl.flock(self.f.fileno(), lock_type)
+        return self.f
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.f.close()
+
+# ---- Ensure base etc layout ----
+
+def ensure_dir(path: str) -> None:
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def ensure_file(path: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    if not os.path.exists(path):
+        with open(path, "a"):
+            pass
+
+def ensure_etc_layout() -> None:
+    ensure_dir(app.config["BASE_ETC_DIR"])
+    ensure_dir(app.config["SUDOERS_DIR"])
+    ensure_file(app.config["PASSWD_PATH"])
+    ensure_file(app.config["GROUP_PATH"])
+    ensure_file(app.config["SHADOW_PATH"])
+
+# ---- /etc/passwd & /etc/group parsing ----
+PASSWD_FIELDS = ["name","passwd","uid","gid","gecos","home","shell"]
+GROUP_FIELDS = ["name","passwd","gid","members"]
+
+_passwd_line_re = re.compile(r"^(?P<name>[^:]+):(?P<passwd>[^:]*):(?P<uid>\d+):(?P<gid>\d+):(?P<gecos>[^:]*):(?P<home>[^:]*):(?P<shell>[^\n]*)$")
+_group_line_re  = re.compile(r"^(?P<name>[^:]+):(?P<passwd>[^:]*):(?P<gid>\d+):(?P<members>[^\n]*)$")
+
+
+def read_passwd_lines() -> List[str]:
+    ensure_etc_layout()
+    with LockedFile(app.config["PASSWD_PATH"], "r") as f:
+        return f.read().splitlines()
+
+
+def write_passwd_lines(lines: List[str]) -> None:
+    ensure_etc_layout()
+    with LockedFile(app.config["PASSWD_PATH"], "r+") as f:
+        content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
+        f.seek(0)
+        f.write(content)
+        f.truncate()
+
+
+def read_group_lines() -> List[str]:
+    ensure_etc_layout()
+    with LockedFile(app.config["GROUP_PATH"], "r") as f:
+        return f.read().splitlines()
+
+
+def write_group_lines(lines: List[str]) -> None:
+    ensure_etc_layout()
+    with LockedFile(app.config["GROUP_PATH"], "r+") as f:
+        content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
+        f.seek(0)
+        f.write(content)
+        f.truncate()
+
+
+def parse_passwd_line(line: str) -> Optional[dict]:
+    m = _passwd_line_re.match(line)
+    if not m:
+        return None
+    d = m.groupdict()
+    d["uid"] = int(d["uid"]) if d["uid"].isdigit() else d["uid"]
+    d["gid"] = int(d["gid"]) if d["gid"].isdigit() else d["gid"]
+    return d
+
+
+def format_passwd_entry(d: dict) -> str:
+    return f"{d['name']}:{d.get('passwd','x')}:{int(d['uid'])}:{int(d['gid'])}:{d.get('gecos','')}:{d.get('home','')}:{d.get('shell','')}"
+
+
+def parse_group_line(line: str) -> Optional[dict]:
+    m = _group_line_re.match(line)
+    if not m:
+        return None
+    d = m.groupdict()
+    d["gid"] = int(d["gid"]) if d["gid"].isdigit() else d["gid"]
+    d["members"] = [x for x in d["members"].split(",") if x]
+    return d
+
+
+def format_group_entry(d: dict) -> str:
+    members = ",".join(d.get("members", []))
+    return f"{d['name']}:{d.get('passwd','x')}:{int(d['gid'])}:{members}"
+
+# ---- /etc/shadow parsing ----
+_shadow_line_re = re.compile(r"^(?P<name>[^:]+):(?P<passwd>[^:]*):(?P<lastchg>\d*):(?P<min>\d*):(?P<max>\d*):(?P<warn>\d*):(?P<inactive>\d*):(?P<expire>\d*):(?P<flag>[^\n:]*)$")
+
+
+def read_shadow_lines() -> List[str]:
+    ensure_etc_layout()
+    with LockedFile(app.config["SHADOW_PATH"], "r") as f:
+        return f.read().splitlines()
+
+
+def write_shadow_lines(lines: List[str]) -> None:
+    ensure_etc_layout()
+    with LockedFile(app.config["SHADOW_PATH"], "r+") as f:
+        content = "\n".join(lines) + "\n" if lines and not lines[-1].endswith("\n") else "\n".join(lines)
+        f.seek(0)
+        f.write(content)
+        f.truncate()
+
+
+def parse_shadow_line(line: str) -> Optional[dict]:
+    m = _shadow_line_re.match(line)
+    if not m:
+        return None
+    d = m.groupdict()
+    # Convert numeric fields if present
+    for k in ["lastchg", "min", "max", "warn", "inactive", "expire"]:
+        if d.get(k):
+            try:
+                d[k] = int(d[k])
+            except ValueError:
+                pass
+    return d
+
+
+def format_shadow_entry(d: dict) -> str:
+    # Fill defaults similar to Debian/Ubuntu: min=0, max=99999, warn=7
+    return (
+        f"{d['name']}:{d['passwd']}:{d.get('lastchg', 0)}:"
+        f"{d.get('min', 0)}:{d.get('max', 99999)}:{d.get('warn', 7)}:"
+        f"{d.get('inactive', '')}:{d.get('expire', '')}:{d.get('flag', '')}"
+    )
+
+
+def ensure_sudoers_dir():
+    ensure_etc_layout()

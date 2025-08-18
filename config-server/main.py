@@ -1,27 +1,42 @@
 from flask import Flask, request, jsonify
+import fcntl
+import re
+import time
+from typing import List, Optional
 from kubernetes import client, config as k8s_config
 import pymysql
 import os
 import requests
 
-from dotenv import load_dotenv
-load_dotenv()
 
 from bg_redis import save_background_status
 from utils import get_existing_pod
+from utils import (
+    LockedFile,
+    ensure_etc_layout, ensure_sudoers_dir,
+    read_passwd_lines, write_passwd_lines,
+    read_group_lines, write_group_lines,
+    read_shadow_lines, write_shadow_lines,
+    parse_passwd_line, format_passwd_entry,
+    parse_group_line, format_group_entry,
+    parse_shadow_line, format_shadow_entry,
+)
+
+
 
 
 app = Flask(__name__)
 
 # ---- Global app configuration ----
+BASE_ETC_DIR = "/home/tako8/share/kube_share"
 app.config.from_mapping({
     # Namespace
-    "NAMESPACE": os.getenv("NAMESPACE", "default"),
+    "NAMESPACE": "cssh",
 
     # External endpoints & timeouts
-    "PROM_URL": os.getenv("PROM_URL", "http://210.94.179.19:9750"),
-    "WAS_URL_TEMPLATE": os.getenv("WAS_URL_TEMPLATE", "http://210.94.179.19:9796/api/acceptinfo/{username}"),
-    "HTTP_TIMEOUT_SEC": float(os.getenv("HTTP_TIMEOUT_SEC", "3.0")),
+    "PROM_URL": "http://210.94.179.19:9750",
+    "WAS_URL_TEMPLATE": "http://210.94.179.19:9796/api/acceptinfo/{username}",
+    "HTTP_TIMEOUT_SEC": 3.0,
 
     # Default resources
     "DEFAULT_CPU_REQUEST": "1000m",
@@ -30,7 +45,7 @@ app.config.from_mapping({
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
     # PVC / storage policy
-    "STORAGE_CLASS_NAME": os.getenv("STORAGE_CLASS_NAME", "nfs-nas-v3-expandable"),
+    "STORAGE_CLASS_NAME": "nfs-nas-v3-expandable",
     "PVC_NAME_PATTERN": "pvc-{username}-share",
     "PVC_ACCESS_MODES": ["ReadWriteMany"],
     "PVC_SIZE_UNIT": "Gi",
@@ -46,6 +61,11 @@ app.config.from_mapping({
     "NVIDIA_AUX_DEVICES": [
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
+    "BASE_ETC_DIR": BASE_ETC_DIR,
+    "PASSWD_PATH": BASE_ETC_DIR + "/passwd",
+    "GROUP_PATH": BASE_ETC_DIR + "/group",
+    "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
+    "SUDOERS_DIR": BASE_ETC_DIR + "/sudoers.d",
 })
 
 @app.route("/health", methods=["GET"])
@@ -421,6 +441,206 @@ def select_best_node_from_prometheus(node_list):
     return best_node
 
 
+from flask import Blueprint
+
+accounts_bp = Blueprint("accounts", __name__)
+
+# ---------- /etc/passwd CRUD ----------
+@accounts_bp.route("/adduser", methods=["POST"])
+def create_user():
+    """Create a new user across passwd, group, shadow, and sudoers.
+    Required JSON: name, uid, gid, passwd_sha512
+    Optional: gecos, primary_group_name
+    Notes:
+      - home is auto-set to /home/{name}
+      - shell is fixed to /bin/bash
+      - passwd_sha512 must be a full SHA-512 crypt string (e.g., $6$...)
+    """
+    data = request.get_json(force=True)
+    required = ["name", "uid", "gid", "passwd_sha512"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
+
+    name = data["name"]
+    lines = read_passwd_lines()
+    if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
+        return jsonify({"error": "user already exists"}), 409
+
+    entry = {
+        "name": name,
+        "passwd": "x",  # shadow-based auth
+        "uid": int(data["uid"]),
+        "gid": int(data["gid"]),
+        "gecos": data.get("gecos", ""),
+        "home": f"/home/{name}",
+        "shell": "/bin/bash",
+    }
+
+    # 1) passwd
+    lines.append(format_passwd_entry(entry))
+    write_passwd_lines(lines)
+
+    # 2) primary group ensure
+    pg_name = data.get("primary_group_name", name)
+    g_lines = read_group_lines()
+    target_gid = int(data["gid"])
+    existing = None
+    for gl in g_lines:
+        rec = parse_group_line(gl)
+        if rec and (rec["gid"] == target_gid or rec["name"] == pg_name):
+            existing = rec
+            break
+    if existing is None:
+        new_group = {"name": pg_name, "passwd": "x", "gid": target_gid, "members": []}
+        g_lines.append(format_group_entry(new_group))
+        write_group_lines(g_lines)
+
+    # 3) shadow
+    today_days = int(time.time() // 86400)
+    sh_lines = read_shadow_lines()
+    shadow_entry = {
+        "name": name,
+        "passwd": data["passwd_sha512"],
+        "lastchg": today_days,
+        "min": 0,
+        "max": 99999,
+        "warn": 7,
+        "inactive": "",
+        "expire": "",
+        "flag": "",
+    }
+    sh_lines.append(format_shadow_entry(shadow_entry))
+    write_shadow_lines(sh_lines)
+
+    # 4) sudoers
+    ensure_sudoers_dir()
+    s_path = os.path.join(app.config["SUDOERS_DIR"], name)
+    tmp = s_path + ".tmp"
+    with LockedFile(tmp, "w") as f:
+        f.write(f"{name} ALL=(ALL) NOPASSWD:ALL\n")
+    os.replace(tmp, s_path)
+    os.chmod(s_path, 0o440)
+
+    return jsonify({"status": "created", "user": entry, "group": {"name": pg_name, "gid": target_gid}, "sudoers": s_path}), 201
+
+@accounts_bp.route("/deleteuser/<username>", methods=["POST"])
+def delete_user(username: str):
+    # Remove from /etc/passwd
+    lines = read_passwd_lines()
+    new_lines = []
+    removed_user = None
+    for line in lines:
+        rec = parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            removed_user = rec
+            continue
+        new_lines.append(line)
+    if removed_user is None:
+        return jsonify({"error": "user not found"}), 404
+    write_passwd_lines(new_lines)
+
+    # Remove from /shadow
+    sh_lines = read_shadow_lines()
+    sh_new = []
+    for sl in sh_lines:
+        srec = parse_shadow_line(sl)
+        if srec and srec["name"] == username:
+            continue
+        sh_new.append(sl)
+    write_shadow_lines(sh_new)
+
+    # Remove sudoers file if present
+    try:
+        ensure_sudoers_dir()
+        path = os.path.join(app.config["SUDOERS_DIR"], username)
+        if os.path.exists(path):
+            # lock-then-remove pattern
+            with LockedFile(path, "r+") as _:
+                pass
+            os.remove(path)
+    except Exception:
+        pass
+
+    # Clean /etc/group: remove user from all member lists; delete any group that had this user
+    # (either explicitly in members or implicitly as the primary GID group) if now empty.
+    g_lines = read_group_lines()
+    g_new = []
+    for gl in g_lines:
+        grec = parse_group_line(gl)
+        if not grec:
+            g_new.append(gl)
+            continue
+
+        had_user_member = username in grec.get("members", [])
+        is_primary_group = (removed_user is not None and grec.get("gid") == removed_user.get("gid"))
+
+        # Remove from explicit members list
+        if had_user_member:
+            grec["members"] = [m for m in grec["members"] if m != username]
+
+        # If this group had the user (explicitly or via primary gid) and is now empty, drop the group
+        if (had_user_member or is_primary_group) and not grec.get("members"):
+            continue
+
+        g_new.append(format_group_entry(grec))
+
+    write_group_lines(g_new)
+
+    return jsonify({"status": "deleted", "user": username})
+
+# ----------- Add user to supplementary groups -----------
+@accounts_bp.route("/addusergroup", methods=["POST"])
+def add_user_groups():
+    """Add user to one or more existing groups. Body: {"username": ..., "add": [...]}
+    Groups must already exist. Does not touch primary group (by gid).
+    """
+    data = request.get_json(force=True)
+    username = data.get("username")
+    if not username:
+        return jsonify({"error": "username is required"}), 400
+    add = data.get("add") or []
+    if not add:
+        return jsonify({"error": "'add' list is required"}), 400
+
+    # Verify user exists and capture their name
+    user_found = False
+    for line in read_passwd_lines():
+        rec = parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            user_found = True
+            break
+    if not user_found:
+        return jsonify({"error": "user not found"}), 404
+
+    # Update group file
+    g_lines = read_group_lines()
+    names = set(add)
+    updated = False
+    new_lines = []
+    for gl in g_lines:
+        rec = parse_group_line(gl)
+        if rec and rec["name"] in names:
+            members = set(rec.get("members", []))
+            if username not in members:
+                members.add(username)
+                rec["members"] = sorted(members)
+                updated = True
+            new_lines.append(format_group_entry(rec))
+        else:
+            new_lines.append(gl)
+
+    # Ensure all requested groups existed
+    existing_group_names = {parse_group_line(gl)["name"] for gl in g_lines if parse_group_line(gl)}
+    missing = [g for g in add if g not in existing_group_names]
+    if missing:
+        return jsonify({"error": f"groups not found: {', '.join(missing)}"}), 404
+
+    write_group_lines(new_lines)
+    return jsonify({"status": "updated", "added_to": sorted(list(names))})
+
+# Register the blueprint under /accounts
+app.register_blueprint(accounts_bp, url_prefix="/accounts")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
