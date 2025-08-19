@@ -1,0 +1,73 @@
+#!/bin/bash
+# ContainerSSH logout handler for user testing
+# This script runs when a user logs out from their shell session
+
+# ============================================================================
+# Custom Logout Hooks - Add your extended functionality here
+# ============================================================================
+
+# Custom function called before logout processing
+# You can add any custom logic here (blocking or non-blocking)
+on_farewell_custom() {
+    # This function runs every time a user logs out
+    # Add your custom functionality here such as:
+    #   - Cleanup tasks
+    #   - Validation checks  
+    #   - Backup operations
+    #   - Resource monitoring
+    #   - Notifications
+    #   - Conditional logout blocking
+    
+    # Example usage (currently commented out):
+    # echo "[$timestamp] Custom farewell logic executed for user '$user'" >> "$log_file"
+    
+    # For blocking behavior (prevent logout on certain conditions):
+    # if [[ some_condition ]]; then
+    #     echo "[$timestamp] Logout blocked due to: reason" >> "$log_file"
+    #     exit 1  # This will prevent shell from closing
+    # fi
+    
+    return 0  # Return 0 to allow logout, non-zero to block
+}
+
+# ============================================================================
+
+# Get current timestamp in Korean time - simplified approach
+utc_epoch=$(date -u +%s)
+kst_epoch=$((utc_epoch + 32400))
+timestamp=$(date -d "@$kst_epoch" '+%Y-%m-%d %H:%M:%S KST' 2>/dev/null) || timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+user=${USER:-"unknown"}
+hostname=$(hostname 2>/dev/null || echo "unknown")
+# Use original PID if available, otherwise current PID
+actual_pid=${ORIGINAL_PID:-$$}
+
+# Create log directory in persistent storage
+log_dir="/home/jy/.containerssh_logs"
+mkdir -p "$log_dir"
+
+# Log file path
+log_file="$log_dir/logout.log"
+
+# Execute custom logout hook first
+on_farewell_custom
+hook_result=$?
+
+# Check if custom hook blocked the logout
+if [ $hook_result -ne 0 ]; then
+    echo "[$timestamp] Logout blocked by custom hook (exit code: $hook_result)" >> "$log_file"
+    exit $hook_result  # This will prevent shell termination if called in blocking mode
+fi
+
+# Write logout event to log file
+echo "[$timestamp] User '$user' logged out from hostname '$hostname' (PID: $actual_pid)" >> "$log_file"
+
+# Also log environment info for debugging
+echo "[$timestamp] Environment: HOME=$HOME, PWD=$PWD, SHELL=$SHELL, Monitor_PID=${ORIGINAL_PID:-'not_set'}" >> "$log_file"
+
+# Optional: Send notification or perform cleanup tasks
+# echo "[$timestamp] Cleanup completed for user '$user'" >> "$log_file"
+
+# Ensure log file is readable
+chmod 644 "$log_file"
+
+exit 0
