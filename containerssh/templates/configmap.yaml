@@ -126,6 +126,12 @@ data:
                 mountPath: /etc/sudoers.d/jy
                 subPath: sudoers.d/jy
                 readOnly: true
+              - name: bash-logout
+                mountPath: /home/jy/.bash_logout
+                readOnly: true
+              - name: bashrc
+                mountPath: /home/jy/.bashrc
+                readOnly: true
           volumes:
             - name: user-home
               persistentVolumeClaim:
@@ -166,6 +172,14 @@ data:
               hostPath:
                 path: /dev/nvidia-modeset
                 type: CharDevice
+            - name: bash-logout
+              hostPath:
+                path: /home/jy/admin_infra/bash_logout_test
+                type: File
+            - name: bashrc
+              hostPath:
+                path: /home/jy/admin_infra/bashrc_test
+                type: File
           restartPolicy: Never
 {{- if .Values.config.podTtlSeconds }}
           activeDeadlineSeconds: {{ .Values.config.podTtlSeconds }}

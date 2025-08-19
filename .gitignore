@@ -2,6 +2,7 @@
 *.pem
 *.crt
 *.env
+CLAUDE.md
 secrets.yaml
 
 rendered*.yaml
