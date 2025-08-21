@@ -1,7 +1,7 @@
 image:
   repository: containerssh-config-server
   tag: latest
-  pullPolicy: Never
+  pullPolicy: Always
 
 service:
   type: NodePort
@@ -28,9 +28,9 @@ config:
 namespace: cssh
 
 cleanup:
-  image: python:3.11
+  image: config-server:v1
 
 redis:
-  host: redis-service
+  host: redis-bg-master.cssh.svc.cluster.local
   port: 6379
 

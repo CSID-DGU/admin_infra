@@ -31,6 +31,23 @@ on_farewell_custom() {
 }
 
 # ============================================================================
+# Custom function called before logout processing
+on_farewell_custom() {
+    pod_name=$(hostname)
+
+    curl -s -X POST "http://210.94.179.19:9732/report-background" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\": \"$USER\", \"pod_name\": \"$pod_name\"}" \
+        >> "$log_file" 2>&1
+
+    if [ $? -eq 0 ]; then
+        echo "[$timestamp] Report sent for user '$USER', pod '$pod_name'" >> "$log_file"
+    else
+        echo "[$timestamp] Failed to send report for user '$USER', pod '$pod_name'" >> "$log_file"
+    fi
+
+    return 0
+}
 
 # Get current timestamp in Korean time - simplified approach
 utc_epoch=$(date -u +%s)

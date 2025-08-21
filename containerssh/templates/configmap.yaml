@@ -27,6 +27,10 @@ data:
           url: {{ include "containerssh.authPubkeyUrl" . }}
       timeout: {{ .Values.config.authTimeout }}
 
+    configserver:
+      url: "{{ .Values.config.configServerUrl }}"
+      timeout: 10s
+
     security:
       forwarding:
         reverseForwardingMode: enable

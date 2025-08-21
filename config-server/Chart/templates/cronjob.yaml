@@ -7,15 +7,13 @@ spec:
   schedule: "0 * * * *"
   jobTemplate:
     spec:
+      ttlSecondsAfterFinished: 300
       template:
         spec:
           containers:
           - name: cleanup
             image: {{ .Values.cleanup.image }}
             command: ["python", "/app/cleanup_cronjob.py"]
-            volumeMounts:
-              - name: app-code
-                mountPath: /app
             env:
               - name: REDIS_HOST
                 value: {{ .Values.redis.host }}
