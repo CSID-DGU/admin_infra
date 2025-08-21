@@ -1,5 +1,11 @@
+import os
+import re
+import fcntl
 import subprocess
+from typing import List, Optional
+
 from kubernetes import client, config as k8s_config
+from flask import current_app as app
 
 def load_k8s():
     # k8s client 초기
