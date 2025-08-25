@@ -10,7 +10,17 @@ from utils import get_existing_pod   # Pod 재사용 확인
 from bg_redis import save_background_status
 from utils import pod_has_process, delete_pod
 
+import logging, sys
+
 app = Flask(__name__)
+
+# 로그 설정
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(message)s")
+handler.setFormatter(formatter)
+app.logger.addHandler(handler)
+app.logger.setLevel(logging.DEBUG)
 
 NAMESPACE = os.getenv("NAMESPACE", "default")
 
@@ -22,23 +32,145 @@ def health():
 
 @app.route("/config", methods=["POST"])
 def config():
-    data = request.get_json(force=True)
-    username = data.get("username")
-    if not username:
-        return jsonify({"error": "username is required"}), 400
+    try:
+        app.logger.info("==== /config called ====")
+        app.logger.info("Raw body: %s", request.data)
+        data = request.get_json(force=True)
+        app.logger.info("Parsed JSON: %s", data)
+        username = data.get("username")
 
-    # 현재 실행 중인 Pod 확인 → 있으면 attach 모드로 반환
-    existing_pod = get_existing_pod(NAMESPACE, username)
-    if existing_pod:
-        return jsonify({
+        if not username:
+            app.logger.warning("No username in request.")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+        # 현재 실행 중인 Pod 확인 → 있으면 attach 모드로 반환
+        existing_pod = get_existing_pod(NAMESPACE, username)
+        if existing_pod:
+            response = {
+                "config": {
+                    "backend": "kubernetes",
+                    "kubernetes": {
+                        "connection": {
+                            "host": "https://kubernetes.default.svc",
+                            "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                            "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                        },
+                        "pod": {
+                            "attach": {
+                                "podName": existing_pod,
+                                "namespace": NAMESPACE,
+                                "container": "shell"
+                            }
+                        }
+                    }
+                },
+                "environment": {
+                    "USER": {"value": username, "sensitive": False}
+                },
+                "metadata": {},
+                "files": {}
+            }
+            app.logger.info("Final /config response (attach): %s", response)
+            return jsonify(response)
+
+
+        # Mock 사용자 정보 (Spring WAS / Prometheus 없이 테스트용)
+        user_info = {
+            "username": username,
+            "image": "dguailab/containerssh-guest:cuda11.8-cudnn8-dev-ubuntu22.04",
+            "uid": 1001,
+            "gid": 1001,
+            "gpu_required": True,
+            "gpu_nodes": [
+                {"node_name": "farm8", "num_gpu": 4}
+            ]
+        }
+
+        best_node = user_info["gpu_nodes"][0]["node_name"].lower()
+        image = user_info["image"]
+        uid = user_info["uid"]
+        gid = user_info["gid"]
+
+        # Pod spec 반환 (없으면 새로 생성)
+        spec = {
             "config": {
                 "backend": "kubernetes",
                 "kubernetes": {
+                    "connection": {
+                        "host": "https://kubernetes.default.svc",
+                        "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                        "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                    },
                     "pod": {
-                        "attach": {
-                            "podName": existing_pod,
+                        "metadata": {
+                            "name": f"containerssh-{username}",
                             "namespace": NAMESPACE,
-                            "container": "shell"
+                            "labels": {
+                                "app": "containerssh-guest",
+                                "managed-by": "containerssh",
+                                "containerssh_username": username
+                            }
+                        },
+                        "spec": {
+                            "nodeName": best_node,
+                            "securityContext": {
+                                "runAsUser": uid,
+                                "runAsGroup": gid,
+                                "fsGroup": gid
+                            },
+                            "containers": [
+                                {
+                                    "name": "shell",
+                                    "image": image,
+                                    "imagePullPolicy": "Never",
+                                    "stdin": True,
+                                    "tty": True,
+                                    "env": [
+                                        {"name": "USER", "value": username},
+                                        {"name": "USER_ID", "value": username},
+                                        {"name": "USER_PW", "value": "1234"},
+                                        {"name": "UID", "value": str(uid)},
+                                        {"name": "HOME", "value": f"/home/{username}"},
+                                        {"name": "SHELL", "value": "/bin/bash"}
+                                    ],
+                                    "resources": {
+                                        "requests": {"cpu": "1000m", "memory": "1024Mi"},
+                                        "limits": {"cpu": "1000m", "memory": "1024Mi"}
+                                    },
+                                    "volumeMounts": [
+                                        {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
+                                        {"name": "nvidia0", "mountPath": "/dev/nvidia0"},
+                                        {"name": "nvidia1", "mountPath": "/dev/nvidia1"},
+                                        {"name": "nvidia2", "mountPath": "/dev/nvidia2"},
+                                        {"name": "nvidia3", "mountPath": "/dev/nvidia3"},
+                                        {"name": "nvidiactl", "mountPath": "/dev/nvidiactl"},
+                                        {"name": "nvidiauvm", "mountPath": "/dev/nvidia-uvm"},
+                                        {"name": "nvidiauvmtools", "mountPath": "/dev/nvidia-uvm-tools"},
+                                        {"name": "nvidiamodeset", "mountPath": "/dev/nvidia-modeset"},
+                                        {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
+                                        {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
+                                        {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
+                                        {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
+                                        {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
+                                        {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
+                                    ]
+                                }
+                            ],
+                            "volumes": [
+                                {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
+                                {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
+                                {"name": "nvidia0", "hostPath": {"path": "/dev/nvidia0", "type": "CharDevice"}},
+                                {"name": "nvidia1", "hostPath": {"path": "/dev/nvidia1", "type": "CharDevice"}},
+                                {"name": "nvidia2", "hostPath": {"path": "/dev/nvidia2", "type": "CharDevice"}},
+                                {"name": "nvidia3", "hostPath": {"path": "/dev/nvidia3", "type": "CharDevice"}},
+                                {"name": "nvidiactl", "hostPath": {"path": "/dev/nvidiactl", "type": "CharDevice"}},
+                                {"name": "nvidiauvm", "hostPath": {"path": "/dev/nvidia-uvm", "type": "CharDevice"}},
+                                {"name": "nvidiauvmtools", "hostPath": {"path": "/dev/nvidia-uvm-tools", "type": "CharDevice"}},
+                                {"name": "nvidiamodeset", "hostPath": {"path": "/dev/nvidia-modeset", "type": "CharDevice"}},
+                                {"name": "bash-logout", "hostPath": {"path": "/home/jy/admin_infra/bash_logout_test", "type": "File"}},
+                                {"name": "bashrc", "hostPath": {"path": "/home/jy/admin_infra/bashrc_test", "type": "File"}}
+                            ],
+                            "restartPolicy": "Never"
                         }
                     }
                 }
@@ -48,109 +180,18 @@ def config():
             },
             "metadata": {},
             "files": {}
-        })
+        }
 
-    # 🔹 Mock 사용자 정보 (Spring WAS / Prometheus 없이 테스트용)
-    user_info = {
-        "username": username,
-        "image": "dguailab/containerssh-guest:cuda11.8-cudnn8-dev-ubuntu22.04",
-        "uid": 1001,
-        "gid": 1001,
-        "gpu_required": True,
-        "gpu_nodes": [
-            {"node_name": "FARM8", "num_gpu": 4}
-        ]
-    }
-
-    best_node = user_info["gpu_nodes"][0]["node_name"]
-    image = user_info["image"]
-    uid = user_info["uid"]
-    gid = user_info["gid"]
-
-    # Pod spec 반환 (없으면 새로 생성)
-    return jsonify({
-        "config": {
-            "backend": "kubernetes",
-            "kubernetes": {
-                "pod": {
-                    "metadata": {
-                        "name": f"containerssh-{username}",
-                        "namespace": NAMESPACE,
-                        "labels": {
-                            "app": "containerssh-guest",
-                            "managed-by": "containerssh"
-                        }
-                    },
-                    "spec": {
-                        "nodeName": best_node,
-                        "securityContext": {
-                            "runAsUser": uid,
-                            "runAsGroup": gid,
-                            "fsGroup": gid
-                        },
-                        "containers": [
-                            {
-                                "name": "shell",
-                                "image": image,
-                                "imagePullPolicy": "Never",
-                                "stdin": True,
-                                "tty": True,
-                                "env": [
-                                    {"name": "USER", "value": username},
-                                    {"name": "USER_ID", "value": username},
-                                    {"name": "USER_PW", "value": "1234"},
-                                    {"name": "UID", "value": str(uid)},
-                                    {"name": "HOME", "value": f"/home/{username}"},
-                                    {"name": "SHELL", "value": "/bin/bash"}
-                                ],
-                                "resources": {
-                                    "requests": {"cpu": "1000m", "memory": "1024Mi"},
-                                    "limits": {"cpu": "1000m", "memory": "1024Mi"}
-                                },
-                                "volumeMounts": [
-                                    {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
-                                    {"name": "nvidia0", "mountPath": "/dev/nvidia0"},
-                                    {"name": "nvidia1", "mountPath": "/dev/nvidia1"},
-                                    {"name": "nvidia2", "mountPath": "/dev/nvidia2"},
-                                    {"name": "nvidia3", "mountPath": "/dev/nvidia3"},
-                                    {"name": "nvidiactl", "mountPath": "/dev/nvidiactl"},
-                                    {"name": "nvidiauvm", "mountPath": "/dev/nvidia-uvm"},
-                                    {"name": "nvidiauvmtools", "mountPath": "/dev/nvidia-uvm-tools"},
-                                    {"name": "nvidiamodeset", "mountPath": "/dev/nvidia-modeset"},
-                                    {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
-                                    {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
-                                    {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
-                                    {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
-                                    {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
-                                    {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
-                                ]
-                            }
-                        ],
-                        "volumes": [
-                            {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
-                            {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
-                            {"name": "nvidia0", "hostPath": {"path": "/dev/nvidia0", "type": "CharDevice"}},
-                            {"name": "nvidia1", "hostPath": {"path": "/dev/nvidia1", "type": "CharDevice"}},
-                            {"name": "nvidia2", "hostPath": {"path": "/dev/nvidia2", "type": "CharDevice"}},
-                            {"name": "nvidia3", "hostPath": {"path": "/dev/nvidia3", "type": "CharDevice"}},
-                            {"name": "nvidiactl", "hostPath": {"path": "/dev/nvidiactl", "type": "CharDevice"}},
-                            {"name": "nvidiauvm", "hostPath": {"path": "/dev/nvidia-uvm", "type": "CharDevice"}},
-                            {"name": "nvidiauvmtools", "hostPath": {"path": "/dev/nvidia-uvm-tools", "type": "CharDevice"}},
-                            {"name": "nvidiamodeset", "hostPath": {"path": "/dev/nvidia-modeset", "type": "CharDevice"}},
-                            {"name": "bash-logout", "hostPath": {"path": "/home/jy/admin_infra/bash_logout_test", "type": "File"}},
-                            {"name": "bashrc", "hostPath": {"path": "/home/jy/admin_infra/bashrc_test", "type": "File"}}
-                        ],
-                        "restartPolicy": "Never"
-                    }
-                }
-            }
-        },
-        "environment": {
-            "USER": {"value": username, "sensitive": False}
-        },
-        "metadata": {},
-        "files": {}
-    })
+        return jsonify(spec)
+    
+    except Exception as e:
+        app.logger.exception("Error in /config")
+        return jsonify({
+            "config": {},
+            "environment": {},
+            "metadata": {},
+            "files": {}
+        }), 200
 
 
 @app.route("/report-background", methods=["POST"])
@@ -181,9 +222,9 @@ def create_or_resize_pvc():
     if not username or not storage_raw:
         return jsonify({"error": "username and storage are required"}), 400
 
-    storage = f"{storage_raw}{app.config['PVC_SIZE_UNIT']}"
-    pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
-    namespace = app.config["NAMESPACE"]
+    storage = f"{storage_raw}Gi"
+    pvc_name = f"pvc-{username}-share"
+    namespace = NAMESPACE
 
     try:
         try:
@@ -223,11 +264,11 @@ def create_or_resize_pvc():
                 annotations={"nfs.io/username": username}  # optional
             ),
             spec=client.V1PersistentVolumeClaimSpec(
-                access_modes=app.config["PVC_ACCESS_MODES"],
+                access_modes=["ReadWriteMany"],
                 resources=client.V1ResourceRequirements(
                     requests={"storage": storage}
                 ),
-                storage_class_name=app.config["STORAGE_CLASS_NAME"]
+                storage_class_name="nfs-nas-v3-expandable"
             )
         )
         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
@@ -247,9 +288,9 @@ def resize_pvc():
     if not username or not storage_raw:
         return jsonify({"error": "username and storage are required"}), 400
 
-    storage = f"{storage_raw}{app.config['PVC_SIZE_UNIT']}"
-    pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
-    namespace = app.config["NAMESPACE"]
+    storage = f"{storage_raw}Gi"
+    pvc_name = f"pvc-{username}-share"
+    namespace = NAMESPACE
 
     try:
         try:
@@ -284,8 +325,7 @@ def resize_pvc():
 
 
 def select_best_node_from_prometheus(node_list):
-    prom_url = app.config["PROM_URL"]
-    timeout = app.config["HTTP_TIMEOUT_SEC"]
+    PROM_URL = "http://210.94.179.19:9750"
     best_node = None
     best_score = float("inf")
 
@@ -297,7 +337,7 @@ def select_best_node_from_prometheus(node_list):
         ) / (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
         """
         try:
-            response = requests.get(f"{prom_url}/api/v1/query", params={"query": query}, timeout=timeout)
+            response = requests.get(f"{PROM_URL}/api/v1/query", params={"query": query}, timeout=2)
             value = float(response.json()["data"]["result"][0]["value"][1])
         except:
             value = float("inf")
@@ -512,5 +552,5 @@ app.register_blueprint(accounts_bp, url_prefix="/accounts")
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=8000, debug=True)
 

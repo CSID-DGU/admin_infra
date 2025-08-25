@@ -60,7 +60,7 @@ def get_existing_pod(namespace, username):
     core_v1 = client.CoreV1Api()
     pods = core_v1.list_namespaced_pod(
         namespace=namespace,
-        label_selector=f"user={username}"
+        label_selector=f"containerssh_username={username}"
     )
     for pod in pods.items:
         if pod.status.phase == "Running":
