@@ -5,42 +5,37 @@
 # ============================================================================
 # Custom Logout Hooks - Add your extended functionality here
 # ============================================================================
+# Create log directory in persistent storage
+log_dir="/home/jy/.containerssh_logs"
+mkdir -p "$log_dir"
 
-# Custom function called before logout processing
-# You can add any custom logic here (blocking or non-blocking)
-on_farewell_custom() {
-    # This function runs every time a user logs out
-    # Add your custom functionality here such as:
-    #   - Cleanup tasks
-    #   - Validation checks  
-    #   - Backup operations
-    #   - Resource monitoring
-    #   - Notifications
-    #   - Conditional logout blocking
-    
-    # Example usage (currently commented out):
-    # echo "[$timestamp] Custom farewell logic executed for user '$user'" >> "$log_file"
-    
-    # For blocking behavior (prevent logout on certain conditions):
-    # if [[ some_condition ]]; then
-    #     echo "[$timestamp] Logout blocked due to: reason" >> "$log_file"
-    #     exit 1  # This will prevent shell from closing
-    # fi
-    
-    return 0  # Return 0 to allow logout, non-zero to block
-}
+# Log file path
+log_file="$log_dir/logout.log"
+
+# Get initial timestamp for start message
+initial_utc_epoch=$(date -u +%s)
+initial_kst_epoch=$((initial_utc_epoch + 32400))
+initial_timestamp=$(date -d "@$initial_kst_epoch" '+%Y-%m-%d %H:%M:%S KST' 2>/dev/null) || initial_timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+echo "[$initial_timestamp] start logout process" >> "$log_file"
 
 # ============================================================================
 # Custom function called before logout processing
 on_farewell_custom() {
-    pod_name=$(hostname)
+    # Get timestamp inside function to ensure it's available
+    local utc_epoch=$(date -u +%s)
+    local kst_epoch=$((utc_epoch + 32400))
+    local timestamp=$(date -d "@$kst_epoch" '+%Y-%m-%d %H:%M:%S KST' 2>/dev/null) || timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    local pod_name=$(hostname)
 
-    curl -s -X POST "http://210.94.179.19:9732/report-background" \
+    echo "[$timestamp] start farewell process" >> "$log_file"
+    
+    # Add timeout and better error handling for curl
+    if curl -s --connect-timeout 10 --max-time 30 -X POST "http://210.94.179.19:9732/report-background" \
         -H "Content-Type: application/json" \
         -d "{\"username\": \"$USER\", \"pod_name\": \"$pod_name\"}" \
-        >> "$log_file" 2>&1
-
-    if [ $? -eq 0 ]; then
+        >> "$log_file" 2>&1; then
         echo "[$timestamp] Report sent for user '$USER', pod '$pod_name'" >> "$log_file"
     else
         echo "[$timestamp] Failed to send report for user '$USER', pod '$pod_name'" >> "$log_file"
@@ -48,7 +43,6 @@ on_farewell_custom() {
 
     return 0
 }
-
 # Get current timestamp in Korean time - simplified approach
 utc_epoch=$(date -u +%s)
 kst_epoch=$((utc_epoch + 32400))
@@ -58,16 +52,11 @@ hostname=$(hostname 2>/dev/null || echo "unknown")
 # Use original PID if available, otherwise current PID
 actual_pid=${ORIGINAL_PID:-$$}
 
-# Create log directory in persistent storage
-log_dir="/home/jy/.containerssh_logs"
-mkdir -p "$log_dir"
-
-# Log file path
-log_file="$log_dir/logout.log"
-
 # Execute custom logout hook first
+echo "[$timestamp] About to call on_farewell_custom" >> "$log_file"
 on_farewell_custom
 hook_result=$?
+echo "[$timestamp] on_farewell_custom returned with code: $hook_result" >> "$log_file"
 
 # Check if custom hook blocked the logout
 if [ $hook_result -ne 0 ]; then
