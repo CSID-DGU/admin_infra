@@ -27,10 +27,6 @@ data:
           url: {{ include "containerssh.authPubkeyUrl" . }}
       timeout: {{ .Values.config.authTimeout }}
 
-    configserver:
-      url: "{{ .Values.config.configServerUrl }}"
-      timeout: 10s
-
     security:
       forwarding:
         reverseForwardingMode: enable
@@ -56,10 +52,18 @@ data:
           labels:
             app: containerssh-guest
             managed-by: containerssh
-        #idleCommand:
-          #- /bin/bash
-          #- -c
-          #- /entrypoint.sh && /usr/bin/containerssh-agent wait-signal --signal INT --signal TERM
+        idleCommand:
+          #- /usr/bin/containerssh-agent
+          #- wait-signal
+          #- --signal
+          #- ALRM
+          # Alternatively keep PID1 alive forever with:
+          - sleep
+          - infinity
+          # Or run a non-login bash that doesn't exit on user logout:
+          # - /bin/bash
+          # - -c
+          # - "trap : TERM INT; sleep infinity & wait"
         spec:
           securityContext:
             #runAsNonRoot: false
@@ -185,6 +189,7 @@ data:
                 path: /home/jy/admin_infra/bashrc_test
                 type: File
           restartPolicy: Never
+          terminationGracePeriodSeconds: 259200
 {{- if .Values.config.podTtlSeconds }}
           activeDeadlineSeconds: {{ .Values.config.podTtlSeconds }}
 {{- end }}
