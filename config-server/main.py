@@ -8,7 +8,8 @@ import pymysql
 import os
 import requests
 
-from dotenv import load_dotenv                                              load_dotenv()
+from dotenv import load_dotenv
+load_dotenv()
 
 import logging, sys
 
@@ -26,6 +27,8 @@ from utils import (
     parse_shadow_line, format_shadow_entry,
 )
 
+app = Flask(__name__)
+
 # 로그 설정                                                             
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
@@ -33,8 +36,6 @@ formatter = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(mess
 handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 app.logger.setLevel(logging.DEBUG)
-
-app = Flask(__name__)
 
 # ---- Global app configuration ----
 BASE_ETC_DIR = "/home/tako8/share/kube_share"
@@ -363,7 +364,7 @@ def create_or_resize_pvc():
 
     storage = f"{storage_raw}Gi"
     pvc_name = f"pvc-{username}-share"
-    namespace = NAMESPACE
+    namespace = app.config["NAMESPACE"]
 
     try:
         try:
@@ -429,7 +430,7 @@ def resize_pvc():
 
     storage = f"{storage_raw}Gi"
     pvc_name = f"pvc-{username}-share"
-    namespace = NAMESPACE
+    namespace = app.config["NAMESPACE"]
 
     try:
         try:
