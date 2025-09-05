@@ -1,6 +1,6 @@
 image:
-  repository: containerssh-config-server
-  tag: latest
+  repository: config-server
+  tag: v1
   pullPolicy: Always
 
 service:
