@@ -3,7 +3,7 @@
 {{- end }}
 
 {{- define "containerssh.authPasswordUrl" -}}
-http://containerssh-auth-service.{{ .Values.config.namespace }}.svc.cluster.local
+{{ .Values.config.authPasswordUrl }}
 {{- end }}
 
 {{- define "containerssh.authPubkeyUrl" -}}
