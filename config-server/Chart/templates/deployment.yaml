@@ -42,4 +42,13 @@ spec:
             limits:
               cpu: {{ .Values.resources.limits.cpu }}
               memory: {{ .Values.resources.limits.memory }}
+          volumeMounts:
+            - name: nfs-kube-share
+              mountPath: /home/tako8/share/kube_share
+      volumes:
+        - name: nfs-kube-share
+          nfs:
+            server: {{ .Values.nfs.server }}
+            path: {{ .Values.nfs.path }}
+            readOnly: false
 
