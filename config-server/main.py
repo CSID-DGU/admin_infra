@@ -674,6 +674,51 @@ def delete_user(username: str):
 
     return jsonify({"status": "deleted", "user": username})
 
+# ----------- Group management -----------
+@accounts_bp.route("/addgroup", methods=["POST"])
+def add_group():
+    """Create a new group.
+    Required JSON: name, gid
+    Optional: members (array of usernames)
+    """
+    data = request.get_json(force=True)
+    required = ["name", "gid"]
+    missing = [k for k in required if k not in data]
+    if missing:
+        return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
+
+    name = data["name"]
+    gid = int(data["gid"])
+    members = data.get("members", [])
+
+    # Check if group already exists
+    g_lines = read_group_lines()
+    for gl in g_lines:
+        rec = parse_group_line(gl)
+        if rec and (rec["name"] == name or rec["gid"] == gid):
+            return jsonify({"error": f"group already exists (name: {rec['name']}, gid: {rec['gid']})"}), 409
+
+    # Validate that all members exist as users
+    if members:
+        passwd_lines = read_passwd_lines()
+        existing_users = {parse_passwd_line(l)["name"] for l in passwd_lines if parse_passwd_line(l)}
+        invalid_members = [m for m in members if m not in existing_users]
+        if invalid_members:
+            return jsonify({"error": f"invalid members (users not found): {', '.join(invalid_members)}"}), 400
+
+    # Create new group
+    new_group = {
+        "name": name,
+        "passwd": "x",
+        "gid": gid,
+        "members": sorted(members)
+    }
+    
+    g_lines.append(format_group_entry(new_group))
+    write_group_lines(g_lines)
+
+    return jsonify({"status": "created", "group": new_group}), 201
+
 # ----------- Add user to supplementary groups -----------
 @accounts_bp.route("/addusergroup", methods=["POST"])
 def add_user_groups():
