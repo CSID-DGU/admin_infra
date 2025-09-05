@@ -45,7 +45,7 @@ app.config.from_mapping({
 
     # External endpoints & timeouts
     "PROM_URL": "http://210.94.179.19:9750",
-    "WAS_URL_TEMPLATE": "http://210.94.179.19:9796/api/acceptinfo/{username}",
+    "WAS_URL_TEMPLATE": "http://210.94.179.19:9796/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
 
     # Default resources
@@ -85,243 +85,279 @@ def health():
 
 @app.route("/config", methods=["POST"])
 def config():
-    data = request.get_json(force=True)
-    username = data.get("username")
-    if not username:
-        return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+    try:
+        data = request.get_json(force=True)
+        username = data.get("username")
 
-    # 현재 실행 중인 Pod가 있는지 확인
-    ns = app.config["NAMESPACE"]
-    existing_pod = get_existing_pod(ns, username)
-    if existing_pod:
-        # Pod가 이미 있으면 attach
-        return jsonify({
-            "config": {
-                "backend": "kubernetes",
-                "kubernetes": {
-                    "connection": {
-                            "host": "https://kubernetes.default.svc",
-                            "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-                            "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"                                                                            },
-                    "pod": {
-                        "attach": {
-                            "podName": existing_pod,
-                            "namespace": ns,
-                            "container": "shell"
+        if not username:
+            app.logger.warning("No username provided in /config")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+        ns = app.config["NAMESPACE"]
+
+        # 현재 실행 중인 Pod가 있는지 확인
+
+        try:
+            existing_pod = get_existing_pod(ns, username)
+        except Exception:
+            app.logger.exception("Error while checking existing pod")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+    
+        # 1.Pod가 이미 있으면 attach
+
+        if existing_pod:
+            return jsonify({
+                "config": {
+                    "backend": "kubernetes",
+                    "kubernetes": {
+                        "connection": {
+                                "host": "https://kubernetes.default.svc",
+                                "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                                "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"                                                                            },
+                        "pod": {
+                            "attach": {
+                                "podName": existing_pod,
+                                "namespace": ns,
+                                "container": "shell"
+                            }
                         }
                     }
-                }
-            },
-            "environment": {
-                "USER": {"value": username, "sensitive": False}
-            },
-            "metadata": {},
-            "files": {}
-        })
+                },
+                "environment": {
+                    "USER": {"value": username, "sensitive": False}
+                },
+                "metadata": {},
+                "files": {}
+            }), 200
 
-    # Pod 없으면 새로 생성
+        # 2. Pod 없으면 새로 생성
 
-    # Spring WAS로 사용자 승인정보 요청
-    try:
-        was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
-        was_response = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
-        was_response.raise_for_status()
-        user_info = was_response.json()
-    except Exception as e:
-        return jsonify({"error": f"Failed to fetch user info from WAS: {str(e)}"}), 500
+        # 2-1. Spring WAS로 사용자 승인정보 요청
 
-    try:
-        node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
-        best_node = select_best_node_from_prometheus(node_list)
-    except Exception as e:
-        return jsonify({"error": f"Failed to select best node: {str(e)}"}), 500
+        try:
+            was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+            was_response = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
+            was_response.raise_for_status()
+            user_info = was_response.json()
+        except Exception:
+            app.logger.exception("Failed to fetch user info from WAS")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+        
 
-    image = user_info["image"]
-    uid = user_info["uid"]
-    gid = user_info["gid"]
-    gpu_required = user_info.get("gpu_required", False)
-    gpu_nodes = user_info.get("gpu_nodes", [])
+        # 2-2. Prometheus 노드 선택
 
-    # best_node의 CPU/Memory limit 추출
-    cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
-    memory_limit = app.config["DEFAULT_MEM_LIMIT"]
-    num_gpu = 0
-    for node in gpu_nodes:
-        if node["node_name"] == best_node:
-            cpu_limit = node.get("cpu_limit", app.config["DEFAULT_CPU_LIMIT"])
-            memory_limit = node.get("memory_limit", app.config["DEFAULT_MEM_LIMIT"])
-            num_gpu = node.get("num_gpu", 0)
-            break
+        try:
+            node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
+            best_node = select_best_node_from_prometheus(node_list)
+        except Exception:
+            app.logger.exception("Failed to select best node from Prometheus")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
 
-    pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
+        # 사용자 리소스 정보 정리
+        try:
+            image = user_info["image"]
+            uid = user_info["uid"]
+            gid = user_info["gid"]
+            gpu_required = user_info.get("gpu_required", False)
+            gpu_nodes = user_info.get("gpu_nodes", [])
 
-    volume_mounts = [
-        {
-            "name": "user-home",
-            "mountPath": f"/home/{username}",
-            "readOnly": False
-        }
-    ]
-    volumes = [
-        {
-            "name": "user-home",
-            "persistentVolumeClaim": {
-                "claimName": pvc_name
+            cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
+            memory_limit = app.config["DEFAULT_MEM_LIMIT"]
+            num_gpu = 0
+            for node in gpu_nodes:
+                if node["node_name"] == best_node:
+                    cpu_limit = node.get("cpu_limit", app.config["DEFAULT_CPU_LIMIT"])
+                    memory_limit = node.get("memory_limit", app.config["DEFAULT_MEM_LIMIT"])
+                    num_gpu = node.get("num_gpu", 0)
+                    break
+
+            pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
+        except Exception:
+            app.logger.exception("Failed to parse user_info or resource limits")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+        volume_mounts = [
+            {
+                "name": "user-home",
+                "mountPath": f"/home/{username}",
+                "readOnly": False
             }
-        }
-    ]
-
-    # GPU 장치 마운트 추가
-    if gpu_required and num_gpu > 0:
-        for i in range(num_gpu):
-            volume_mounts.append({
-                "name": f"nvidia{i}",
-                "mountPath": f"/dev/nvidia{i}"
-            })
-            volumes.append({
-                "name": f"nvidia{i}",
-                "hostPath": {
-                    "path": f"/dev/nvidia{i}",
-                    "type": "CharDevice"
+        ]
+        volumes = [
+            {
+                "name": "user-home",
+                "persistentVolumeClaim": {
+                    "claimName": pvc_name
                 }
-            })
+            }
+        ]
 
-        for dev in app.config["NVIDIA_AUX_DEVICES"]:
-            mount_name = dev.replace("-", "")
-            volume_mounts.append({
-                "name": mount_name,
-                "mountPath": f"/dev/{dev}"
-            })
-            volumes.append({
-                "name": mount_name,
-                "hostPath": {
-                    "path": f"/dev/{dev}",
-                    "type": "CharDevice"
-                }
-            })
-
-    # host-etc 마운트 추가
-    host_etc_mounts = []
-    for sub in app.config["HOST_ETC_SUBPATHS"]:
-        sub_fmt = sub.format(username=username)
-        # decide mount path
-        if sub.startswith("sudoers.d/"):
-            mount_path = f"/etc/sudoers.d/{username}"
-        else:
-            mount_path = f"/etc/{sub_fmt}"
-        host_etc_mounts.append({
-            "name": "host-etc",
-            "mountPath": mount_path,
-            "subPath": sub_fmt,
-            "readOnly": True
-        })
-    volume_mounts.extend(host_etc_mounts)
-
-    volumes.append({
-        "name": "host-etc",
-        "hostPath": {
-            "path": "/etc",
-            "type": "Directory"
-        }
-    })
-
-
-
-    return jsonify({
-        "config": {
-            "backend": "kubernetes",
-            "kubernetes": {
-                "connection": {
-                        "host": "https://kubernetes.default.svc",
-                        "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-                        "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"
-                    },
-                "pod": {
-                    "metadata": {
-                        "name": f"containerssh-{username}",
-                        "namespace": ns,
-                        "labels": {
-                            "app": "containerssh-guest",
-                            "managed-by": "containerssh",
-                            "containerssh_username": username
-                        }
-                    },
-                    "spec": {
-                            "nodeName": best_node,
-                            "securityContext": {
-                                "runAsUser": uid,
-                                "runAsGroup": gid,
-                                "fsGroup": gid
-                            },
-                            "containers": [
-                                {
-                                    "name": "shell",
-                                    "image": image,
-                                    "imagePullPolicy": "Never",
-                                    "stdin": True,
-                                    "tty": True,
-                                    "env": [
-                                        {"name": "USER", "value": username},
-                                        {"name": "USER_ID", "value": username},
-                                        {"name": "USER_PW", "value": "1234"},
-                                        {"name": "UID", "value": str(uid)},
-                                        {"name": "HOME", "value": f"/home/{username}"},
-                                        {"name": "SHELL", "value": "/bin/bash"}
-                                    ],
-                                    "resources": {
-                                    "requests": {
-                                        "cpu": app.config["DEFAULT_CPU_REQUEST"],
-                                        "memory": app.config["DEFAULT_MEM_REQUEST"]
-                                    },
-                                    "limits": {
-                                        "cpu": cpu_limit,
-                                        "memory": memory_limit
-                                    }
-                                },
-                                    "volumeMounts": [
-                                        {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
-                                        {"name": "nvidia0", "mountPath": "/dev/nvidia0"},
-                                        {"name": "nvidia1", "mountPath": "/dev/nvidia1"},
-                                        {"name": "nvidia2", "mountPath": "/dev/nvidia2"},
-                                        {"name": "nvidia3", "mountPath": "/dev/nvidia3"},
-                                        {"name": "nvidiactl", "mountPath": "/dev/nvidiactl"},
-                                        {"name": "nvidiauvm", "mountPath": "/dev/nvidia-uvm"},
-                                        {"name": "nvidiauvmtools", "mountPath": "/dev/nvidia-uvm-tools"},
-                                        {"name": "nvidiamodeset", "mountPath": "/dev/nvidia-modeset"},
-                                        {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
-                                        {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
-                                        {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
-                                        {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
-                                        {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
-                                        {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
-                                    ]
-                                }
-                            ],
-                            "volumes": [
-                                {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
-                                {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
-                                {"name": "nvidia0", "hostPath": {"path": "/dev/nvidia0", "type": "CharDevice"}},
-                                {"name": "nvidia1", "hostPath": {"path": "/dev/nvidia1", "type": "CharDevice"}},
-                                {"name": "nvidia2", "hostPath": {"path": "/dev/nvidia2", "type": "CharDevice"}},
-                                {"name": "nvidia3", "hostPath": {"path": "/dev/nvidia3", "type": "CharDevice"}},
-                                {"name": "nvidiactl", "hostPath": {"path": "/dev/nvidiactl", "type": "CharDevice"}},
-                                {"name": "nvidiauvm", "hostPath": {"path": "/dev/nvidia-uvm", "type": "CharDevice"}},
-                                {"name": "nvidiauvmtools", "hostPath": {"path": "/dev/nvidia-uvm-tools", "type": "CharDevice"}},
-                                {"name": "nvidiamodeset", "hostPath": {"path": "/dev/nvidia-modeset", "type": "CharDevice"}},
-                                {"name": "bash-logout", "hostPath": {"path": "/home/jy/admin_infra/bash_logout_test", "type": "File"}},
-                                {"name": "bashrc", "hostPath": {"path": "/home/jy/admin_infra/bashrc_test", "type": "File"}}
-                            ],
-                            "restartPolicy": "Never"
-                        }
+        # GPU 장치 마운트 추가
+        if gpu_required and num_gpu > 0:
+            for i in range(num_gpu):
+                volume_mounts.append({
+                    "name": f"nvidia{i}",
+                    "mountPath": f"/dev/nvidia{i}"
+                })
+                volumes.append({
+                    "name": f"nvidia{i}",
+                    "hostPath": {
+                        "path": f"/dev/nvidia{i}",
+                        "type": "CharDevice"
                     }
-                }
-            },
-            "environment": {
-                "USER": {"value": username, "sensitive": False}
-            },
+                })
+
+            for dev in app.config["NVIDIA_AUX_DEVICES"]:
+                mount_name = dev.replace("-", "")
+                volume_mounts.append({
+                    "name": mount_name,
+                    "mountPath": f"/dev/{dev}"
+                })
+                volumes.append({
+                    "name": mount_name,
+                    "hostPath": {
+                        "path": f"/dev/{dev}",
+                        "type": "CharDevice"
+                    }
+                })
+
+        # host-etc 마운트 추가
+        host_etc_mounts = []
+        for sub in app.config["HOST_ETC_SUBPATHS"]:
+            sub_fmt = sub.format(username=username)
+            # decide mount path
+            if sub.startswith("sudoers.d/"):
+                mount_path = f"/etc/sudoers.d/{username}"
+            else:
+                mount_path = f"/etc/{sub_fmt}"
+            host_etc_mounts.append({
+                "name": "host-etc",
+                "mountPath": mount_path,
+                "subPath": sub_fmt,
+                "readOnly": True
+            })
+        volume_mounts.extend(host_etc_mounts)
+
+        volumes.append({
+            "name": "host-etc",
+            "hostPath": {
+                "path": "/etc",
+                "type": "Directory"
+            }
+        })
+
+
+        try:
+            spec = {
+                "config": {
+                    "backend": "kubernetes",
+                    "kubernetes": {
+                        "connection": {
+                                "host": "https://kubernetes.default.svc",
+                                "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                                "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                            },
+                        "pod": {
+                            "metadata": {
+                                "name": f"containerssh-{username}",
+                                "namespace": ns,
+                                "labels": {
+                                    "app": "containerssh-guest",
+                                    "managed-by": "containerssh",
+                                    "containerssh_username": username
+                                }
+                            },
+                            "spec": {
+                                    "nodeName": best_node,
+                                    "securityContext": {
+                                        "runAsUser": uid,
+                                        "runAsGroup": gid,
+                                        "fsGroup": gid
+                                    },
+                                    "containers": [
+                                        {
+                                            "name": "shell",
+                                            "image": image,
+                                            "imagePullPolicy": "Never",
+                                            "stdin": True,
+                                            "tty": True,
+                                            "env": [
+                                                {"name": "USER", "value": username},
+                                                {"name": "USER_ID", "value": username},
+                                                {"name": "USER_PW", "value": "1234"},
+                                                {"name": "UID", "value": str(uid)},
+                                                {"name": "HOME", "value": f"/home/{username}"},
+                                                {"name": "SHELL", "value": "/bin/bash"}
+                                            ],
+                                            "resources": {
+                                            "requests": {
+                                                "cpu": app.config["DEFAULT_CPU_REQUEST"],
+                                                "memory": app.config["DEFAULT_MEM_REQUEST"]
+                                            },
+                                            "limits": {
+                                                "cpu": cpu_limit,
+                                                "memory": memory_limit
+                                            }
+                                        },
+                                            "volumeMounts": [
+                                                {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
+                                                {"name": "nvidia0", "mountPath": "/dev/nvidia0"},
+                                                {"name": "nvidia1", "mountPath": "/dev/nvidia1"},
+                                                {"name": "nvidia2", "mountPath": "/dev/nvidia2"},
+                                                {"name": "nvidia3", "mountPath": "/dev/nvidia3"},
+                                                {"name": "nvidiactl", "mountPath": "/dev/nvidiactl"},
+                                                {"name": "nvidiauvm", "mountPath": "/dev/nvidia-uvm"},
+                                                {"name": "nvidiauvmtools", "mountPath": "/dev/nvidia-uvm-tools"},
+                                                {"name": "nvidiamodeset", "mountPath": "/dev/nvidia-modeset"},
+                                                {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
+                                                {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
+                                                {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
+                                                {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
+                                                {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
+                                                {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
+                                            ]
+                                        }
+                                    ],
+                                    "volumes": [
+                                        {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
+                                        {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
+                                        {"name": "nvidia0", "hostPath": {"path": "/dev/nvidia0", "type": "CharDevice"}},
+                                        {"name": "nvidia1", "hostPath": {"path": "/dev/nvidia1", "type": "CharDevice"}},
+                                        {"name": "nvidia2", "hostPath": {"path": "/dev/nvidia2", "type": "CharDevice"}},
+                                        {"name": "nvidia3", "hostPath": {"path": "/dev/nvidia3", "type": "CharDevice"}},
+                                        {"name": "nvidiactl", "hostPath": {"path": "/dev/nvidiactl", "type": "CharDevice"}},
+                                        {"name": "nvidiauvm", "hostPath": {"path": "/dev/nvidia-uvm", "type": "CharDevice"}},
+                                        {"name": "nvidiauvmtools", "hostPath": {"path": "/dev/nvidia-uvm-tools", "type": "CharDevice"}},
+                                        {"name": "nvidiamodeset", "hostPath": {"path": "/dev/nvidia-modeset", "type": "CharDevice"}},
+                                        {"name": "bash-logout", "hostPath": {"path": "/home/jy/admin_infra/bash_logout_test", "type": "File"}},
+                                        {"name": "bashrc", "hostPath": {"path": "/home/jy/admin_infra/bashrc_test", "type": "File"}}
+                                    ],
+                                    "restartPolicy": "Never"
+                                }
+                            }
+                        }
+                    },
+                    "environment": {
+                        "USER": {"value": username, "sensitive": False}
+                    },
+                    "metadata": {},
+                    "files": {}
+            }
+
+            return jsonify(spec)
+        except Exception:
+            app.logger.exception("Failed to build pod spec")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+
+    except Exception as e:
+        app.logger.exception("Error in /config")
+        return jsonify({
+            "config": {},
+            "environment": {},
             "metadata": {},
             "files": {}
-    })
+        }), 200
 
 
 @app.route("/report-background", methods=["POST"])
