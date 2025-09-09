@@ -34,9 +34,9 @@ data:
         socketForwardingMode: enable
         socketListenMode: enable
 
-        #configserver:
-        #url: {{ include "containerssh.configServerUrl" . }}
-        #timeout: {{ .Values.config.configServerTimeout }}
+    configserver:
+        url: {{ include "containerssh.configServerUrl" . }}
+        timeout: {{ .Values.config.configServerTimeout }}
 
     backend: kubernetes
     kubernetes:
