@@ -4,7 +4,7 @@ metadata:
   name: cleanup-background-pods
   namespace: {{ .Values.namespace }}
 spec:
-  schedule: "0 * * * *"
+  schedule: "0 * * * *" # 매시간 실행
   jobTemplate:
     spec:
       ttlSecondsAfterFinished: 300
