@@ -45,7 +45,7 @@ app.config.from_mapping({
 
     # External endpoints & timeouts
     "PROM_URL": "http://210.94.179.19:9750",
-    "WAS_URL_TEMPLATE": "http://210.94.179.19:9796/requests/config/{username}",
+    "WAS_URL_TEMPLATE": "http://210.94.179.19:9796/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
 
     # Default resources
@@ -134,7 +134,7 @@ def config():
         try:
             image = user_info["image"]
             uid = user_info["uid"]
-            gid = user_info["gid"]
+            gid = user_info["uid"]
             gpu_required = user_info.get("gpu_required", False)
             gpu_nodes = user_info.get("gpu_nodes", [])
 
