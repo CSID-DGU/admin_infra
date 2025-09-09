@@ -89,6 +89,9 @@ def config():
         data = request.get_json(force=True)
         username = data.get("username")
 
+        app.logger.info(f"/config called with body: {data}")
+        app.logger.info(f"Parsed username: {username}")
+
         if not username:
             app.logger.warning("No username provided in /config")
             return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
@@ -99,40 +102,14 @@ def config():
 
         try:
             existing_pod = get_existing_pod(ns, username)
+            if existing_pod:
+                app.logger.info(f"Pod already exists for {username}: {existing_pod}")
         except Exception:
             app.logger.exception("Error while checking existing pod")
             return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-    
-        # 1.Pod가 이미 있으면 attach
 
-        if existing_pod:
-            return jsonify({
-                "config": {
-                    "backend": "kubernetes",
-                    "kubernetes": {
-                        "connection": {
-                                "host": "https://kubernetes.default.svc",
-                                "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-                                "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"                                                                            },
-                        "pod": {
-                            "attach": {
-                                "podName": existing_pod,
-                                "namespace": ns,
-                                "container": "shell"
-                            }
-                        }
-                    }
-                },
-                "environment": {
-                    "USER": {"value": username, "sensitive": False}
-                },
-                "metadata": {},
-                "files": {}
-            }), 200
 
-        # 2. Pod 없으면 새로 생성
-
-        # 2-1. Spring WAS로 사용자 승인정보 요청
+        # Spring WAS로 사용자 승인정보 요청
 
         try:
             was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
@@ -144,7 +121,7 @@ def config():
             return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
         
 
-        # 2-2. Prometheus 노드 선택
+        # Prometheus 노드 선택
 
         try:
             node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
@@ -329,8 +306,8 @@ def config():
                                         {"name": "nvidiauvm", "hostPath": {"path": "/dev/nvidia-uvm", "type": "CharDevice"}},
                                         {"name": "nvidiauvmtools", "hostPath": {"path": "/dev/nvidia-uvm-tools", "type": "CharDevice"}},
                                         {"name": "nvidiamodeset", "hostPath": {"path": "/dev/nvidia-modeset", "type": "CharDevice"}},
-                                        {"name": "bash-logout", "hostPath": {"path": "/home/jy/admin_infra/bash_logout_test", "type": "File"}},
-                                        {"name": "bashrc", "hostPath": {"path": "/home/jy/admin_infra/bashrc_test", "type": "File"}}
+                                        {"name": "bash-logout", "hostPath": {"path": f"/home/{username}/admin_infra/bash_logout_test", "type": "File"}},
+                                        {"name": "bashrc", "hostPath": {"path": f"/home/{username}/admin_infra/bashrc_test", "type": "File"}}
                                     ],
                                     "restartPolicy": "Never"
                                 }
