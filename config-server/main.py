@@ -25,6 +25,8 @@ from utils import (
     parse_passwd_line, format_passwd_entry,
     parse_group_line, format_group_entry,
     parse_shadow_line, format_shadow_entry,
+    create_directory_with_permissions,
+    delete_directory_if_exists,
 )
 
 app = Flask(__name__)
@@ -267,15 +269,15 @@ def config():
                                                 {"name": "SHELL", "value": "/bin/bash"}
                                             ],
                                             "resources": {
-                                            "requests": {
-                                                "cpu": app.config["DEFAULT_CPU_REQUEST"],
-                                                "memory": app.config["DEFAULT_MEM_REQUEST"]
+                                                "requests": {
+                                                    "cpu": app.config["DEFAULT_CPU_REQUEST"],
+                                                    "memory": app.config["DEFAULT_MEM_REQUEST"]
+                                                },
+                                                "limits": {
+                                                    "cpu": cpu_limit,
+                                                    "memory": memory_limit
+                                                }
                                             },
-                                            "limits": {
-                                                "cpu": cpu_limit,
-                                                "memory": memory_limit
-                                            }
-                                        },
                                             "volumeMounts": [
                                                 {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
                                                 {"name": "nvidia0", "mountPath": "/dev/nvidia0"},
@@ -319,6 +321,7 @@ def config():
                     },
                     "metadata": {},
                     "files": {}
+                }
             }
 
             return jsonify(spec)
@@ -369,14 +372,20 @@ def report_background():
 @app.route("/pvc", methods=["POST"])
 def create_or_resize_pvc():
     data = request.get_json(force=True)
-    username = data.get("username")
-    storage_raw = data.get("storage")
+    pvcs = data.get("pvcs", [])
+    
+    # Legacy support for old format
+    if not pvcs and data.get("username") and data.get("storage"):
+        pvcs = [{
+            "name": data["username"],
+            "type": "user",
+            "storage": data["storage"]
+        }]
+    
+    if not pvcs:
+        return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
 
-    if not username or not storage_raw:
-        return jsonify({"error": "username and storage are required"}), 400
-
-    storage = f"{storage_raw}Gi"
-    pvc_name = f"pvc-{username}-share"
+    results = []
     namespace = app.config["NAMESPACE"]
 
     try:
@@ -387,48 +396,83 @@ def create_or_resize_pvc():
 
         core_v1 = client.CoreV1Api()
 
-        # PVC 존재 여부 확인
-        try:
-            _ = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-            # 존재 → resize
-            patch_body = {
-                "spec": {
-                    "resources": {
-                        "requests": {
-                            "storage": storage
+        for pvc_config in pvcs:
+            name = pvc_config.get("name")
+            pvc_type = pvc_config.get("type", "user")
+            storage_raw = pvc_config.get("storage")
+            custom_pvc_name = pvc_config.get("pvc_name")
+
+            if not name or not storage_raw:
+                results.append({"error": f"name and storage required for {pvc_config}"})
+                continue
+
+            if pvc_type not in ["user", "group"]:
+                results.append({"error": f"type must be 'user' or 'group' for {name}"})
+                continue
+
+            storage = f"{storage_raw}Gi"
+            
+            # PVC naming
+            if custom_pvc_name:
+                pvc_name = custom_pvc_name
+            elif pvc_type == "group":
+                pvc_name = f"pvc-{name}-group-share"
+            else:
+                pvc_name = f"pvc-{name}-share"
+
+            try:
+                # Check if PVC exists
+                try:
+                    _ = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+                    # Exists → resize
+                    patch_body = {
+                        "spec": {
+                            "resources": {
+                                "requests": {
+                                    "storage": storage
+                                }
+                            }
                         }
                     }
-                }
-            }
-            core_v1.patch_namespaced_persistent_volume_claim(
-                name=pvc_name,
-                namespace=namespace,
-                body=patch_body
-            )
-            return jsonify({"status": "resized", "message": f"{pvc_name} resized to {storage}"})
-        except client.exceptions.ApiException as e:
-            if e.status != 404:
-                return jsonify({"error": f"Kubernetes API error: {e.body}"}), 500
+                    core_v1.patch_namespaced_persistent_volume_claim(
+                        name=pvc_name,
+                        namespace=namespace,
+                        body=patch_body
+                    )
+                    results.append({"status": "resized", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
+                except client.exceptions.ApiException as e:
+                    if e.status != 404:
+                        results.append({"error": f"Kubernetes API error for {name}: {e.body}"})
+                        continue
 
-        # PVC 없으면 새로 생성
-        pvc_body = client.V1PersistentVolumeClaim(
-            metadata=client.V1ObjectMeta(
-                name=pvc_name,
-                annotations={"nfs.io/username": username}  # optional
-            ),
-            spec=client.V1PersistentVolumeClaimSpec(
-                access_modes=["ReadWriteMany"],
-                resources=client.V1ResourceRequirements(
-                    requests={"storage": storage}
-                ),
-                storage_class_name="nfs-nas-v3-expandable"
-            )
-        )
-        core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-        return jsonify({"status": "created", "message": f"{pvc_name} created with {storage}"})
+                    # PVC doesn't exist → create
+                    pvc_body = client.V1PersistentVolumeClaim(
+                        metadata=client.V1ObjectMeta(
+                            name=pvc_name,
+                            annotations={"nfs.io/name": name, "nfs.io/type": pvc_type}
+                        ),
+                        spec=client.V1PersistentVolumeClaimSpec(
+                            access_modes=["ReadWriteMany"],
+                            resources=client.V1ResourceRequirements(
+                                requests={"storage": storage}
+                            ),
+                            storage_class_name="nfs-nas-v3-expandable"
+                        )
+                    )
+                    core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+                    
+                    # NFS storage class automatically creates directory, but we need to set proper ownership and permissions
+                    create_directory_with_permissions(name, pvc_type)
+                    
+                    results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
+
+            except Exception as e:
+                results.append({"error": f"Failed to process {name}: {str(e)}"})
+
+        return jsonify({"results": results})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"results": [{"error": str(e)}]}), 500
 
 
 
@@ -474,6 +518,99 @@ def resize_pvc():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/delete-pvc", methods=["POST"])
+def delete_pvc():
+    """Delete PVC, PV, and associated directory
+    
+    Request format:
+    {
+        "pvcs": [
+            {"name": "testuser", "type": "user"},
+            {"name": "developers", "type": "group"}
+        ]
+    }
+    
+    Or legacy format:
+    {"username": "testuser", "type": "user"}
+    """
+    data = request.get_json(force=True)
+    pvcs = data.get("pvcs", [])
+    
+    # Legacy support for old format
+    if not pvcs and data.get("username"):
+        pvcs = [{
+            "name": data["username"],
+            "type": data.get("type", "user")
+        }]
+    
+    if not pvcs:
+        return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
+
+    results = []
+    namespace = app.config["NAMESPACE"]
+
+    try:
+        try:
+            k8s_config.load_incluster_config()
+        except:
+            k8s_config.load_kube_config()
+
+        core_v1 = client.CoreV1Api()
+
+        for pvc_config in pvcs:
+            name = pvc_config.get("name")
+            pvc_type = pvc_config.get("type", "user")
+            custom_pvc_name = pvc_config.get("pvc_name")
+
+            if not name:
+                results.append({"error": f"name is required for {pvc_config}"})
+                continue
+
+            if pvc_type not in ["user", "group"]:
+                results.append({"error": f"type must be 'user' or 'group' for {name}"})
+                continue
+
+            # PVC naming (same logic as create)
+            if custom_pvc_name:
+                pvc_name = custom_pvc_name
+            elif pvc_type == "group":
+                pvc_name = f"pvc-{name}-group-share"
+            else:
+                pvc_name = f"pvc-{name}-share"
+
+            try:
+                # Delete PVC (this also deletes the PV automatically due to reclaim policy)
+                try:
+                    core_v1.delete_namespaced_persistent_volume_claim(
+                        name=pvc_name,
+                        namespace=namespace
+                    )
+                    app.logger.info(f"Deleted PVC: {pvc_name}")
+                except client.exceptions.ApiException as e:
+                    if e.status == 404:
+                        app.logger.warning(f"PVC {pvc_name} not found, skipping PVC deletion")
+                    else:
+                        results.append({"error": f"Failed to delete PVC {pvc_name}: {e.body}"})
+                        continue
+
+                # Delete directory
+                delete_directory_if_exists(name, pvc_type)
+                
+                results.append({
+                    "status": "deleted", 
+                    "name": name, 
+                    "type": pvc_type, 
+                    "pvc_name": pvc_name
+                })
+
+            except Exception as e:
+                results.append({"error": f"Failed to delete {name}: {str(e)}"})
+
+        return jsonify({"results": results})
+
+    except Exception as e:
+        return jsonify({"results": [{"error": str(e)}]}), 500
 
 
 
@@ -650,6 +787,48 @@ def delete_user(username: str):
     write_group_lines(g_new)
 
     return jsonify({"status": "deleted", "user": username})
+
+@accounts_bp.route("/deletegroup/<groupname>", methods=["POST"])
+def delete_group(groupname: str):
+    """Delete a group from the system.
+    This removes the group from /etc/group but does not affect users' primary groups.
+    """
+    # Check if group exists
+    g_lines = read_group_lines()
+    group_found = None
+    new_lines = []
+    
+    for line in g_lines:
+        rec = parse_group_line(line)
+        if rec and rec["name"] == groupname:
+            group_found = rec
+            continue
+        new_lines.append(line)
+    
+    if not group_found:
+        return jsonify({"error": "group not found"}), 404
+    
+    # Check if this group is used as primary group by any user
+    passwd_lines = read_passwd_lines()
+    users_with_primary_gid = []
+    for line in passwd_lines:
+        user_rec = parse_passwd_line(line)
+        if user_rec and user_rec["gid"] == group_found["gid"]:
+            users_with_primary_gid.append(user_rec["name"])
+    
+    if users_with_primary_gid:
+        return jsonify({
+            "error": f"Cannot delete group {groupname}: it is the primary group for users: {', '.join(users_with_primary_gid)}"
+        }), 400
+    
+    # Remove group
+    write_group_lines(new_lines)
+    
+    return jsonify({
+        "status": "deleted", 
+        "group": groupname,
+        "gid": group_found["gid"]
+    })
 
 # ----------- Group management -----------
 @accounts_bp.route("/addgroup", methods=["POST"])

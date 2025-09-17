@@ -229,3 +229,80 @@ def format_shadow_entry(d: dict) -> str:
 
 def ensure_sudoers_dir():
     ensure_etc_layout()
+
+
+def create_directory_with_permissions(name, pvc_type):
+    """Create directory in NFS mount and set proper ownership"""
+    import subprocess
+    
+    base_path = "/home/tako8/share"  # NFS storage class mount path
+    
+    if pvc_type == "group":
+        # Verify group exists
+        g_lines = read_group_lines()
+        group_info = None
+        for line in g_lines:
+            rec = parse_group_line(line)
+            if rec and rec["name"] == name:
+                group_info = rec
+                break
+        
+        if not group_info:
+            raise ValueError(f"Group '{name}' not found in group file")
+        
+        dir_path = f"{base_path}/pvc-{name}-group-share"
+        try:
+            subprocess.run(["mkdir", "-p", dir_path], check=True)
+            gid = group_info["gid"]
+            subprocess.run(["chown", f"root:{gid}", dir_path], check=True)
+            subprocess.run(["chmod", "775", dir_path], check=True)
+            app.logger.info(f"Created group directory {dir_path} with ownership root:{gid}")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to create group directory {dir_path}: {e}")
+    else:
+        # Verify user exists
+        lines = read_passwd_lines()
+        user_info = None
+        for line in lines:
+            rec = parse_passwd_line(line)
+            if rec and rec["name"] == name:
+                user_info = rec
+                break
+        
+        if not user_info:
+            raise ValueError(f"User '{name}' not found in passwd file")
+        
+        dir_path = f"{base_path}/pvc-{name}-share"
+        try:
+            subprocess.run(["mkdir", "-p", dir_path], check=True)
+            uid = user_info["uid"]
+            subprocess.run(["chown", f"{uid}:{uid}", dir_path], check=True)
+            subprocess.run(["chmod", "755", dir_path], check=True)
+            app.logger.info(f"Created user directory {dir_path} with ownership {uid}:{uid}")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Failed to create user directory {dir_path}: {e}")
+
+
+def delete_directory_if_exists(name, pvc_type):
+    """Delete directory if it exists"""
+    import subprocess
+    import shutil
+    import os
+    
+    base_path = "/home/tako8/share"  # NFS storage class mount path
+    
+    if pvc_type == "group":
+        dir_path = f"{base_path}/pvc-{name}-group-share"
+    else:
+        dir_path = f"{base_path}/pvc-{name}-share"
+    
+    try:
+        if os.path.exists(dir_path):
+            # Use shutil.rmtree for recursive directory deletion
+            shutil.rmtree(dir_path)
+            app.logger.info(f"Deleted directory: {dir_path}")
+        else:
+            app.logger.info(f"Directory {dir_path} does not exist, skipping deletion")
+    except Exception as e:
+        app.logger.error(f"Failed to delete directory {dir_path}: {e}")
+        raise RuntimeError(f"Failed to delete directory {dir_path}: {e}")
