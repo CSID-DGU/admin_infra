@@ -44,7 +44,7 @@ spec:
               memory: {{ .Values.resources.limits.memory }}
           volumeMounts:
             - name: nfs-kube-share
-              mountPath: /home/tako8/share/kube_share
+              mountPath: /home/tako8/share
       volumes:
         - name: nfs-kube-share
           nfs:

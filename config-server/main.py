@@ -31,7 +31,7 @@ from utils import (
 
 app = Flask(__name__)
 
-# 로그 설정                                                             
+# 로그 설정
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
 formatter = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(message)s")
@@ -322,7 +322,6 @@ def config():
                     "metadata": {},
                     "files": {}
                 }
-            }
 
             return jsonify(spec)
         except Exception:
@@ -402,16 +401,20 @@ def create_or_resize_pvc():
             storage_raw = pvc_config.get("storage")
             custom_pvc_name = pvc_config.get("pvc_name")
 
+            app.logger.info(f"Processing PVC request: name={name}, type={pvc_type}, storage={storage_raw}")
+
             if not name or not storage_raw:
+                app.logger.error(f"Missing required fields for {pvc_config}")
                 results.append({"error": f"name and storage required for {pvc_config}"})
                 continue
 
             if pvc_type not in ["user", "group"]:
+                app.logger.error(f"Invalid PVC type '{pvc_type}' for {name}")
                 results.append({"error": f"type must be 'user' or 'group' for {name}"})
                 continue
 
             storage = f"{storage_raw}Gi"
-            
+
             # PVC naming
             if custom_pvc_name:
                 pvc_name = custom_pvc_name
@@ -420,10 +423,14 @@ def create_or_resize_pvc():
             else:
                 pvc_name = f"pvc-{name}-share"
 
+            app.logger.info(f"PVC name determined: {pvc_name}")
+
             try:
                 # Check if PVC exists
+                app.logger.info(f"Checking if PVC {pvc_name} already exists...")
                 try:
-                    _ = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+                    existing_pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+                    app.logger.info(f"PVC {pvc_name} already exists, performing resize operation")
                     # Exists → resize
                     patch_body = {
                         "spec": {
@@ -460,9 +467,36 @@ def create_or_resize_pvc():
                         )
                     )
                     core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-                    
+                    app.logger.info(f"Created PVC: {pvc_name}")
+
+                    # Wait for PVC to be bound and get the actual PV name
+                    import time
+                    max_wait = 30  # 30 seconds timeout
+                    wait_time = 0
+                    pv_name = None
+
+                    app.logger.info(f"Waiting for PVC {pvc_name} to be bound...")
+                    while wait_time < max_wait:
+                        try:
+                            pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+                            app.logger.debug(f"PVC status: {pvc.status.phase}, volume_name: {pvc.spec.volume_name}")
+                            if pvc.status.phase == "Bound" and pvc.spec.volume_name:
+                                pv_name = pvc.spec.volume_name
+                                app.logger.info(f"PVC bound to PV: {pv_name}")
+                                break
+                        except Exception as e:
+                            app.logger.debug(f"Error checking PVC status: {e}")
+                        time.sleep(1)
+                        wait_time += 1
+
                     # NFS storage class automatically creates directory, but we need to set proper ownership and permissions
-                    create_directory_with_permissions(name, pvc_type)
+                    if pv_name:
+                        app.logger.info(f"Creating directory with PV name: {pv_name}")
+                        create_directory_with_permissions(pv_name, pvc_type, username=name)
+                    else:
+                        app.logger.warning(f"Failed to get PV name after {max_wait}s, using fallback: {name}")
+                        # Fallback to original behavior if PV name not found
+                        create_directory_with_permissions(name, pvc_type)
                     
                     results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
 

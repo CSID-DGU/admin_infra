@@ -1,6 +1,6 @@
 image:
   repository: config-server
-  tag: v1
+  tag: v4
   pullPolicy: Never
 
 service:
@@ -22,7 +22,7 @@ env:
 
 nfs:
   server: "100.100.100.120"
-  path: "/volume1/share/kube_share"
+  path: "/volume1/share"
 
 
 config:

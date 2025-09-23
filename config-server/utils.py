@@ -231,56 +231,140 @@ def ensure_sudoers_dir():
     ensure_etc_layout()
 
 
-def create_directory_with_permissions(name, pvc_type):
-    """Create directory in NFS mount and set proper ownership"""
+def create_directory_with_permissions(name_or_pv, pvc_type, username=None):
+    """Create directory in NFS mount and set proper ownership
+
+    Args:
+        name_or_pv: Either username (legacy) or PV name (new behavior)
+        pvc_type: 'user' or 'group'
+        username: Original username for ownership lookup (when name_or_pv is PV name)
+    """
     import subprocess
-    
+
+    app.logger.info(f"create_directory_with_permissions called with: name_or_pv={name_or_pv}, pvc_type={pvc_type}, username={username}")
+
     base_path = "/home/tako8/share"  # NFS storage class mount path
-    
+
+    # Determine if this is a PV name (starts with 'pvc-' and has UUID format)
+    # PV names are typically 40+ characters and contain UUID-like patterns
+    is_pv_name = (name_or_pv.startswith('pvc-') and
+                  len(name_or_pv) >= 36 and  # UUID is 36 chars, plus 'pvc-' prefix
+                  '-' in name_or_pv[4:])  # Has dashes like UUID format
+    app.logger.info(f"Is PV name check: {is_pv_name} (length: {len(name_or_pv)}, starts with pvc-: {name_or_pv.startswith('pvc-')})")
+
+    if is_pv_name:
+        # Use PV name directly as directory name
+        dir_path = f"{base_path}/{name_or_pv}"
+        lookup_name = username if username else name_or_pv  # Fallback to name_or_pv if username not provided
+        app.logger.info(f"Using PV name as directory: {dir_path}, lookup user: {lookup_name}")
+    else:
+        # Legacy behavior: construct directory name from username
+        lookup_name = name_or_pv
+        if pvc_type == "group":
+            dir_path = f"{base_path}/pvc-{name_or_pv}-group-share"
+        else:
+            dir_path = f"{base_path}/pvc-{name_or_pv}-share"
+        app.logger.info(f"Using legacy naming: {dir_path}, lookup user: {lookup_name}")
+
     if pvc_type == "group":
+        app.logger.info(f"Processing group type PVC for lookup_name: {lookup_name}")
         # Verify group exists
         g_lines = read_group_lines()
         group_info = None
         for line in g_lines:
             rec = parse_group_line(line)
-            if rec and rec["name"] == name:
+            if rec and rec["name"] == lookup_name:
                 group_info = rec
                 break
-        
+
         if not group_info:
-            raise ValueError(f"Group '{name}' not found in group file")
-        
-        dir_path = f"{base_path}/pvc-{name}-group-share"
+            app.logger.error(f"Group '{lookup_name}' not found in group file")
+            raise ValueError(f"Group '{lookup_name}' not found in group file")
+
+        app.logger.info(f"Found group info: {group_info}")
+
         try:
+            app.logger.info(f"Creating directory: {dir_path}")
             subprocess.run(["mkdir", "-p", dir_path], check=True)
             gid = group_info["gid"]
+            app.logger.info(f"Setting ownership to root:{gid}")
             subprocess.run(["chown", f"root:{gid}", dir_path], check=True)
             subprocess.run(["chmod", "775", dir_path], check=True)
-            app.logger.info(f"Created group directory {dir_path} with ownership root:{gid}")
+            app.logger.info(f"Successfully created group directory {dir_path} with ownership root:{gid}")
         except subprocess.CalledProcessError as e:
+            app.logger.error(f"Failed to create group directory {dir_path}: {e}")
             raise RuntimeError(f"Failed to create group directory {dir_path}: {e}")
     else:
+        app.logger.info(f"Processing user type PVC for lookup_name: {lookup_name}")
         # Verify user exists
         lines = read_passwd_lines()
         user_info = None
         for line in lines:
             rec = parse_passwd_line(line)
-            if rec and rec["name"] == name:
+            if rec and rec["name"] == lookup_name:
                 user_info = rec
                 break
-        
+
         if not user_info:
-            raise ValueError(f"User '{name}' not found in passwd file")
-        
-        dir_path = f"{base_path}/pvc-{name}-share"
+            app.logger.error(f"User '{lookup_name}' not found in passwd file")
+            raise ValueError(f"User '{lookup_name}' not found in passwd file")
+
+        app.logger.info(f"Found user info: {user_info}")
+
         try:
-            subprocess.run(["mkdir", "-p", dir_path], check=True)
+            app.logger.info(f"Creating directory: {dir_path}")
+
+            # Check if base path exists and is writable
+            base_exists = os.path.exists("/home/tako8/share")
+            app.logger.info(f"Base path /home/tako8/share exists: {base_exists}")
+            if base_exists:
+                app.logger.info(f"Base path permissions: {oct(os.stat('/home/tako8/share').st_mode)[-3:]}")
+
+            # Create directory with detailed output capture
+            mkdir_result = subprocess.run(["mkdir", "-p", dir_path], capture_output=True, text=True, check=False)
+            app.logger.info(f"mkdir command exit code: {mkdir_result.returncode}")
+            if mkdir_result.stdout:
+                app.logger.info(f"mkdir stdout: {mkdir_result.stdout}")
+            if mkdir_result.stderr:
+                app.logger.info(f"mkdir stderr: {mkdir_result.stderr}")
+
+            # Check if directory was actually created
+            dir_created = os.path.exists(dir_path)
+            app.logger.info(f"Directory {dir_path} exists after mkdir: {dir_created}")
+
+            if mkdir_result.returncode != 0:
+                raise subprocess.CalledProcessError(mkdir_result.returncode, ["mkdir", "-p", dir_path], mkdir_result.stdout, mkdir_result.stderr)
+
             uid = user_info["uid"]
-            subprocess.run(["chown", f"{uid}:{uid}", dir_path], check=True)
-            subprocess.run(["chmod", "755", dir_path], check=True)
-            app.logger.info(f"Created user directory {dir_path} with ownership {uid}:{uid}")
+            app.logger.info(f"Setting ownership to {uid}:{uid}")
+
+            # Only proceed with chown/chmod if directory exists
+            if dir_created:
+                chown_result = subprocess.run(["chown", f"{uid}:{uid}", dir_path], capture_output=True, text=True, check=False)
+                app.logger.info(f"chown command exit code: {chown_result.returncode}")
+                if chown_result.stderr:
+                    app.logger.info(f"chown stderr: {chown_result.stderr}")
+
+                chmod_result = subprocess.run(["chmod", "755", dir_path], capture_output=True, text=True, check=False)
+                app.logger.info(f"chmod command exit code: {chmod_result.returncode}")
+                if chmod_result.stderr:
+                    app.logger.info(f"chmod stderr: {chmod_result.stderr}")
+
+                if chown_result.returncode != 0 or chmod_result.returncode != 0:
+                    app.logger.warning(f"chown/chmod failed but continuing")
+
+                app.logger.info(f"Successfully created user directory {dir_path} with ownership {uid}:{uid}")
+            else:
+                app.logger.error(f"Directory {dir_path} was not created despite mkdir success")
+                raise RuntimeError(f"Directory {dir_path} was not created")
+
         except subprocess.CalledProcessError as e:
+            app.logger.error(f"Failed to create user directory {dir_path}: {e}")
+            app.logger.error(f"Command output: stdout={e.stdout}, stderr={e.stderr}")
             raise RuntimeError(f"Failed to create user directory {dir_path}: {e}")
+        except Exception as e:
+            app.logger.error(f"Unexpected error creating directory {dir_path}: {e}")
+            raise RuntimeError(f"Unexpected error creating directory {dir_path}: {e}")
 
 
 def delete_directory_if_exists(name, pvc_type):
