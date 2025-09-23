@@ -155,6 +155,38 @@ def config():
             app.logger.exception("Failed to parse user_info or resource limits")
             return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
 
+        gpu_volume_mounts = []
+        gpu_volumes = []
+
+        if gpu_required and num_gpu > 0:
+            for i in range(num_gpu):
+                gpu_volume_mounts.append({
+                    "name": f"nvidia{i}",
+                    "mountPath": f"/dev/nvidia{i}"
+                })
+                gpu_volumes.append({
+                    "name": f"nvidia{i}",
+                    "hostPath": {
+                        "path": f"/dev/nvidia{i}",
+                        "type": "CharDevice"
+                    }
+                })
+
+            # 보조 디바이스 추가
+            for dev in app.config["NVIDIA_AUX_DEVICES"]:
+                mount_name = dev.replace("-", "")
+                gpu_volume_mounts.append({
+                    "name": mount_name,
+                    "mountPath": f"/dev/{dev}"
+                })
+                gpu_volumes.append({
+                    "name": mount_name,
+                    "hostPath": {
+                        "path": f"/dev/{dev}",
+                        "type": "CharDevice"
+                    }
+                })
+
         volume_mounts = [
             {
                 "name": "user-home",
@@ -279,38 +311,23 @@ def config():
                                                 }
                                             },
                                             "volumeMounts": [
-                                                {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
-                                                {"name": "nvidia0", "mountPath": "/dev/nvidia0"},
-                                                {"name": "nvidia1", "mountPath": "/dev/nvidia1"},
-                                                {"name": "nvidia2", "mountPath": "/dev/nvidia2"},
-                                                {"name": "nvidia3", "mountPath": "/dev/nvidia3"},
-                                                {"name": "nvidiactl", "mountPath": "/dev/nvidiactl"},
-                                                {"name": "nvidiauvm", "mountPath": "/dev/nvidia-uvm"},
-                                                {"name": "nvidiauvmtools", "mountPath": "/dev/nvidia-uvm-tools"},
-                                                {"name": "nvidiamodeset", "mountPath": "/dev/nvidia-modeset"},
-                                                {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
-                                                {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
-                                                {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
-                                                {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
-                                                {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
-                                                {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
-                                            ]
-                                        }
-                                    ],
+    {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
+    *gpu_volume_mounts,
+    {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
+    {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
+    {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
+    {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
+    {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
+    {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
+],
                                     "volumes": [
-                                        {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
-                                        {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
-                                        {"name": "nvidia0", "hostPath": {"path": "/dev/nvidia0", "type": "CharDevice"}},
-                                        {"name": "nvidia1", "hostPath": {"path": "/dev/nvidia1", "type": "CharDevice"}},
-                                        {"name": "nvidia2", "hostPath": {"path": "/dev/nvidia2", "type": "CharDevice"}},
-                                        {"name": "nvidia3", "hostPath": {"path": "/dev/nvidia3", "type": "CharDevice"}},
-                                        {"name": "nvidiactl", "hostPath": {"path": "/dev/nvidiactl", "type": "CharDevice"}},
-                                        {"name": "nvidiauvm", "hostPath": {"path": "/dev/nvidia-uvm", "type": "CharDevice"}},
-                                        {"name": "nvidiauvmtools", "hostPath": {"path": "/dev/nvidia-uvm-tools", "type": "CharDevice"}},
-                                        {"name": "nvidiamodeset", "hostPath": {"path": "/dev/nvidia-modeset", "type": "CharDevice"}},
-                                        {"name": "bash-logout", "hostPath": {"path": f"/home/{username}/admin_infra/bash_logout_test", "type": "File"}},
-                                        {"name": "bashrc", "hostPath": {"path": f"/home/{username}/admin_infra/bashrc_test", "type": "File"}}
-                                    ],
+    {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
+    {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
+    *gpu_volumes,
+    {"name": "bash-logout", "hostPath": {"path": f"/home/{username}/admin_infra/bash_logout_test", "type": "File"}},
+    {"name": "bashrc", "hostPath": {"path": f"/home/{username}/admin_infra/bashrc_test", "type": "File"}}
+    ],
+
                                     "restartPolicy": "Never"
                                 }
                             }

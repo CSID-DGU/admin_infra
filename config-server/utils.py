@@ -1,10 +1,10 @@
 import os
 import re
 import fcntl
-import subprocess
 from typing import List, Optional
 
 from kubernetes import client, config as k8s_config
+from kubernetes.stream import stream
 from flask import current_app as app
 
 def load_k8s():
@@ -15,39 +15,48 @@ def load_k8s():
         k8s_config.load_kube_config()
 
 def pod_has_process(namespace, pod_name, username):
-    import subprocess
     
     try:
-        uid_cmd = [
-            "kubectl", "exec", "-n", namespace, pod_name, "--",
-            "id", "-u", username
-        ]
-        uid_result = subprocess.run(uid_cmd, capture_output=True, text=True, check=True)
-        user_uid = uid_result.stdout.strip()
+        v1 = client.CoreV1Api()
 
-        # 프로세스 목록 조회
-        ps_cmd = [
-            "kubectl", "exec", "-n", namespace, pod_name, "--",
-            "ps", "-eo", "pid,uid,cmd", "--no-headers"
-        ]
-        result = subprocess.run(ps_cmd, capture_output=True, text=True, check=True)
-        processes = result.stdout.strip().split("\n")
+        app.logger.info(f"[pod_has_process] Checking pod={pod_name}, ns={namespace}, username={username}")
 
-        system_cmds = [
-            "ps", "bash", "sh", "sleep", "top", "kubectl", "tail", "cat"
-        ]
+        # UID 확인
+        uid_output = stream(
+            v1.connect_get_namespaced_pod_exec,
+            pod_name,
+            namespace,
+            command=["id", "-u", username],
+            stderr=True, stdin=False, stdout=True, tty=False
+        )
+        user_uid = uid_output.strip()
+        app.logger.debug(f"[pod_has_process] UID for {username} = {user_uid}")
 
-        # 필터링
+        # 현재 프로세스 목록 조회
+        ps_output = stream(
+            v1.connect_get_namespaced_pod_exec,
+            pod_name,
+            namespace,
+            command=["ps", "-eo", "pid,uid,cmd", "--no-headers"],
+            stderr=True, stdin=False, stdout=True, tty=False
+        )
+        processes = ps_output.strip().split("\n")
+        app.logger.debug(f"[pod_has_process] ps output:\n{ps_output}")
+
+        # 시스템 프로세스 제외
+        system_cmds = ["ps", "bash", "sh", "sleep", "top", "kubectl", "tail", "cat"]
+
         user_procs = [
             proc for proc in processes
             if proc and proc.split()[1] == user_uid
             and not any(proc.split(maxsplit=2)[2].startswith(syscmd) for syscmd in system_cmds)
         ]
 
+        app.logger.info(f"[pod_has_process] Found {len(user_procs)} user processes for {username}: {user_procs}")
         return len(user_procs) > 0
 
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] Failed to check processes in Pod: {e}")
+    except Exception as e:
+        app.logger.error(f"[pod_has_process] ERROR in pod={pod_name}, ns={namespace}: {e}", exc_info=True)
         return False
 
 # 기존 Pod가 있는지 확인 -> username당 Pod 1개만 유지
