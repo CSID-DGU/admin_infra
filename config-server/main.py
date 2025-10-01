@@ -311,22 +311,24 @@ def config():
                                                 }
                                             },
                                             "volumeMounts": [
-    {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
-    *gpu_volume_mounts,
-    {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
-    {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
-    {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
-    {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
-    {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
-    {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
+            {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
+            *gpu_volume_mounts,
+            {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
+            {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
+            {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
+            {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
+            {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
+            {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
+        ]
+    }
 ],
-                                    "volumes": [
+"volumes": [
     {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
     {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
     *gpu_volumes,
-    {"name": "bash-logout", "hostPath": {"path": f"/home/{username}/admin_infra/bash_logout_test", "type": "File"}},
-    {"name": "bashrc", "hostPath": {"path": f"/home/{username}/admin_infra/bashrc_test", "type": "File"}}
-    ],
+    {"name": "bash-logout", "hostPath": {"path": "/home/hyrn/github-containerssh/admin_infra/bash_logout_test", "type": "File"}},
+    {"name": "bashrc", "hostPath": {"path": "/home/hyrn/github-containerssh/admin_infra/bashrc_test", "type": "File"}}
+],
 
                                     "restartPolicy": "Never"
                                 }
