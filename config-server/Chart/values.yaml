@@ -1,6 +1,6 @@
 image:
   repository: config-server
-  tag: v6
+  tag: v9
   pullPolicy: Never
 
 service:

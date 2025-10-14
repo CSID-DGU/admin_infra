@@ -529,50 +529,7 @@ def create_or_resize_pvc():
 
 
 
-@app.route("/resize-pvc", methods=["POST"])
-def resize_pvc():
-    data = request.get_json(force=True)
-    username = data.get("username")
-    storage_raw = data.get("storage")
-
-    if not username or not storage_raw:
-        return jsonify({"error": "username and storage are required"}), 400
-
-    storage = f"{storage_raw}Gi"
-    pvc_name = f"pvc-{username}-share"
-    namespace = app.config["NAMESPACE"]
-
-    try:
-        try:
-            k8s_config.load_incluster_config()
-        except:
-            k8s_config.load_kube_config()
-
-        core_v1 = client.CoreV1Api()
-
-        patch_body = {
-            "spec": {
-                "resources": {
-                    "requests": {
-                        "storage": storage
-                    }
-                }
-            }
-        }
-        core_v1.patch_namespaced_persistent_volume_claim(
-            name=pvc_name,
-            namespace=namespace,
-            body=patch_body
-        )
-        return jsonify({"status": "resized", "message": f"{pvc_name} resized to {storage}"})
-
-    except client.exceptions.ApiException as e:
-        return jsonify({"error": f"Kubernetes API error: {e.body}"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/delete-pvc", methods=["POST"])
+@app.route("/pvc", methods=["DELETE"])
 def delete_pvc():
     """Delete PVC, PV, and associated directory
     
@@ -698,7 +655,82 @@ from flask import Blueprint
 accounts_bp = Blueprint("accounts", __name__)
 
 # ---------- /etc/passwd CRUD ----------
-@accounts_bp.route("/adduser", methods=["POST"])
+@accounts_bp.route("/users", methods=["GET"])
+def list_users():
+    """List all users in the system."""
+    try:
+        lines = read_passwd_lines()
+        users = []
+        for line in lines:
+            rec = parse_passwd_line(line)
+            if rec:
+                users.append({
+                    "name": rec["name"],
+                    "uid": rec["uid"],
+                    "gid": rec["gid"],
+                    "gecos": rec.get("gecos", ""),
+                    "home": rec["home"],
+                    "shell": rec["shell"]
+                })
+        return jsonify({"users": users}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@accounts_bp.route("/users/<username>", methods=["GET"])
+def get_user(username: str):
+    """Get detailed user information including group memberships."""
+    try:
+        # Find user in passwd
+        lines = read_passwd_lines()
+        user_rec = None
+        for line in lines:
+            rec = parse_passwd_line(line)
+            if rec and rec["name"] == username:
+                user_rec = rec
+                break
+
+        if not user_rec:
+            return jsonify({"error": "user not found"}), 404
+
+        # Get group memberships
+        g_lines = read_group_lines()
+        groups = []
+
+        for gl in g_lines:
+            grec = parse_group_line(gl)
+            if not grec:
+                continue
+
+            # Primary group
+            if grec["gid"] == user_rec["gid"]:
+                groups.append({
+                    "name": grec["name"],
+                    "gid": grec["gid"],
+                    "type": "primary"
+                })
+            # Supplementary groups
+            elif username in grec.get("members", []):
+                groups.append({
+                    "name": grec["name"],
+                    "gid": grec["gid"],
+                    "type": "supplementary"
+                })
+
+        return jsonify({
+            "user": {
+                "name": user_rec["name"],
+                "uid": user_rec["uid"],
+                "gid": user_rec["gid"],
+                "gecos": user_rec.get("gecos", ""),
+                "home": user_rec["home"],
+                "shell": user_rec["shell"]
+            },
+            "groups": groups
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@accounts_bp.route("/users", methods=["PUT"])
 def create_user():
     """Create a new user across passwd, group, shadow, and sudoers.
     Required JSON: name, uid, gid, passwd_sha512
@@ -776,7 +808,7 @@ def create_user():
 
     return jsonify({"status": "created", "user": entry, "group": {"name": pg_name, "gid": target_gid}, "sudoers": s_path}), 201
 
-@accounts_bp.route("/deleteuser/<username>", methods=["POST"])
+@accounts_bp.route("/users/<username>", methods=["DELETE"])
 def delete_user(username: str):
     # Remove from /etc/passwd
     lines = read_passwd_lines()
@@ -841,7 +873,7 @@ def delete_user(username: str):
 
     return jsonify({"status": "deleted", "user": username})
 
-@accounts_bp.route("/deletegroup/<groupname>", methods=["POST"])
+@accounts_bp.route("/groups/<groupname>", methods=["DELETE"])
 def delete_group(groupname: str):
     """Delete a group from the system.
     This removes the group from /etc/group but does not affect users' primary groups.
@@ -884,7 +916,7 @@ def delete_group(groupname: str):
     })
 
 # ----------- Group management -----------
-@accounts_bp.route("/addgroup", methods=["POST"])
+@accounts_bp.route("/groups", methods=["PUT"])
 def add_group():
     """Create a new group.
     Required JSON: name, gid
@@ -929,18 +961,15 @@ def add_group():
     return jsonify({"status": "created", "group": new_group}), 201
 
 # ----------- Add user to supplementary groups -----------
-@accounts_bp.route("/addusergroup", methods=["POST"])
-def add_user_groups():
-    """Add user to one or more existing groups. Body: {"username": ..., "add": [...]}
+@accounts_bp.route("/users/<username>/groups", methods=["PUT"])
+def add_user_groups(username: str):
+    """Add user to one or more existing groups. Body: {"groups": [...]}
     Groups must already exist. Does not touch primary group (by gid).
     """
     data = request.get_json(force=True)
-    username = data.get("username")
-    if not username:
-        return jsonify({"error": "username is required"}), 400
-    add = data.get("add") or []
-    if not add:
-        return jsonify({"error": "'add' list is required"}), 400
+    groups = data.get("groups") or []
+    if not groups:
+        return jsonify({"error": "'groups' list is required"}), 400
 
     # Verify user exists and capture their name
     user_found = False
@@ -954,7 +983,7 @@ def add_user_groups():
 
     # Update group file
     g_lines = read_group_lines()
-    names = set(add)
+    names = set(groups)
     updated = False
     new_lines = []
     for gl in g_lines:
@@ -971,12 +1000,12 @@ def add_user_groups():
 
     # Ensure all requested groups existed
     existing_group_names = {parse_group_line(gl)["name"] for gl in g_lines if parse_group_line(gl)}
-    missing = [g for g in add if g not in existing_group_names]
+    missing = [g for g in groups if g not in existing_group_names]
     if missing:
         return jsonify({"error": f"groups not found: {', '.join(missing)}"}), 404
 
     write_group_lines(new_lines)
-    return jsonify({"status": "updated", "added_to": sorted(list(names))})
+    return jsonify({"status": "updated", "user": username, "groups": sorted(list(names))})
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp, url_prefix="/accounts")
