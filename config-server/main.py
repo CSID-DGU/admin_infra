@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Blueprint
 import fcntl
 import re
 import time
@@ -40,7 +40,7 @@ app.logger.addHandler(handler)
 app.logger.setLevel(logging.DEBUG)
 
 # ---- Global app configuration ----
-BASE_ETC_DIR = "/home/tako8/share/kube_share"
+BASE_ETC_DIR = "/kube_share"
 app.config.from_mapping({
     # Namespace
     "NAMESPACE": "cssh",
@@ -78,6 +78,8 @@ app.config.from_mapping({
     "GROUP_PATH": BASE_ETC_DIR + "/group",
     "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
     "SUDOERS_DIR": BASE_ETC_DIR + "/sudoers.d",
+    "BASH_LOGOUT_PATH": BASE_ETC_DIR + "/bash.bash_logout",
+    "BASHRC_PATH": BASE_ETC_DIR + "/bashrc",
 })
 
 @app.route("/health", methods=["GET"])
@@ -311,25 +313,24 @@ def config():
                                                 }
                                             },
                                             "volumeMounts": [
-            {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
-            *gpu_volume_mounts,
-            {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
-            {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
-            {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
-            {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
-            {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
-            {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
-        ]
-    }
-],
-"volumes": [
-    {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
-    {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
-    *gpu_volumes,
-    {"name": "bash-logout", "hostPath": {"path": "/home/hyrn/github-containerssh/admin_infra/bash_logout_test", "type": "File"}},
-    {"name": "bashrc", "hostPath": {"path": "/home/hyrn/github-containerssh/admin_infra/bashrc_test", "type": "File"}}
-],
-
+                                                {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
+                                                *gpu_volume_mounts,
+                                                {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
+                                                {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
+                                                {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
+                                                {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
+                                                {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
+                                                {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
+                                            ]
+                                        }
+                                    ],
+                                    "volumes": [
+                                        {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
+                                        {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
+                                        *gpu_volumes,
+                                        {"name": "bash-logout", "hostPath": {"path": app.config["BASH_LOGOUT_PATH"], "type": "File"}},
+                                        {"name": "bashrc", "hostPath": {"path": app.config["BASHRC_PATH"], "type": "File"}}
+                                    ],
                                     "restartPolicy": "Never"
                                 }
                             }
@@ -649,8 +650,6 @@ def select_best_node_from_prometheus(node_list):
 
     return best_node
 
-
-from flask import Blueprint
 
 accounts_bp = Blueprint("accounts", __name__)
 

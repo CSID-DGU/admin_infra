@@ -16,6 +16,8 @@ spec:
         app: containerssh-config-server
     spec:
       serviceAccountName: containerssh
+      nodeSelector:
+        kubernetes.io/hostname: farm8
       containers:
         - name: config-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -44,7 +46,7 @@ spec:
               memory: {{ .Values.resources.limits.memory }}
           volumeMounts:
             - name: nfs-kube-share
-              mountPath: /home/tako8/share
+              mountPath: /kube_share
       volumes:
         - name: nfs-kube-share
           nfs:
