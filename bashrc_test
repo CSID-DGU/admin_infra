@@ -44,12 +44,12 @@ run_logout_once() {
     # Atomic creation using noclobber so only the first caller succeeds
     ( set -o noclobber; echo "$$ $(date +%s)" > "$lock" ) 2>/dev/null || {
         # Already executed once for this session; just return
-        echo "$(kst_date): logout already executed once for SID=${sid} (lock=${lock})" >> /home/jy/.tmp/monitor.log
+        echo "$(kst_date): logout already executed once for SID=${sid} (lock=${lock})" >> /kube_logs/.containerssh_logs/monitor.log
         return 0
     }
 
     # Actually run the logout script exactly once
-    bash /home/jy/.bash_logout
+    bash $HOME/.bash_logout
 }
 
 # -----------------------------------------------------------------------------
@@ -75,7 +75,7 @@ safe_logout() {
 # -----------------------------------------------------------------------------
 # Set up traps with run-once guard via safe_logout
 # -----------------------------------------------------------------------------
-trap 'echo "$(kst_date): EXIT trap triggered for PID $$" >> /home/jy/.tmp/monitor.log; ORIGINAL_PID=$$ safe_logout $$' EXIT
+trap 'echo "$(kst_date): EXIT trap triggered for PID $$" >> /kube_logs/.containerssh_logs/monitor.log; ORIGINAL_PID=$$ safe_logout $$' EXIT
 
 # Test trap that won't block
 test_trap() {
@@ -119,9 +119,9 @@ ssh_session_monitor() {
     export SESSION_ID="$session_id"
 
     # Create persistent monitor log directory
-    mkdir -p "/home/jy/.tmp"
+    mkdir -p "/kube_logs/.containerssh_logs"
     # Use fixed filename that continues across pod restarts
-    local monitor_log="/home/jy/.tmp/monitor.log"
+    local monitor_log="/kube_logs/.containerssh_logs/monitor.log"
 
     # Prevent multiple monitors for the same PID
     if [ -f "/tmp/monitor_active_${main_bash_pid}" ]; then
@@ -203,7 +203,7 @@ ssh_session_monitor() {
     disown $!
 
     # Store the monitor info
-    echo "Monitor started for session $session_id at $(kst_date)" > "/home/jy/.tmp/monitor_${session_id}.info"
+    echo "Monitor started for session $session_id at $(kst_date)" > "/kube_logs/.containerssh_logs/monitor_${session_id}.info"
 }
 
 # Start monitoring when bash starts (only for interactive shells)
@@ -224,10 +224,10 @@ check_session() {
 PROMPT_COMMAND="check_session"
 
 # Useful monitoring commands
-alias monitor_status='echo "=== Persistent monitor files ==="; ls -la /home/jy/.tmp/monitor_* 2>/dev/null; echo "=== Temp session files ==="; ls -la /tmp/monitor_active_* /tmp/ssh_session_* 2>/dev/null || echo "No temp files found"'
-alias cleanup_old_monitors='echo "Persistent logs:"; ls -la /home/jy/.tmp/monitor_* 2>/dev/null; echo "Temp files:"; find /tmp -name "monitor_*" -o -name "ssh_session_*" -o -name "session_active_*" | xargs ls -la 2>/dev/null; echo "Use: rm /home/jy/.tmp/monitor_* /tmp/monitor_* /tmp/ssh_session_* /tmp/session_active_* to clean up"'
-alias monitor_log='cat /home/jy/.tmp/monitor.log 2>/dev/null || echo "No monitor log found"'
-alias logout_log='ls -la /home/jy/.containerssh_logs/ 2>/dev/null && cat /home/jy/.containerssh_logs/logout.log 2>/dev/null || echo "No logout logs found"'
+alias monitor_status='echo "=== Persistent monitor files ==="; ls -la /kube_logs/.containerssh_logs/monitor_* 2>/dev/null; echo "=== Temp session files ==="; ls -la /tmp/monitor_active_* /tmp/ssh_session_* 2>/dev/null || echo "No temp files found"'
+alias cleanup_old_monitors='echo "Persistent logs:"; ls -la /kube_logs/.containerssh_logs/monitor_* 2>/dev/null; echo "Temp files:"; find /tmp -name "monitor_*" -o -name "ssh_session_*" -o -name "session_active_*" | xargs ls -la 2>/dev/null; echo "Use: rm /kube_logs/.containerssh_logs/monitor_* /tmp/monitor_* /tmp/ssh_session_* /tmp/session_active_* to clean up"'
+alias monitor_log='cat /kube_logs/.containerssh_logs/monitor.log 2>/dev/null || echo "No monitor log found"'
+alias logout_log='ls -la /kube_logs/.containerssh_logs/ 2>/dev/null && cat /kube_logs/.containerssh_logs/logout.log 2>/dev/null || echo "No logout logs found"'
 alias session_info='echo "Current PID: $$, PPID: $(ps -o ppid= -p $$), Terminal: $([ -t 0 ] && echo "Connected" || echo "Disconnected")"'
 alias timezone_info='echo "System time: $(date)"; echo "UTC time: $(date -u)"; echo "KST attempt: $(kst_date)"; ls -la /usr/share/zoneinfo/Asia/Seoul 2>/dev/null || echo "Seoul timezone file not found"'
 
