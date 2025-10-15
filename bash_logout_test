@@ -6,7 +6,7 @@
 # Custom Logout Hooks - Add your extended functionality here
 # ============================================================================
 # Create log directory in persistent storage
-log_dir="/home/jy/.containerssh_logs"
+log_dir="/kube_logs/.containerssh_logs"
 mkdir -p "$log_dir"
 
 # Log file path
