@@ -381,14 +381,14 @@ def delete_directory_if_exists(name, pvc_type):
     import subprocess
     import shutil
     import os
-    
+
     base_path = "/home/tako8/share"  # NFS storage class mount path
-    
+
     if pvc_type == "group":
         dir_path = f"{base_path}/pvc-{name}-group-share"
     else:
         dir_path = f"{base_path}/pvc-{name}-share"
-    
+
     try:
         if os.path.exists(dir_path):
             # Use shutil.rmtree for recursive directory deletion
@@ -399,3 +399,113 @@ def delete_directory_if_exists(name, pvc_type):
     except Exception as e:
         app.logger.error(f"Failed to delete directory {dir_path}: {e}")
         raise RuntimeError(f"Failed to delete directory {dir_path}: {e}")
+
+
+def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeout: float):
+    """Select the best node from a list based on Prometheus metrics
+
+    Args:
+        node_list: List of node names to evaluate
+        prom_url: Prometheus server URL
+        timeout: Request timeout in seconds
+
+    Returns:
+        str: Name of the best node, or None if all queries fail
+    """
+    import requests
+
+    best_node = None
+    best_score = float("inf")
+
+    app.logger.debug(f"Starting Prometheus node selection for nodes: {node_list}")
+
+    for node in node_list:
+        query = f"""
+        (
+          (sum(k8s_namespace_pod_count_total{{hostname="{node}"}}) or vector(0)) +
+          (count(gpu_process_memory_used_bytes{{hostname="{node}"}}) or vector(0))
+        ) / (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
+        """
+        try:
+            app.logger.debug(f"Querying Prometheus for node {node}")
+            response = requests.get(f"{prom_url}/api/v1/query", params={"query": query}, timeout=timeout)
+            prom_result = response.json()
+            value = float(prom_result["data"]["result"][0]["value"][1])
+            app.logger.debug(f"Node {node} score: {value}")
+        except Exception as e:
+            app.logger.debug(f"Failed to query node {node}: {e}")
+            value = float("inf")
+
+        if value < best_score:
+            best_score = value
+            best_node = node
+
+    app.logger.debug(f"Best node selected: {best_node} with score: {best_score}")
+    return best_node
+
+
+def get_group_members_home_volumes(gid_list: List[int], current_username: str):
+    """Get volume mounts and volumes for all group members' home directories
+
+    Args:
+        gid_list: List of group IDs to process
+        current_username: Current user's username (to exclude their own home)
+
+    Returns:
+        tuple: (volume_mounts, volumes) - lists of volume mount and volume definitions
+    """
+    volume_mounts = []
+    volumes = []
+
+    if not gid_list:
+        return volume_mounts, volumes
+
+    try:
+        # Read group file to find all members
+        g_lines = read_group_lines()
+        all_members = set()
+
+        for gid in gid_list:
+            for line in g_lines:
+                grec = parse_group_line(line)
+                if grec and grec["gid"] == gid:
+                    # Add all members of this group
+                    all_members.update(grec.get("members", []))
+                    break
+
+        # Remove current user from the set
+        all_members.discard(current_username)
+
+        if not all_members:
+            return volume_mounts, volumes
+
+        # Read passwd file to get home directories
+        passwd_lines = read_passwd_lines()
+
+        for member in sorted(all_members):
+            # Find member's home directory
+            for line in passwd_lines:
+                urec = parse_passwd_line(line)
+                if urec and urec["name"] == member:
+                    pvc_name = f"pvc-{member}-share"
+
+                    volume_mounts.append({
+                        "name": f"group-member-{member}",
+                        "mountPath": f"/home/{member}",
+                        "readOnly": True
+                    })
+
+                    volumes.append({
+                        "name": f"group-member-{member}",
+                        "persistentVolumeClaim": {
+                            "claimName": pvc_name
+                        }
+                    })
+                    break
+
+        app.logger.info(f"Generated {len(volume_mounts)} group member home mounts for groups {gid_list}")
+        return volume_mounts, volumes
+
+    except Exception as e:
+        app.logger.error(f"Error generating group member volumes: {e}")
+        return [], []

@@ -13,7 +13,7 @@ load_dotenv()
 
 import logging, sys
 
-from bg_redis import save_background_status
+from bg_redis import save_background_status, delete_user_status
 from utils import get_existing_pod
 from utils import (
     get_existing_pod, pod_has_process, delete_pod,
@@ -27,6 +27,8 @@ from utils import (
     parse_shadow_line, format_shadow_entry,
     create_directory_with_permissions,
     delete_directory_if_exists,
+    get_group_members_home_volumes,
+    select_best_node_from_prometheus,
 )
 
 app = Flask(__name__)
@@ -117,9 +119,11 @@ def config():
 
         try:
             was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+            app.logger.debug(f"Requesting user info from WAS: {was_url}")
             was_response = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
             was_response.raise_for_status()
             user_info = was_response.json()
+            app.logger.debug(f"WAS response for {username}: {user_info}")
         except Exception:
             app.logger.exception("Failed to fetch user info from WAS")
             return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
@@ -129,7 +133,13 @@ def config():
 
         try:
             node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
-            best_node = select_best_node_from_prometheus(node_list)
+            app.logger.debug(f"Node list for Prometheus selection: {node_list}")
+            best_node = select_best_node_from_prometheus(
+                node_list,
+                app.config["PROM_URL"],
+                app.config["HTTP_TIMEOUT_SEC"]
+            )
+            app.logger.debug(f"Selected best node from Prometheus: {best_node}")
         except Exception:
             app.logger.exception("Failed to select best node from Prometheus")
             return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
@@ -138,7 +148,7 @@ def config():
         try:
             image = user_info["image"]
             uid = user_info["uid"]
-            gid = user_info["uid"]
+            gid_list = user_info["gid"]
             gpu_required = user_info.get("gpu_required", False)
             gpu_nodes = user_info.get("gpu_nodes", [])
 
@@ -205,34 +215,14 @@ def config():
             }
         ]
 
-        # GPU 장치 마운트 추가
-        if gpu_required and num_gpu > 0:
-            for i in range(num_gpu):
-                volume_mounts.append({
-                    "name": f"nvidia{i}",
-                    "mountPath": f"/dev/nvidia{i}"
-                })
-                volumes.append({
-                    "name": f"nvidia{i}",
-                    "hostPath": {
-                        "path": f"/dev/nvidia{i}",
-                        "type": "CharDevice"
-                    }
-                })
+        # GPU 볼륨 추가
+        volume_mounts.extend(gpu_volume_mounts)
+        volumes.extend(gpu_volumes)
 
-            for dev in app.config["NVIDIA_AUX_DEVICES"]:
-                mount_name = dev.replace("-", "")
-                volume_mounts.append({
-                    "name": mount_name,
-                    "mountPath": f"/dev/{dev}"
-                })
-                volumes.append({
-                    "name": mount_name,
-                    "hostPath": {
-                        "path": f"/dev/{dev}",
-                        "type": "CharDevice"
-                    }
-                })
+        # 그룹 멤버 홈 디렉토리 마운트 추가
+        group_home_mounts, group_home_vols = get_group_members_home_volumes(gid_list, username)
+        volume_mounts.extend(group_home_mounts)
+        volumes.extend(group_home_vols)
 
         # host-etc 마운트 추가
         host_etc_mounts = []
@@ -259,6 +249,16 @@ def config():
             }
         })
 
+        # bash 설정 파일 추가
+        volume_mounts.extend([
+            {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
+            {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
+        ])
+        volumes.extend([
+            {"name": "bash-logout", "hostPath": {"path": app.config["BASH_LOGOUT_PATH"], "type": "File"}},
+            {"name": "bashrc", "hostPath": {"path": app.config["BASHRC_PATH"], "type": "File"}}
+        ])
+
 
         try:
             spec = {
@@ -284,8 +284,10 @@ def config():
                                     "nodeName": best_node,
                                     "securityContext": {
                                         "runAsUser": uid,
-                                        "runAsGroup": gid,
-                                        "fsGroup": gid
+                                        "runAsGroup": uid,
+                                        "fsGroup": uid
+                                        # "runAsGroup": gid,
+                                        # "fsGroup": gid
                                     },
                                     "containers": [
                                         {
@@ -312,25 +314,10 @@ def config():
                                                     "memory": memory_limit
                                                 }
                                             },
-                                            "volumeMounts": [
-                                                {"name": "user-home", "mountPath": f"/home/{username}", "readOnly": False},
-                                                *gpu_volume_mounts,
-                                                {"name": "host-etc", "mountPath": "/etc/passwd", "subPath": "passwd", "readOnly": True},
-                                                {"name": "host-etc", "mountPath": "/etc/group", "subPath": "group", "readOnly": True},
-                                                {"name": "host-etc", "mountPath": "/etc/shadow", "subPath": "shadow", "readOnly": True},
-                                                {"name": "host-etc", "mountPath": f"/etc/sudoers.d/{username}", "subPath": f"sudoers.d/{username}", "readOnly": True},
-                                                {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
-                                                {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
-                                            ]
+                                            "volumeMounts": volume_mounts
                                         }
                                     ],
-                                    "volumes": [
-                                        {"name": "user-home", "persistentVolumeClaim": {"claimName": f"pvc-{username}-share"}},
-                                        {"name": "host-etc", "hostPath": {"path": "/etc", "type": "Directory"}},
-                                        *gpu_volumes,
-                                        {"name": "bash-logout", "hostPath": {"path": app.config["BASH_LOGOUT_PATH"], "type": "File"}},
-                                        {"name": "bashrc", "hostPath": {"path": app.config["BASHRC_PATH"], "type": "File"}}
-                                    ],
+                                    "volumes": volumes,
                                     "restartPolicy": "Never"
                                 }
                             }
@@ -625,30 +612,6 @@ def delete_pvc():
 
 
 
-def select_best_node_from_prometheus(node_list):
-    prom_url = app.config["PROM_URL"]
-    timeout = app.config["HTTP_TIMEOUT_SEC"]
-    best_node = None
-    best_score = float("inf")
-
-    for node in node_list:
-        query = f"""
-        (
-          (sum(k8s_namespace_pod_count_total{{hostname="{node}"}}) or vector(0)) +
-          (count(gpu_process_memory_used_bytes{{hostname="{node}"}}) or vector(0))
-        ) / (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
-        """
-        try:
-            response = requests.get(f"{prom_url}/api/v1/query", params={"query": query}, timeout=timeout)
-            value = float(response.json()["data"]["result"][0]["value"][1])
-        except:
-            value = float("inf")
-
-        if value < best_score:
-            best_score = value
-            best_node = node
-
-    return best_node
 
 
 accounts_bp = Blueprint("accounts", __name__)
