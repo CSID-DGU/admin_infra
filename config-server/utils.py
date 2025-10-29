@@ -91,6 +91,88 @@ def delete_pod(pod_name, namespace):
 
 
 # ============================
+#  NodePort Service 관련
+# ============================
+
+def create_nodeport_services(username: str, namespace: str, extra_ports: List[dict]):
+    """
+    사용자 Pod용 NodePort Service 생성 (여러 포트 지원)
+
+    Args:
+        username: 사용자명
+        namespace: k8s 네임스페이스
+        extra_ports: [{"internal_port": 8888, "external_port": 10001, "usage_purpose": "jupyter"}, ...]
+    """
+    load_k8s()
+    v1 = client.CoreV1Api()
+    pod_name = f"containerssh-{username}"
+
+    for port_info in extra_ports:
+        internal_port = port_info["internal_port"]  # Pod 내부 포트
+        external_port = port_info["external_port"]  # NodePort (10000-15000)
+        purpose = port_info.get("usage_purpose", "custom")
+
+        service_name = f"containerssh-{username}-{purpose}-{external_port}"
+
+        service_body = client.V1Service(
+            metadata=client.V1ObjectMeta(
+                name=service_name,
+                namespace=namespace,
+                labels={
+                    "app": "containerssh-nodeport",
+                    "username": username,
+                    "purpose": purpose
+                }
+            ),
+            spec=client.V1ServiceSpec(
+                type="NodePort",
+                selector={"containerssh_pod_name": pod_name},
+                ports=[client.V1ServicePort(
+                    name=purpose,
+                    protocol="TCP",
+                    port=internal_port,
+                    target_port=internal_port,
+                    node_port=external_port
+                )]
+            )
+        )
+
+        try:
+            # 기존 Service가 있으면 삭제 후 재생성
+            try:
+                v1.delete_namespaced_service(service_name, namespace)
+                app.logger.info(f"Deleted existing service {service_name}")
+            except client.exceptions.ApiException as e:
+                if e.status != 404:
+                    raise
+
+            v1.create_namespaced_service(namespace, service_body)
+            app.logger.info(f"Created service {service_name}: {internal_port} -> NodePort {external_port}")
+        except Exception as e:
+            app.logger.error(f"Failed to create service {service_name}: {e}")
+            raise
+
+
+def delete_nodeport_services(username: str, namespace: str):
+    """사용자 Pod 삭제 시 관련 NodePort Service도 모두 삭제"""
+    load_k8s()
+    v1 = client.CoreV1Api()
+
+    try:
+        # username 라벨로 모든 관련 Service 조회
+        services = v1.list_namespaced_service(
+            namespace=namespace,
+            label_selector=f"username={username},app=containerssh-nodeport"
+        )
+
+        for svc in services.items:
+            v1.delete_namespaced_service(svc.metadata.name, namespace)
+            app.logger.info(f"Deleted service {svc.metadata.name}")
+    except Exception as e:
+        app.logger.error(f"Failed to delete services for {username}: {e}")
+
+
+# ============================
 #  Docker / Image 관련
 # ============================
 
