@@ -1,11 +1,14 @@
 import os
+import subprocess
 import re
 import fcntl
 from typing import List, Optional
 
+from datetime import datetime
 from kubernetes import client, config as k8s_config
 from kubernetes.stream import stream
 from flask import current_app as app
+from bg_redis import save_image_metadata, get_image_metadata
 
 def load_k8s():
     # k8s client 초기
@@ -14,6 +17,9 @@ def load_k8s():
     except:
         k8s_config.load_kube_config()
 
+# ============================
+#  Pod / Process 관련
+# ============================
 def pod_has_process(namespace, pod_name, username):
     
     try:
@@ -84,6 +90,94 @@ def delete_pod(pod_name, namespace):
     v1.delete_namespaced_pod(pod_name, namespace)
 
 
+# ============================
+#  Docker / Image 관련
+# ============================
+
+def load_user_image(username: str, base_image: str) -> str:
+    """
+    NFS에 tar가 있으면 docker load 실행, 성공 시 user-{username}:latest 사용
+    """
+    image_dir = app.config.get("NFS_IMAGE_DIR", "/volume1/images")
+    docker_bin = app.config.get("DOCKER_BIN", "/usr/bin/docker")
+    tar_path = os.path.join(image_dir, f"user-{username}.tar")
+
+    if not os.path.exists(tar_path):
+        app.logger.info(f"[{username}] No saved image tar → base image 사용")
+        save_image_metadata(username, status="base_used", path=tar_path)
+        return base_image
+
+    try:
+        subprocess.run([docker_bin, "load", "-i", tar_path], check=True)
+        image = f"user-{username}:latest"
+        app.logger.info(f"[{username}] ✅ Image loaded from {tar_path}")
+        save_image_metadata(username, status="loaded", path=tar_path)
+        return image
+    except subprocess.CalledProcessError as e:
+        app.logger.error(f"[{username}] docker load failed: {e}")
+        save_image_metadata(username, status="load_failed", path=tar_path)
+        return base_image
+    except Exception as e:
+        app.logger.exception(f"[{username}] Unexpected load error: {e}")
+        save_image_metadata(username, status="load_error", path=tar_path)
+        return base_image
+
+def commit_and_save_user_image(username, pod_name, namespace):
+    """
+    Pod 컨테이너를 Docker 이미지로 커밋하고 NFS에 tar로 저장,
+    이후 Redis에 메타데이터 기록
+    """
+    image_dir = app.config["NFS_IMAGE_DIR"]
+    docker_bin = app.config["DOCKER_BIN"]
+    image_name = f"user-{username}:latest"
+    tar_path = os.path.join(image_dir, f"user-{username}.tar")
+
+    try:
+        v1 = client.CoreV1Api()
+        pod = v1.read_namespaced_pod(pod_name, namespace)
+        node_name = pod.spec.node_name
+        app.logger.info(f"[{username}] Pod {pod_name} on node {node_name}")
+
+        # 컨테이너 ID 찾기
+        container_id_cmd = [docker_bin, "ps", "-q", "--filter", f"name={pod_name}"]
+        container_id = subprocess.check_output(container_id_cmd).decode().strip()
+        if not container_id:
+            app.logger.warning(f"[{username}] No container found for pod {pod_name}")
+            return False
+
+        # docker commit + save
+        subprocess.run([docker_bin, "commit", container_id, image_name], check=True)
+        os.makedirs(image_dir, exist_ok=True)
+        subprocess.run([docker_bin, "save", "-o", tar_path, image_name], check=True)
+
+        # 파일 크기 계산
+        size_mb = round(os.path.getsize(tar_path) / (1024 * 1024), 2)
+        version = int(datetime.utcnow().timestamp())
+
+        # Redis에 이미지 메타데이터 기록
+        save_image_metadata(
+            username=username,
+            status="success",
+            size_mb=size_mb,
+            version=version,
+            path=tar_path
+        )
+
+        app.logger.info(f"[{username}] ✅ Image saved ({size_mb} MB), recorded in Redis.")
+        return True
+
+    except subprocess.CalledProcessError as e:
+        app.logger.error(f"[{username}] Docker command failed: {e}")
+        save_image_metadata(username, status="failed")
+        return False
+    except Exception as e:
+        app.logger.exception(f"[{username}] Unexpected error: {e}")
+        save_image_metadata(username, status="error")
+        return False
+
+# ============================
+#  Group / Volume 관련
+# ============================
 # ---- File lock helpers ----
 class LockedFile:
     """Context manager for POSIX advisory file locks using fcntl.flock."""

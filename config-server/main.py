@@ -29,6 +29,7 @@ from utils import (
     delete_directory_if_exists,
     get_group_members_home_volumes,
     select_best_node_from_prometheus,
+    load_user_image,
 )
 
 app = Flask(__name__)
@@ -146,7 +147,7 @@ def config():
 
         # 사용자 리소스 정보 정리
         try:
-            image = user_info["image"]
+            image = load_user_image(username, user_info["image"])
             uid = user_info["uid"]
             gid_list = user_info["gid"]
             gpu_required = user_info.get("gpu_required", False)
@@ -358,10 +359,20 @@ def report_background():
 
     ns = app.config["NAMESPACE"]
     # 실제 프로세스 확인
-    still_running = pod_has_process(pod_name, ns, username)
+    still_running = pod_has_process(ns, pod_name, username)
 
     if not still_running:
-        # 즉시 Pod 삭제
+        app.logger.info(f"[{username}] No background process. Committing image before deletion...")
+
+        # 1. Pod에서 Docker 이미지 커밋 + NFS 저장 + Redis 기록
+        success = commit_and_save_user_image(username, pod_name, ns)
+
+        if success:
+            app.logger.info(f"[{username}] Image commit/save succeeded.")
+        else:
+            app.logger.warning(f"[{username}] Image commit/save failed.")
+        
+        # 2. Pod 삭제
         delete_pod(pod_name, ns)
         delete_user_status(username)  # Redis 정리
         return jsonify({"status": "deleted", "username": username}), 200
