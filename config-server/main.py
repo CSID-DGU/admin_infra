@@ -30,6 +30,8 @@ from utils import (
     get_group_members_home_volumes,
     select_best_node_from_prometheus,
     load_user_image,
+    create_nodeport_services,
+    delete_nodeport_services,
 )
 
 app = Flask(__name__)
@@ -152,6 +154,7 @@ def config():
             gid_list = user_info["gid"]
             gpu_required = user_info.get("gpu_required", False)
             gpu_nodes = user_info.get("gpu_nodes", [])
+            extra_ports = user_info.get("extra_ports", [])
 
             cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
             memory_limit = app.config["DEFAULT_MEM_LIMIT"]
@@ -278,7 +281,8 @@ def config():
                                 "labels": {
                                     "app": "containerssh-guest",
                                     "managed-by": "containerssh",
-                                    "containerssh_username": username
+                                    "containerssh_username": username,
+                                    "containerssh_pod_name": f"containerssh-{username}"
                                 }
                             },
                             "spec": {
@@ -297,6 +301,14 @@ def config():
                                             "imagePullPolicy": "Never",
                                             "stdin": True,
                                             "tty": True,
+                                            "ports": [
+                                                {
+                                                    "containerPort": port_info["internal_port"],
+                                                    "protocol": "TCP",
+                                                    "name": port_info.get("usage_purpose", "custom")[:15]
+                                                }
+                                                for port_info in extra_ports
+                                            ] if extra_ports else [],
                                             "env": [
                                                 {"name": "USER", "value": username},
                                                 {"name": "USER_ID", "value": username},
@@ -330,6 +342,15 @@ def config():
                     "metadata": {},
                     "files": {}
                 }
+
+            # NodePort Service 생성 (Pod 생성 전)
+            if extra_ports:
+                try:
+                    create_nodeport_services(username, ns, extra_ports)
+                    app.logger.info(f"Created {len(extra_ports)} NodePort services for {username}")
+                except Exception as e:
+                    app.logger.error(f"Failed to create NodePort services: {e}")
+                    # Service 생성 실패해도 Pod는 생성되도록 계속 진행
 
             return jsonify(spec)
         except Exception:
@@ -374,7 +395,16 @@ def report_background():
         
         # 2. Pod 삭제
         delete_pod(pod_name, ns)
-        delete_user_status(username)  # Redis 정리
+
+        # 3. NodePort Service 삭제
+        try:
+            delete_nodeport_services(username, ns)
+            app.logger.info(f"[{username}] Deleted NodePort services")
+        except Exception as e:
+            app.logger.error(f"[{username}] Failed to delete NodePort services: {e}")
+
+        # 4. Redis 정리
+        delete_user_status(username)
         return jsonify({"status": "deleted", "username": username}), 200
 
     # 백그라운드 있으면 Redis에 저장
