@@ -1,0 +1,89 @@
+# Unified CUDA guest image Dockerfile
+# Build with: docker build --build-arg CUDA_VERSION=11.8.0 -t guest:cuda11.8 -f Dockerfile.cuda .
+#         or: docker build --build-arg CUDA_VERSION=12.2.2 -t guest:cuda12.2 -f Dockerfile.cuda .
+
+ARG CUDA_VERSION=11.8.0
+ARG CUDNN_VERSION=8
+ARG UBUNTU_VERSION=22.04
+
+FROM containerssh/agent AS agent
+
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn${CUDNN_VERSION}-devel-ubuntu${UBUNTU_VERSION}
+
+# Install common packages
+RUN apt-get update && apt-get install -y \
+    bash wget curl net-tools fcitx-hangul fonts-nanum* vim software-properties-common sudo \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-key adv --keyserver keyserver.ubuntu.com --recv-keys A4B469963BF863CC
+
+# Copy ContainerSSH Agent
+COPY --from=agent /usr/bin/containerssh-agent /usr/bin/containerssh-agent
+
+# Install Anaconda (version can be parameterized if needed)
+ARG ANACONDA_VERSION=2025.06-1
+RUN wget https://repo.anaconda.com/archive/Anaconda3-${ANACONDA_VERSION}-Linux-x86_64.sh \
+    && bash Anaconda3-${ANACONDA_VERSION}-Linux-x86_64.sh -b -p /opt/anaconda3 \
+    && rm Anaconda3-${ANACONDA_VERSION}-Linux-x86_64.sh
+
+# Setup Anaconda PATH
+ENV PATH=/opt/anaconda3/bin:$PATH
+
+# Add PATH to profile and initialize conda
+RUN echo "export PATH=/opt/anaconda3/bin:\$PATH" >> /etc/profile \
+    && /opt/anaconda3/bin/conda init
+
+# Install and configure Jupyter (Notebook 7.x uses ServerApp)
+RUN /opt/anaconda3/bin/pip install --upgrade pip && \
+    /opt/anaconda3/bin/pip install jupyter jupyterlab notebook ipywidgets
+
+# Create system-wide Jupyter config directory and base configuration
+# Users will have their own ~/.jupyter directory with this as template
+RUN mkdir -p /etc/jupyter && \
+    cat > /etc/jupyter/jupyter_server_config.py <<'EOF'
+# Jupyter Server configuration for Jupyter Notebook 7.x+
+c = get_config()  # noqa
+
+# Network settings
+c.ServerApp.ip = '0.0.0.0'
+c.ServerApp.port = 8888
+c.ServerApp.open_browser = False
+c.ServerApp.allow_root = False
+
+# Disable authentication (handled by ContainerSSH)
+c.ServerApp.token = ''
+c.ServerApp.password = ''
+c.ServerApp.disable_check_xsrf = True
+
+# Allow remote access
+c.ServerApp.allow_remote_access = True
+c.ServerApp.allow_origin = '*'
+
+# Working directory (users can override in their ~/.jupyter/)
+# c.ServerApp.root_dir = '/home/{username}'  # Set by user
+EOF
+
+# Create a startup script for users to easily launch Jupyter
+RUN cat > /usr/local/bin/start-jupyter <<'EOF'
+#!/bin/bash
+# Simple Jupyter startup script
+# Usage: start-jupyter [port] [notebook_dir]
+
+PORT=${1:-8888}
+NOTEBOOK_DIR=${2:-$HOME}
+
+echo "Starting Jupyter Notebook on port $PORT..."
+echo "Notebook directory: $NOTEBOOK_DIR"
+
+jupyter notebook \
+  --ip=0.0.0.0 \
+  --port=$PORT \
+  --no-browser \
+  --notebook-dir="$NOTEBOOK_DIR"
+EOF
+
+RUN chmod +x /usr/local/bin/start-jupyter
+
+# Expose common Jupyter ports (informational only)
+EXPOSE 8888 8889 8890
+
+# No entrypoint needed - user creation handled by config-server
