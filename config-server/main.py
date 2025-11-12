@@ -13,7 +13,7 @@ load_dotenv()
 
 import logging, sys
 
-from bg_redis import save_background_status, delete_user_status
+from bg_img_redis import save_background_status, delete_user_status
 from utils import get_existing_pod
 from utils import (
     get_existing_pod, pod_has_process, delete_pod,
@@ -156,6 +156,8 @@ def config():
             gpu_nodes = user_info.get("gpu_nodes", [])
             extra_ports = user_info.get("extra_ports", [])
 
+            app.logger.info(f"[{username}] gpu_required={gpu_required}, gpu_nodes={gpu_nodes}")
+
             cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
             memory_limit = app.config["DEFAULT_MEM_LIMIT"]
             num_gpu = 0
@@ -164,6 +166,7 @@ def config():
                     cpu_limit = node.get("cpu_limit", app.config["DEFAULT_CPU_LIMIT"])
                     memory_limit = node.get("memory_limit", app.config["DEFAULT_MEM_LIMIT"])
                     num_gpu = node.get("num_gpu", 0)
+                    app.logger.info(f"[{username}] Matched node={best_node}, cpu={cpu_limit}, mem={memory_limit}, num_gpu={num_gpu}")
                     break
 
             pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)

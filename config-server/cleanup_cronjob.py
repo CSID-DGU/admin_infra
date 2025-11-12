@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from bg_redis import get_all_background_users, delete_user_status
+from bg_img_redis import get_all_background_users, delete_user_status
 from utils import pod_has_process, delete_pod, load_k8s
 
 NAMESPACE = "cssh"

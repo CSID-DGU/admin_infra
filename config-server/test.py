@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from utils import get_existing_pod   # Pod 재사용 확인
-from bg_redis import save_background_status
+from bg_img_redis import save_background_status
 from utils import pod_has_process, delete_pod
 
 import logging, sys
