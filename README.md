@@ -94,5 +94,6 @@ kubectl describe pod <POD_NAME> -n cssh | grep Image
 
 # 6. 환경 변수 및 시크릿
 CI/CD 작동을 위해 GitHub Repository Secrets에 다음 변수들이 등록되어 있습니다.
-- Docker Hub: DOCKER_USERNAME, DOCKER_PASSWORD
-- Kubernetes Access: K8S_HOST, K8S_USERNAME, K8S_PRIVATE_KEY, K8S_PORT
+- Docker Hub: `DOCKER_USERNAME`, `DOCKER_PASSWORD`
+- Kubernetes Access: `K8S_HOST`, `K8S_USERNAME`, `K8S_PRIVATE_KEY`, `K8S_PORT`
+> 현재는 username이 toni와 key로 되어있으며, 관리자 변경 시 인수인계가 필요합니다.
