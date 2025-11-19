@@ -7,6 +7,9 @@ from kubernetes import client, config as k8s_config
 import pymysql
 import os
 import requests
+import logging, sys
+
+from flasgger import Swagger
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -35,6 +38,20 @@ from utils import (
 )
 
 app = Flask(__name__)
+
+# Swagger 설정
+app.config['SWAGGER'] = {
+    'title': 'GPU Server Manager API',
+    'uiversion': 3
+}
+
+swagger = Swagger(app, template={
+    "info": {
+        "title": "GPU 서버 관리 업무 자동화 시스템 API",
+        "description": "Kubernetes Pod 동적 할당 및 시스템 계정 관리 API",
+        "version": "1.0.0"
+    }
+})
 
 # 로그 설정
 handler = logging.StreamHandler(sys.stdout)
