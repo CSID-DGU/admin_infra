@@ -37,22 +37,6 @@ from utils import (
     delete_nodeport_services,
 )
 
-app = Flask(__name__)
-
-# Swagger 설정
-app.config['SWAGGER'] = {
-    'title': 'GPU Server Manager API',
-    'uiversion': 3
-}
-
-swagger = Swagger(app, template={
-    "info": {
-        "title": "GPU 서버 관리 업무 자동화 시스템 API",
-        "description": "Kubernetes Pod 동적 할당 및 시스템 계정 관리 API",
-        "version": "1.0.0"
-    }
-})
-
 # 로그 설정
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
@@ -1032,6 +1016,22 @@ def add_user_groups(username: str):
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp, url_prefix="/accounts")
+
+app = Flask(__name__)
+
+# Swagger 설정
+app.config['SWAGGER'] = {
+    'title': 'GPU Server Manager API',
+    'uiversion': 3
+}
+
+swagger = Swagger(app, template={
+    "info": {
+        "title": "GPU 서버 관리 업무 자동화 시스템 API",
+        "description": "Kubernetes Pod 동적 할당 및 시스템 계정 관리 API",
+        "version": "1.0.0"
+    }
+})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000)
