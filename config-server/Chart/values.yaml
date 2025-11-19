@@ -1,7 +1,7 @@
 image:
-  repository: config-server
-  tag: v10
-  pullPolicy: Never
+  repository: dguailab/config-server
+  tag: latest
+  pullPolicy: Always
 
 service:
   type: NodePort
