@@ -24,6 +24,7 @@ jobs:
         password: ${{ secrets.DOCKER_PASSWORD }}
 
     # 3. 이미지 빌드 및 푸시
+    # secrets.DOCKER_USERNAME을 네임스페이스로 사용하여 푸시
     - name: Build and Push Docker Image
       uses: docker/build-push-action@v4
       with:
@@ -61,14 +62,14 @@ jobs:
           IMAGE_TAG=${{ github.sha }}
           
           # 2. Helm Upgrade 실행
-          # -n cssh: 네임스페이스 지정
-          # --set image.tag: 방금 빌드한 이미지 태그 주입
-          # --install: 없으면 설치, 있으면 업그레이드
+          # --set image.repository: 시크릿에 저장된 이름으로 이미지 경로 설정
+          # --set image.pullPolicy=Always: 무조건 최신 이미지를 다운로드 받도록 설정
           
           helm upgrade --install containerssh-config-server ~/deploy-temp/config-server/Chart \
             --namespace cssh \
             --create-namespace \
             --set image.repository=${{ secrets.DOCKER_USERNAME }}/config-server \
-            --set image.tag=$IMAGE_TAG
+            --set image.tag=$IMAGE_TAG \
+            --set image.pullPolicy=Always
           
           echo "=== Deployment Finished ==="
