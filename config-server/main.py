@@ -37,6 +37,8 @@ from utils import (
     delete_nodeport_services,
 )
 
+app = Flask(__name__)
+
 # 로그 설정
 handler = logging.StreamHandler(sys.stdout)
 handler.setLevel(logging.DEBUG)
@@ -1016,8 +1018,6 @@ def add_user_groups(username: str):
 
 # Register the blueprint under /accounts
 app.register_blueprint(accounts_bp, url_prefix="/accounts")
-
-app = Flask(__name__)
 
 # Swagger 설정
 app.config['SWAGGER'] = {
