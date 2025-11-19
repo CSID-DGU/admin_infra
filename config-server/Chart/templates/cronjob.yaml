@@ -2,9 +2,9 @@ apiVersion: batch/v1
 kind: CronJob
 metadata:
   name: cleanup-background-pods
-  namespace: {{ .Values.namespace }}
+  namespace: {{ .Values.config.namespace }}  
 spec:
-  schedule: "0 * * * *" # 매시간 실행
+  schedule: "0 * * * *" # 매시간 정각 실행
   jobTemplate:
     spec:
       ttlSecondsAfterFinished: 300
@@ -12,16 +12,12 @@ spec:
         spec:
           containers:
           - name: cleanup
-            image: {{ .Values.cleanup.image }}
-            command: ["python", "/app/cleanup_cronjob.py"]
+            image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+            imagePullPolicy: {{ .Values.image.pullPolicy }}
+            command: ["python", "cleanup_cronjob.py"] 
             env:
               - name: REDIS_HOST
                 value: {{ .Values.redis.host }}
               - name: REDIS_PORT
                 value: "{{ .Values.redis.port }}"
           restartPolicy: OnFailure
-          volumes:
-            - name: app-code
-              configMap:
-                name: config-server-scripts
-
