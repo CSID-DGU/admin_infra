@@ -92,6 +92,15 @@ app.config.from_mapping({
 
 @app.route("/health", methods=["GET"])
 def health():
+    """
+    서버 상태 확인 API
+    ---
+    tags:
+      - System
+    responses:
+      200:
+        description: 서버가 살아있음
+    """
     return "OK", 200
 
 
