@@ -1,9 +1,8 @@
 flask
-
 python-dotenv
-
 kubernetes==26.1.0
-
 pymysql==1.1.0
-
 redis
+requests
+flasgger
+gunicorn
