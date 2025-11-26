@@ -33,6 +33,7 @@ from utils import (
     get_group_members_home_volumes,
     select_best_node_from_prometheus,
     load_user_image,
+    commit_and_save_user_image,
     create_nodeport_services,
     delete_nodeport_services,
 )
