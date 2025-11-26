@@ -1,0 +1,30 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: config-server-role
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app: containerssh-config-server
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec", "pods/log", "services"]
+  verbs: ["get", "list", "watch", "create", "delete", "patch"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "create", "delete", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: config-server-rolebinding
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app: containerssh-config-server
+subjects:
+- kind: ServiceAccount
+  name: config-server
+  namespace: {{ .Values.config.namespace }}
+roleRef:
+  kind: Role
+  name: config-server-role
+  apiGroup: rbac.authorization.k8s.io
