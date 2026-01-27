@@ -16,8 +16,6 @@ spec:
         app: containerssh-config-server
     spec:
       serviceAccountName: containerssh
-      nodeSelector:
-        kubernetes.io/hostname: farm8
       containers:
         - name: config-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -27,10 +25,8 @@ spec:
           env:
             - name: NFS_ADDRESS
               value: "{{ .Values.env.nfsAddress }}"
-
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
-
           readinessProbe:
             httpGet:
               path: /health
@@ -53,4 +49,3 @@ spec:
             server: {{ .Values.nfs.server }}
             path: {{ .Values.nfs.path }}
             readOnly: false
-
