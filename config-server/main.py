@@ -79,7 +79,7 @@ app.config.from_mapping({
     ],
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
-    
+
     "NVIDIA_AUX_DEVICES": [
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
@@ -296,6 +296,33 @@ def build_pod_spec(
 
 @app.route("/config", methods=["POST"])
 def config():
+    """
+    ContainerSSH에서 호출하는 사용자 Pod 생성 설정 API
+    ---
+    tags:
+      - ContainerSSH
+    consumes:
+      - application/json
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - username
+          properties:
+            username:
+              type: string
+              example: alice
+    responses:
+      200:
+        description: Pod 생성용 Kubernetes spec 반환
+        schema:
+          type: object
+      500:
+        description: 내부 오류
+    """
     try:
         data = request.get_json(force=True)
         username = data.get("username")
@@ -457,6 +484,40 @@ def _migrate_internal(data):
 
 @app.route("/migrate", methods=["POST"])
 def migrate():
+    """
+    실행 중인 사용자 Pod를 더 좋은 GPU 노드로 마이그레이션
+    ---
+    tags:
+      - Migration
+    consumes:
+      - application/json
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - username
+            - nodes
+          properties:
+            username:
+              type: string
+              example: alice
+            nodes:
+              type: array
+              items:
+                type: string
+              example: ["gpu-node-1", "gpu-node-2"]
+            min_improvement_ratio:
+              type: number
+              example: 0.2
+    responses:
+      200:
+        description: 마이그레이션 결과
+      400:
+        description: 잘못된 요청
+    """
     data = request.get_json(force=True)
     username = data.get("username")
     nodes = data.get("nodes")
@@ -475,6 +536,39 @@ def migrate():
 
 @app.route("/pvc", methods=["POST"])
 def create_or_resize_pvc():
+    """
+    PVC 생성 또는 용량 확장 API
+    ---
+    tags:
+      - Storage
+    consumes:
+      - application/json
+    parameters:
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            pvcs:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: alice
+                  type:
+                    type: string
+                    example: user
+                  storage:
+                    type: integer
+                    example: 50
+    responses:
+      200:
+        description: PVC 처리 결과 목록
+      400:
+        description: 잘못된 요청
+    """
     data = request.get_json(force=True)
     pvcs = data.get("pvcs", [])
     
@@ -617,18 +711,57 @@ def create_or_resize_pvc():
 
 @app.route("/pvc", methods=["DELETE"])
 def delete_pvc():
-    """Delete PVC, PV, and associated directory
-    
-    Request format:
-    {
+    """
+    PVC 및 연결된 디렉터리 삭제 API
+
+    - 표준 요청 형식:
+      {
         "pvcs": [
-            {"name": "testuser", "type": "user"},
-            {"name": "developers", "type": "group"}
+          {"name": "testuser", "type": "user"},
+          {"name": "developers", "type": "group"}
         ]
-    }
-    
-    Or legacy format:
-    {"username": "testuser", "type": "user"}
+      }
+
+    - Legacy 요청 형식:
+      {
+        "username": "testuser",
+        "type": "user"
+      }
+
+    ---
+    tags:
+      - Storage
+    consumes:
+      - application/json
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            pvcs:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: testuser
+                  type:
+                    type: string
+                    example: user
+            username:
+              type: string
+              example: testuser
+            type:
+              type: string
+              example: user
+    responses:
+      200:
+        description: 삭제 결과
+      400:
+        description: 잘못된 요청
     """
     data = request.get_json(force=True)
     pvcs = data.get("pvcs", [])

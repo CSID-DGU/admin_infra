@@ -47,10 +47,14 @@ spec:
           volumeMounts:
             - name: nfs-kube-share
               mountPath: /kube_share
+            - name: image-store
+              mountPath: /image-store
       volumes:
         - name: nfs-kube-share
           nfs:
             server: {{ .Values.nfs.server }}
             path: {{ .Values.nfs.path }}
             readOnly: false
-
+        - name: image-store
+          persistentVolumeClaim:
+            claimName: pvc-image-store  
