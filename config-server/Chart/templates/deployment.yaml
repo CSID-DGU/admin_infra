@@ -15,7 +15,7 @@ spec:
       labels:
         app: containerssh-config-server
     spec:
-      serviceAccountName: containerssh
+      serviceAccountName: config-server
       nodeSelector:
         kubernetes.io/hostname: farm8
       containers:

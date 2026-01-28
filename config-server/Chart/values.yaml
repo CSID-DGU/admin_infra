@@ -32,7 +32,7 @@ config:
 namespace: cssh
 
 cleanup:
-  image: config-server:v1
+  image: config-server:latest
 
 redis:
   host: redis-bg-master.cssh.svc.cluster.local
