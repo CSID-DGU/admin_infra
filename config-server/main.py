@@ -16,11 +16,9 @@ load_dotenv()
 
 import logging, sys
 
-from bg_img_redis import save_background_status, delete_user_status
-from utils import get_existing_pod
 from utils import (
-    get_existing_pod, pod_has_process, delete_pod,
-    LockedFile,
+    get_existing_pod, delete_pod,
+    LockedFile,get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_dir,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
@@ -79,6 +77,9 @@ app.config.from_mapping({
         "sudoers.d/{username}",
         "bash.bash_logout",
     ],
+    # image store
+    "IMAGE_STORE_DIR": "/image-store/images",
+    
     "NVIDIA_AUX_DEVICES": [
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
@@ -105,183 +106,111 @@ def health():
     return "OK", 200
 
 
-@app.route("/config", methods=["POST"])
-def config():
-    try:
-        data = request.get_json(force=True)
-        username = data.get("username")
+def build_pod_spec(
+    username: str,
+    user_info: dict,
+    target_node: str
+):
+    ns = app.config["NAMESPACE"]
 
-        app.logger.info(f"/config called with body: {data}")
-        app.logger.info(f"Parsed username: {username}")
+    image = load_user_image(username, user_info["image"])
+    uid = user_info["uid"]
+    gid_list = user_info["gid"]
+    gpu_nodes = user_info.get("gpu_nodes", [])
+    extra_ports = user_info.get("extra_ports", [])
 
-        if not username:
-            app.logger.warning("No username provided in /config")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+    cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
+    memory_limit = app.config["DEFAULT_MEM_LIMIT"]
+    num_gpu = 0
 
-        ns = app.config["NAMESPACE"]
+    for node in gpu_nodes:
+        if node["node_name"] == target_node:
+            cpu_limit = node.get("cpu_limit", cpu_limit)
+            memory_limit = node.get("memory_limit", memory_limit)
+            num_gpu = node.get("num_gpu", 0)
+            break
 
-        # 현재 실행 중인 Pod가 있는지 확인
+    pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
 
-        try:
-            existing_pod = get_existing_pod(ns, username)
-            if existing_pod:
-                app.logger.info(f"Pod already exists for {username}: {existing_pod}")
-        except Exception:
-            app.logger.exception("Error while checking existing pod")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+    gpu_volume_mounts = []
+    gpu_volumes = []
 
-
-        # Spring WAS로 사용자 승인정보 요청
-
-        try:
-            was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
-            app.logger.debug(f"Requesting user info from WAS: {was_url}")
-            was_response = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
-            was_response.raise_for_status()
-            user_info = was_response.json()
-            app.logger.debug(f"WAS response for {username}: {user_info}")
-        except Exception:
-            app.logger.exception("Failed to fetch user info from WAS")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-        
-
-        # Prometheus 노드 선택
-
-        try:
-            node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
-            app.logger.debug(f"Node list for Prometheus selection: {node_list}")
-            best_node = select_best_node_from_prometheus(
-                node_list,
-                app.config["PROM_URL"],
-                app.config["HTTP_TIMEOUT_SEC"]
-            )
-            app.logger.debug(f"Selected best node from Prometheus: {best_node}")
-        except Exception:
-            app.logger.exception("Failed to select best node from Prometheus")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-
-        # 사용자 리소스 정보 정리
-        try:
-            image = load_user_image(username, user_info["image"])
-            uid = user_info["uid"]
-            gid_list = user_info["gid"]
-            gpu_required = user_info.get("gpu_required", False)
-            gpu_nodes = user_info.get("gpu_nodes", [])
-            extra_ports = user_info.get("extra_ports", [])
-
-            app.logger.info(f"[{username}] gpu_required={gpu_required}, gpu_nodes={gpu_nodes}")
-
-            cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
-            memory_limit = app.config["DEFAULT_MEM_LIMIT"]
-            num_gpu = 0
-            for node in gpu_nodes:
-                if node["node_name"] == best_node:
-                    cpu_limit = node.get("cpu_limit", app.config["DEFAULT_CPU_LIMIT"])
-                    memory_limit = node.get("memory_limit", app.config["DEFAULT_MEM_LIMIT"])
-                    num_gpu = node.get("num_gpu", 0)
-                    app.logger.info(f"[{username}] Matched node={best_node}, cpu={cpu_limit}, mem={memory_limit}, num_gpu={num_gpu}")
-                    break
-
-            pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
-        except Exception:
-            app.logger.exception("Failed to parse user_info or resource limits")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-
-        gpu_volume_mounts = []
-        gpu_volumes = []
-
-        if gpu_required and num_gpu > 0:
-            for i in range(num_gpu):
-                gpu_volume_mounts.append({
-                    "name": f"nvidia{i}",
-                    "mountPath": f"/dev/nvidia{i}"
-                })
-                gpu_volumes.append({
-                    "name": f"nvidia{i}",
-                    "hostPath": {
-                        "path": f"/dev/nvidia{i}",
-                        "type": "CharDevice"
-                    }
-                })
-
-            # 보조 디바이스 추가
-            for dev in app.config["NVIDIA_AUX_DEVICES"]:
-                mount_name = dev.replace("-", "")
-                gpu_volume_mounts.append({
-                    "name": mount_name,
-                    "mountPath": f"/dev/{dev}"
-                })
-                gpu_volumes.append({
-                    "name": mount_name,
-                    "hostPath": {
-                        "path": f"/dev/{dev}",
-                        "type": "CharDevice"
-                    }
-                })
-
-        volume_mounts = [
-            {
-                "name": "user-home",
-                "mountPath": f"/home/{username}",
-                "readOnly": False
-            }
-        ]
-        volumes = [
-            {
-                "name": "user-home",
-                "persistentVolumeClaim": {
-                    "claimName": pvc_name
-                }
-            }
-        ]
-
-        # GPU 볼륨 추가
-        volume_mounts.extend(gpu_volume_mounts)
-        volumes.extend(gpu_volumes)
-
-        # 그룹 멤버 홈 디렉토리 마운트 추가
-        group_home_mounts, group_home_vols = get_group_members_home_volumes(gid_list, username)
-        volume_mounts.extend(group_home_mounts)
-        volumes.extend(group_home_vols)
-
-        # host-etc 마운트 추가
-        host_etc_mounts = []
-        for sub in app.config["HOST_ETC_SUBPATHS"]:
-            sub_fmt = sub.format(username=username)
-            # decide mount path
-            if sub.startswith("sudoers.d/"):
-                mount_path = f"/etc/sudoers.d/{username}"
-            else:
-                mount_path = f"/etc/{sub_fmt}"
-            host_etc_mounts.append({
-                "name": "host-etc",
-                "mountPath": mount_path,
-                "subPath": sub_fmt,
-                "readOnly": True
+    if num_gpu > 0:
+        for i in range(num_gpu):
+            gpu_volume_mounts.append({
+                "name": f"nvidia{i}",
+                "mountPath": f"/dev/nvidia{i}"
             })
-        volume_mounts.extend(host_etc_mounts)
+            gpu_volumes.append({
+                "name": f"nvidia{i}",
+                "hostPath": {
+                    "path": f"/dev/nvidia{i}",
+                    "type": "CharDevice"
+                }
+            })
 
-        volumes.append({
+        for dev in app.config["NVIDIA_AUX_DEVICES"]:
+            mount_name = dev.replace("-", "")
+            gpu_volume_mounts.append({
+                "name": mount_name,
+                "mountPath": f"/dev/{dev}"
+            })
+            gpu_volumes.append({
+                "name": mount_name,
+                "hostPath": {
+                    "path": f"/dev/{dev}",
+                    "type": "CharDevice"
+                }
+            })
+
+    volume_mounts = [{
+        "name": "user-home",
+        "mountPath": f"/home/{username}",
+        "readOnly": False
+    }]
+    volume_mounts.append({
+        "name": "image-store",
+        "mountPath": "/image-store",
+        "readOnly": False
+    })
+    volumes = [{
+        "name": "user-home",
+        "persistentVolumeClaim": {
+            "claimName": pvc_name
+        }
+    }]
+    volumes.append({
+        "name": "image-store",
+        "persistentVolumeClaim": {
+            "claimName": "pvc-image-store"
+        }
+    })
+
+    volume_mounts.extend(gpu_volume_mounts)
+    volumes.extend(gpu_volumes)
+
+    group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
+    volume_mounts.extend(group_mounts)
+    volumes.extend(group_vols)
+
+    host_etc_mounts = []
+    for sub in app.config["HOST_ETC_SUBPATHS"]:
+        sub_fmt = sub.format(username=username)
+        mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
+        host_etc_mounts.append({
             "name": "host-etc",
-            "hostPath": {
-                "path": "/etc",
-                "type": "Directory"
-            }
+            "mountPath": mount_path,
+            "subPath": sub_fmt,
+            "readOnly": True
         })
+    volume_mounts.extend(host_etc_mounts)
 
-        # bash 설정 파일 추가
-        volume_mounts.extend([
-            {"name": "bash-logout", "mountPath": f"/home/{username}/.bash_logout", "readOnly": True},
-            {"name": "bashrc", "mountPath": f"/home/{username}/.bashrc", "readOnly": True}
-        ])
-        volumes.extend([
-            {"name": "bash-logout", "hostPath": {"path": app.config["BASH_LOGOUT_PATH"], "type": "File"}},
-            {"name": "bashrc", "hostPath": {"path": app.config["BASHRC_PATH"], "type": "File"}}
-        ])
+    volumes.append({
+        "name": "host-etc",
+        "hostPath": {"path": "/etc", "type": "Directory"}
+    })
 
-
-        try:
-            spec = {
+    spec = {
                 "config": {
                     "backend": "kubernetes",
                     "kubernetes": {
@@ -302,7 +231,7 @@ def config():
                                 }
                             },
                             "spec": {
-                                    "nodeName": best_node,
+                                    "nodeName": target_node,
                                     "securityContext": {
                                         "runAsUser": uid,
                                         "runAsGroup": uid,
@@ -359,16 +288,74 @@ def config():
                     "files": {}
                 }
 
-            # NodePort Service 생성 (Pod 생성 전)
-            if extra_ports:
-                try:
-                    create_nodeport_services(username, ns, extra_ports)
-                    app.logger.info(f"Created {len(extra_ports)} NodePort services for {username}")
-                except Exception as e:
-                    app.logger.error(f"Failed to create NodePort services: {e}")
-                    # Service 생성 실패해도 Pod는 생성되도록 계속 진행
+    if extra_ports:
+        create_nodeport_services(username, ns, extra_ports)
 
-            return jsonify(spec)
+    return spec
+
+
+@app.route("/config", methods=["POST"])
+def config():
+    try:
+        data = request.get_json(force=True)
+        username = data.get("username")
+
+        app.logger.info(f"/config called with body: {data}")
+        app.logger.info(f"Parsed username: {username}")
+
+        if not username:
+            app.logger.warning("No username provided in /config")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+        ns = app.config["NAMESPACE"]
+
+        # 현재 실행 중인 Pod가 있는지 확인
+
+        try:
+            existing_pod = get_existing_pod(ns, username)
+            if existing_pod:
+                app.logger.info(f"Pod already exists for {username}: {existing_pod}")
+                return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+        except Exception:
+            app.logger.exception("Error while checking existing pod")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+
+        # Spring WAS로 사용자 승인정보 요청
+
+        try:
+            was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+            app.logger.debug(f"Requesting user info from WAS: {was_url}")
+            was_response = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
+            was_response.raise_for_status()
+            user_info = was_response.json()
+            app.logger.debug(f"WAS response for {username}: {user_info}")
+        except Exception:
+            app.logger.exception("Failed to fetch user info from WAS")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+        
+
+        # Prometheus 노드 선택
+
+        try:
+            node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
+            app.logger.debug(f"Node list for Prometheus selection: {node_list}")
+            best_node = select_best_node_from_prometheus(
+                node_list,
+                app.config["PROM_URL"],
+                app.config["HTTP_TIMEOUT_SEC"]
+            )
+            app.logger.debug(f"Selected best node from Prometheus: {best_node}")
+        except Exception:
+            app.logger.exception("Failed to select best node from Prometheus")
+            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+
+        try:
+            spec = build_pod_spec(username, user_info, best_node)
+            app.logger.info(f"Built pod spec for {username} on node {best_node}")
+            return jsonify(spec), 200
+
         except Exception:
             app.logger.exception("Failed to build pod spec")
             return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
@@ -383,53 +370,107 @@ def config():
             "files": {}
         }), 200
 
+def _migrate_internal(data):
 
-@app.route("/report-background", methods=["POST"])
-def report_background():
-    data = request.get_json(force=True)
     username = data.get("username")
-    pod_name = data.get("pod_name")
-    has_background = data.get("has_background", False)
-
-    if not username or not pod_name:
-        return jsonify({"error": "username and pod_name are required"}), 400
+    nodes = data.get("nodes")  # resource group에 속한 node_id 목록
+    min_ratio = data.get("min_improvement_ratio", 0.2)
 
     ns = app.config["NAMESPACE"]
-    # 실제 프로세스 확인
-    still_running = pod_has_process(ns, pod_name, username)
 
-    if not still_running:
-        app.logger.info(f"[{username}] No background process. Committing image before deletion...")
+    # 1. 현재 Pod 확인
+    pod_name = get_existing_pod(ns, username)
+    if not pod_name:
+        return jsonify({"error": "no running pod"}), 404
 
-        # 1. Pod에서 Docker 이미지 커밋 + NFS 저장 + Redis 기록
-        success = commit_and_save_user_image(username, pod_name, ns)
+    v1 = client.CoreV1Api()
+    pod = v1.read_namespaced_pod(pod_name, ns)
+    current_node = pod.spec.node_name
 
-        if success:
-            app.logger.info(f"[{username}] Image commit/save succeeded.")
-        else:
-            app.logger.warning(f"[{username}] Image commit/save failed.")
-        
-        # 2. Pod 삭제
-        delete_pod(pod_name, ns)
+    if current_node not in nodes:
+        return jsonify({
+            "error": "current node is not in given nodes list"
+        }), 400
 
-        # 3. NodePort Service 삭제
-        try:
-            delete_nodeport_services(username, ns)
-            app.logger.info(f"[{username}] Deleted NodePort services")
-        except Exception as e:
-            app.logger.error(f"[{username}] Failed to delete NodePort services: {e}")
+    candidate_nodes = [n for n in nodes if n != current_node]
+    if not candidate_nodes:
+        return jsonify({
+            "status": "skipped",
+            "reason": "no_candidate_node"
+        }), 200
 
-        # 4. Redis 정리
-        delete_user_status(username)
-        return jsonify({"status": "deleted", "username": username}), 200
+    prom_url = app.config["PROM_URL"]
+    timeout = app.config["HTTP_TIMEOUT_SEC"]
 
-    # 백그라운드 있으면 Redis에 저장
-    save_background_status(username, pod_name, True)
+    # 2. GPU score 계산
+    current_score = get_node_gpu_score(current_node, prom_url, timeout)
+    scores = {
+        node: get_node_gpu_score(node, prom_url, timeout)
+        for node in candidate_nodes
+    }
+
+    best_node, best_score = min(scores.items(), key=lambda x: x[1])
+
+    # 3. 이전(migrate) 기준 판단
+    if best_score > current_score * (1 - min_ratio):
+        return jsonify({
+            "status": "skipped",
+            "reason": "no_significant_improvement",
+            "current_node": current_node,
+            "current_score": current_score,
+            "best_candidate": best_node,
+            "best_score": best_score
+        }), 200
+
+    # 4. WAS에서 사용자 정보 조회
+    was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+    user_info = requests.get(
+        was_url,
+        timeout=app.config["HTTP_TIMEOUT_SEC"]
+    ).json()
+
+    # 5. 기존 Pod 이미지 저장
+    ok = commit_and_save_user_image(username, pod_name, ns)
+    if not ok:
+        return jsonify({
+            "error": "image_commit_failed"
+        }), 500
+
+    # 6-1. 기존 NodePort Service 삭제
+    delete_nodeport_services(username, ns)
+
+    # 6-2. 기존 Pod 삭제
+    delete_pod(pod_name, ns)
+
+    # 7. 새 노드에서 Pod 재생성
+    spec = build_pod_spec(username, user_info, best_node)
+
     return jsonify({
-        "status": "background",
-        "username": username,
-        "has_background": True
+        "status": "migrated",
+        "from": current_node,
+        "to": best_node,
+        "current_score": current_score,
+        "target_score": best_score,
+        "config": spec
     }), 200
+
+
+@app.route("/migrate", methods=["POST"])
+def migrate():
+    data = request.get_json(force=True)
+    username = data.get("username")
+    nodes = data.get("nodes")
+
+    if not username or not nodes or not isinstance(nodes, list):
+        return jsonify({
+            "error": "username and nodes(list) are required"
+        }), 400
+
+    lock_path = f"/tmp/migrate-{username}.lock"
+
+    with LockedFile(lock_path, "w"):
+        return _migrate_internal(data)
+
 
 
 @app.route("/pvc", methods=["POST"])
