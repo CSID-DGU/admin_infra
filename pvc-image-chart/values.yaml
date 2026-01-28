@@ -1,0 +1,7 @@
+config:
+  namespace: cssh
+
+imageStore:
+  size: 500Gi
+
+storageClass: nfs-nas-v3-expandable
