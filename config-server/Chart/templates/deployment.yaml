@@ -15,7 +15,9 @@ spec:
       labels:
         app: containerssh-config-server
     spec:
-      serviceAccountName: containerssh
+      serviceAccountName: config-server
+      nodeSelector:
+        kubernetes.io/hostname: farm8
       containers:
         - name: config-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -43,9 +45,14 @@ spec:
           volumeMounts:
             - name: nfs-kube-share
               mountPath: /kube_share
+            - name: image-store
+              mountPath: /image-store
       volumes:
         - name: nfs-kube-share
           nfs:
             server: {{ .Values.nfs.server }}
             path: {{ .Values.nfs.path }}
             readOnly: false
+        - name: image-store
+          persistentVolumeClaim:
+            claimName: pvc-image-store  
