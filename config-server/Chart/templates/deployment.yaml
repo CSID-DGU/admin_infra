@@ -27,10 +27,8 @@ spec:
           env:
             - name: NFS_ADDRESS
               value: "{{ .Values.env.nfsAddress }}"
-
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
-
           readinessProbe:
             httpGet:
               path: /health
