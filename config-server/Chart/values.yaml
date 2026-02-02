@@ -32,7 +32,7 @@ config:
 namespace: ailab-infra
 
 cleanup:
-  image: config-server:v1
+  image: config-server:latest
 
 redis:
   host: redis-bg-master.ailab-infra.svc.cluster.local
