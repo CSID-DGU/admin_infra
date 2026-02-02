@@ -7,7 +7,7 @@ service:
   type: NodePort
   port: 80
   targetPort: 8000
-  nodePort: 9732
+  nodePort: 30082
 
 resources:
   requests:
@@ -26,15 +26,15 @@ nfs:
 
 
 config:
-  namespace: cssh
+  namespace: ailab-infra
 
 
-namespace: cssh
+namespace: ailab-infra
 
 cleanup:
   image: config-server:latest
 
 redis:
-  host: redis-bg-master.cssh.svc.cluster.local
+  host: redis-bg-master.ailab-infra.svc.cluster.local
   port: 6379
 
