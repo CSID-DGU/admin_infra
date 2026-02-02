@@ -17,60 +17,10 @@ def load_k8s():
     except:
         k8s_config.load_kube_config()
 
-# ============================
-#  Pod / Process 관련
-# ============================
-def pod_has_process(namespace, pod_name, username):
-    
-    try:
-        v1 = client.CoreV1Api()
-
-        app.logger.info(f"[pod_has_process] Checking pod={pod_name}, ns={namespace}, username={username}")
-
-        # UID 확인
-        uid_output = stream(
-            v1.connect_get_namespaced_pod_exec,
-            pod_name,
-            namespace,
-            command=["id", "-u", username],
-            stderr=True, stdin=False, stdout=True, tty=False
-        )
-        user_uid = uid_output.strip()
-        app.logger.debug(f"[pod_has_process] UID for {username} = {user_uid}")
-
-        # 현재 프로세스 목록 조회
-        ps_output = stream(
-            v1.connect_get_namespaced_pod_exec,
-            pod_name,
-            namespace,
-            command=["ps", "-eo", "pid,uid,cmd", "--no-headers"],
-            stderr=True, stdin=False, stdout=True, tty=False
-        )
-        processes = ps_output.strip().split("\n")
-        app.logger.debug(f"[pod_has_process] ps output:\n{ps_output}")
-
-        # 시스템 프로세스 제외
-        system_cmds = ["ps", "bash", "sh", "sleep", "top", "kubectl", "tail", "cat"]
-
-        user_procs = [
-            proc for proc in processes
-            if proc and proc.split()[1] == user_uid
-            and not any(proc.split(maxsplit=2)[2].startswith(syscmd) for syscmd in system_cmds)
-        ]
-
-        app.logger.info(f"[pod_has_process] Found {len(user_procs)} user processes for {username}: {user_procs}")
-        return len(user_procs) > 0
-
-    except Exception as e:
-        app.logger.error(f"[pod_has_process] ERROR in pod={pod_name}, ns={namespace}: {e}", exc_info=True)
-        return False
 
 # 기존 Pod가 있는지 확인 -> username당 Pod 1개만 유지
 def get_existing_pod(namespace, username):
-    try:
-        k8s_config.load_incluster_config()
-    except:
-        k8s_config.load_kube_config()
+    load_k8s()
 
     core_v1 = client.CoreV1Api()
     pods = core_v1.list_namespaced_pod(
@@ -85,6 +35,7 @@ def get_existing_pod(namespace, username):
 
 
 def delete_pod(pod_name, namespace):
+    load_k8s()
     # Pod 삭제
     v1 = client.CoreV1Api()
     v1.delete_namespaced_pod(pod_name, namespace)
@@ -180,82 +131,60 @@ def load_user_image(username: str, base_image: str) -> str:
     """
     NFS에 tar가 있으면 docker load 실행, 성공 시 user-{username}:latest 사용
     """
-    image_dir = app.config.get("NFS_IMAGE_DIR", "/volume1/images")
+    image_dir = app.config.get("IMAGE_STORE_DIR", "/image-store/images")
     docker_bin = app.config.get("DOCKER_BIN", "/usr/bin/docker")
     tar_path = os.path.join(image_dir, f"user-{username}.tar")
 
     if not os.path.exists(tar_path):
-        app.logger.info(f"[{username}] No saved image tar → base image 사용")
+        app.logger.info(f"[{username}] no saved image → base image")
         save_image_metadata(username, status="base_used", path=tar_path)
         return base_image
 
     try:
         subprocess.run([docker_bin, "load", "-i", tar_path], check=True)
-        image = f"user-{username}:latest"
-        app.logger.info(f"[{username}] ✅ Image loaded from {tar_path}")
+        app.logger.info(f"[{username}] image loaded from {tar_path}")
         save_image_metadata(username, status="loaded", path=tar_path)
-        return image
-    except subprocess.CalledProcessError as e:
-        app.logger.error(f"[{username}] docker load failed: {e}")
-        save_image_metadata(username, status="load_failed", path=tar_path)
-        return base_image
+        return f"user-{username}:latest"
     except Exception as e:
-        app.logger.exception(f"[{username}] Unexpected load error: {e}")
-        save_image_metadata(username, status="load_error", path=tar_path)
+        app.logger.exception(f"[{username}] docker load failed")
+        save_image_metadata(username, status="load_failed", path=tar_path)
         return base_image
 
 def commit_and_save_user_image(username, pod_name, namespace):
     """
-    Pod 컨테이너를 Docker 이미지로 커밋하고 NFS에 tar로 저장,
-    이후 Redis에 메타데이터 기록
+    User Pod 내부에서 save_image.sh 실행
     """
-    image_dir = app.config["NFS_IMAGE_DIR"]
-    docker_bin = app.config["DOCKER_BIN"]
-    image_name = f"user-{username}:latest"
-    tar_path = os.path.join(image_dir, f"user-{username}.tar")
+    load_k8s()
+    v1 = client.CoreV1Api()
 
     try:
-        v1 = client.CoreV1Api()
-        pod = v1.read_namespaced_pod(pod_name, namespace)
-        node_name = pod.spec.node_name
-        app.logger.info(f"[{username}] Pod {pod_name} on node {node_name}")
+        app.logger.info(f"[{username}] exec save_image.sh in pod {pod_name}")
 
-        # 컨테이너 ID 찾기
-        container_id_cmd = [docker_bin, "ps", "-q", "--filter", f"name={pod_name}"]
-        container_id = subprocess.check_output(container_id_cmd).decode().strip()
-        if not container_id:
-            app.logger.warning(f"[{username}] No container found for pod {pod_name}")
-            return False
+        stream(
+            v1.connect_get_namespaced_pod_exec,
+            pod_name,
+            namespace,
+            command=["/usr/local/bin/save_image.sh"],
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+        )
 
-        # docker commit + save
-        subprocess.run([docker_bin, "commit", container_id, image_name], check=True)
-        os.makedirs(image_dir, exist_ok=True)
-        subprocess.run([docker_bin, "save", "-o", tar_path, image_name], check=True)
-
-        # 파일 크기 계산
-        size_mb = round(os.path.getsize(tar_path) / (1024 * 1024), 2)
-        version = int(datetime.utcnow().timestamp())
-
-        # Redis에 이미지 메타데이터 기록
+        # 성공했다고 가정 (실패 시 stream에서 예외 발생)
         save_image_metadata(
             username=username,
             status="success",
-            size_mb=size_mb,
-            version=version,
-            path=tar_path
+            version=int(datetime.utcnow().timestamp())
         )
 
-        app.logger.info(f"[{username}] ✅ Image saved ({size_mb} MB), recorded in Redis.")
         return True
 
-    except subprocess.CalledProcessError as e:
-        app.logger.error(f"[{username}] Docker command failed: {e}")
-        save_image_metadata(username, status="failed")
-        return False
     except Exception as e:
-        app.logger.exception(f"[{username}] Unexpected error: {e}")
+        app.logger.exception(f"[{username}] image save failed")
         save_image_metadata(username, status="error")
         return False
+
 
 # ============================
 #  Group / Volume 관련
@@ -575,6 +504,37 @@ def delete_directory_if_exists(name, pvc_type):
     except Exception as e:
         app.logger.error(f"Failed to delete directory {dir_path}: {e}")
         raise RuntimeError(f"Failed to delete directory {dir_path}: {e}")
+
+def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:
+    """
+    GPU 사용량 score
+    - 낮을수록 여유 있음
+    """
+    import requests
+
+    query = f"""
+    (
+      (sum(k8s_namespace_pod_count_total{{hostname="{node}"}}) or vector(0)) +
+      (count(gpu_process_memory_used_bytes{{hostname="{node}"}}) or vector(0))
+    )
+    /
+    (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
+    """
+
+    try:
+        resp = requests.get(
+            f"{prom_url}/api/v1/query",
+            params={"query": query},
+            timeout=timeout
+        )
+        resp.raise_for_status()
+        result = resp.json()["data"]["result"]
+        if not result:
+            return float("inf")
+        return float(result[0]["value"][1])
+    except Exception as e:
+        app.logger.warning(f"[GPU SCORE] failed for node={node}: {e}")
+        return float("inf")
 
 
 def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeout: float):
