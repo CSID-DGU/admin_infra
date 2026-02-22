@@ -270,7 +270,8 @@ def create_pod():
         return jsonify({
             "status": "created",
             "node": best_node,
-            "pod_name": pod_spec["metadata"]["name"]
+            "pod_name": pod_name,
+            "ports": allocated_ports
         }), 201
 
     except Exception as e:
@@ -630,7 +631,8 @@ def _migrate_internal(data):
         "status": "migrated",
         "from": current_node,
         "to": best_node,
-        "new_pod": new_pod_name
+        "new_pod": new_pod_name,
+        "ports": allocated_ports
     }), 200
 
 
