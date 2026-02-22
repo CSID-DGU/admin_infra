@@ -3,11 +3,11 @@ image:
   tag: latest
   pullPolicy: Always
 
-service:
-  type: NodePort
-  port: 80
-  targetPort: 8000
-  nodePort: 9732
+# service:
+#   type: NodePort
+#   port: 80
+#   targetPort: 8000
+#   nodePort: 30080
 
 resources:
   requests:
