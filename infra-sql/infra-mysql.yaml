@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: infra-mysql
+  namespace: cssh
+spec:
+  serviceName: infra-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: infra-mysql
+  template:
+    metadata:
+      labels:
+        app: infra-mysql
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0.36
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: rootpassword123
+        - name: MYSQL_DATABASE
+          value: pod_port_db
+        - name: MYSQL_USER
+          value: pod_port_user
+        - name: MYSQL_PASSWORD
+          value: podpassword123
+        volumeMounts:
+        - name: mysql-data
+          mountPath: /var/lib/mysql
+
+  volumeClaimTemplates:
+  - metadata:
+      name: mysql-data
+    spec:
+      storageClassName: nfs-mysql-dedicated
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: infra-mysql
+  namespace: cssh
+spec:
+  type: ClusterIP
+  selector:
+    app: infra-mysql
+  ports:
+  - port: 3306
+    targetPort: 3306

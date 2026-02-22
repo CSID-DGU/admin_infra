@@ -17,7 +17,7 @@ load_dotenv()
 import logging, sys
 
 from utils import (
-    get_existing_pod, delete_pod,
+    get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod,
     LockedFile,get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_dir,
     read_passwd_lines, write_passwd_lines,
@@ -45,6 +45,7 @@ formatter = logging.Formatter("[%(asctime)s] %(levelname)s in %(module)s: %(mess
 handler.setFormatter(formatter)
 app.logger.addHandler(handler)
 app.logger.setLevel(logging.DEBUG)
+
 
 # ---- Global app configuration ----
 BASE_ETC_DIR = "/kube_share"
@@ -105,11 +106,182 @@ def health():
     """
     return "OK", 200
 
+def load_k8s():
+    try:
+        k8s_config.load_incluster_config()
+    except:
+        k8s_config.load_kube_config()
+
+# ////////////////////// 포트 할당 //////////////////////
+def allocate_nodeports(username, pod_name, node_name, ports):
+    """
+    ports:
+    [
+        {"internal_port": 22, "usage_purpose": "ssh"},
+        {"internal_port": 8888, "usage_purpose": "jupyter"},
+        ...
+    ]
+    """
+
+    conn = get_db_connection()
+
+    try:
+        with conn.cursor() as cur:
+
+            cur.execute("SELECT node_port FROM nodeport_allocations FOR UPDATE")
+            used = {row[0] for row in cur.fetchall()}
+
+            available = [
+                p for p in range(30000, 32768)
+                if p not in used
+            ]
+
+            if len(available) < len(ports):
+                raise Exception("Not enough NodePorts")
+
+            result_ports = []
+
+            for idx, port in enumerate(ports):
+
+                node_port = available[idx]
+
+                cur.execute("""
+                    INSERT INTO nodeport_allocations
+                    (username, pod_name, node_name, internal_port, node_port, purpose)
+                    VALUES (%s,%s,%s,%s,%s,%s)
+                """, (
+                    username,
+                    pod_name,
+                    node_name,
+                    port["internal_port"],
+                    node_port,
+                    port.get("usage_purpose", "custom")
+                ))
+
+                result_ports.append({
+                    "internal_port": port["internal_port"],
+                    "external_port": node_port,
+                    "usage_purpose": port.get("usage_purpose", "custom")
+                })
+
+            conn.commit()
+            return result_ports
+
+    except:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    
+def release_nodeports(pod_name):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM nodeport_allocations WHERE pod_name=%s",
+                (pod_name,)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@app.route("/create-pod", methods=["POST"])
+def create_pod():
+    data = request.get_json(force=True)
+    username = data.get("username")
+
+    if not username:
+        return jsonify({"error": "username required"}), 400
+
+    ns = app.config["NAMESPACE"]
+
+    try:
+        # WAS 조회
+        was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+        user_info = requests.get(
+            was_url,
+            timeout=app.config["HTTP_TIMEOUT_SEC"]
+        ).json()
+
+        pod_name = generate_pod_name(username)
+
+        # pod_name 중복 확인
+        load_k8s()
+        v1 = client.CoreV1Api()
+
+        try:
+            v1.read_namespaced_pod(pod_name, ns)
+            return jsonify({"error": "pod already exists"}), 409
+        except:
+            pass
+
+        # Prometheus 기반 노드 선택
+        node_list = [n["node_name"] for n in user_info["gpu_nodes"]]
+        best_node = select_best_node_from_prometheus(
+            node_list,
+            app.config["PROM_URL"],
+            app.config["HTTP_TIMEOUT_SEC"]
+        )
+
+        # Pod spec 생성
+        spec_wrapper, allocated_ports = build_pod_spec(
+            username,
+            user_info,
+            best_node,
+            pod_name
+        )
+
+        pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
+
+        load_k8s()
+        v1 = client.CoreV1Api()
+
+        # 실제 Pod 생성
+        try:
+            # 1. Pod 생성
+            v1.create_namespaced_pod(
+                namespace=ns,
+                body=pod_spec
+            )
+
+            # 2. Ready 대기
+            for _ in range(60):
+                pod = v1.read_namespaced_pod(pod_name, ns)
+                if is_pod_ready(pod):
+                    break
+                time.sleep(1)
+            else:
+                release_nodeports(pod_name)
+                v1.delete_namespaced_pod(pod_name, ns)
+                return jsonify({"error": "pod failed to start"}), 500
+
+            # 3. Pod 성공 후 Service 생성
+            create_nodeport_services(username, ns, pod_name, allocated_ports)
+
+        except Exception:
+            release_nodeports(pod_name)
+            try:
+                v1.delete_namespaced_pod(pod_name, ns)
+            except:
+                pass
+            raise
+
+        return jsonify({
+            "status": "created",
+            "node": best_node,
+            "pod_name": pod_spec["metadata"]["name"]
+        }), 201
+
+    except Exception as e:
+        app.logger.exception("create-pod failed")
+        return jsonify({"error": str(e)}), 500
 
 def build_pod_spec(
     username: str,
     user_info: dict,
-    target_node: str
+    target_node: str,
+    pod_name: str
 ):
     ns = app.config["NAMESPACE"]
 
@@ -117,7 +289,23 @@ def build_pod_spec(
     uid = user_info["uid"]
     gid_list = user_info["gid"]
     gpu_nodes = user_info.get("gpu_nodes", [])
-    extra_ports = user_info.get("extra_ports", [])
+    
+    # 기본 포트
+    ports = [
+        {"internal_port": 22, "usage_purpose": "ssh"},
+        {"internal_port": 8888, "usage_purpose": "jupyter"},
+    ]
+
+    # WAS 추가 포트
+    ports.extend(user_info.get("additional_ports", []))
+
+    # 포트 할당
+    allocated_ports = allocate_nodeports(
+        username=username,
+        pod_name=pod_name,
+        node_name=target_node,
+        ports=ports
+    )
 
     cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
     memory_limit = app.config["DEFAULT_MEM_LIMIT"]
@@ -221,13 +409,13 @@ def build_pod_spec(
                             },
                         "pod": {
                             "metadata": {
-                                "name": f"containerssh-{username}",
+                                "name": pod_name,
                                 "namespace": ns,
                                 "labels": {
                                     "app": "containerssh-guest",
                                     "managed-by": "containerssh",
                                     "containerssh_username": username,
-                                    "containerssh_pod_name": f"containerssh-{username}"
+                                    "containerssh_pod_name": pod_name
                                 }
                             },
                             "spec": {
@@ -248,12 +436,11 @@ def build_pod_spec(
                                             "tty": True,
                                             "ports": [
                                                 {
-                                                    "containerPort": port_info["internal_port"],
-                                                    "protocol": "TCP",
-                                                    "name": port_info.get("usage_purpose", "custom")[:15]
+                                                    "containerPort": m["internal_port"],
+                                                    "protocol": "TCP"
                                                 }
-                                                for port_info in extra_ports
-                                            ] if extra_ports else [],
+                                                for m in allocated_ports
+                                            ],
                                             "env": [
                                                 {"name": "USER", "value": username},
                                                 {"name": "USER_ID", "value": username},
@@ -288,116 +475,44 @@ def build_pod_spec(
                     "files": {}
                 }
 
-    if extra_ports:
-        create_nodeport_services(username, ns, extra_ports)
+    return spec, allocated_ports
 
-    return spec
+# //////////////////////// Pod 삭제 //////////////////////
 
+@app.route("/delete-pod", methods=["POST"])
+def delete_pod_api():
 
-@app.route("/config", methods=["POST"])
-def config():
-    """
-    ContainerSSH에서 호출하는 사용자 Pod 생성 설정 API
-    ---
-    tags:
-      - ContainerSSH
-    consumes:
-      - application/json
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          required:
-            - username
-          properties:
-            username:
-              type: string
-              example: alice
-    responses:
-      200:
-        description: Pod 생성용 Kubernetes spec 반환
-        schema:
-          type: object
-      500:
-        description: 내부 오류
-    """
+    data = request.get_json(force=True)
+    pod_name = data.get("pod_name")
+
+    if not pod_name:
+        return jsonify({"error": "pod_name required"}), 400
+
+    ns = app.config["NAMESPACE"]
+
     try:
-        data = request.get_json(force=True)
-        username = data.get("username")
+        if not pod_name.startswith("containerssh-"):
+            return jsonify({"error": "invalid pod_name"}), 400
 
-        app.logger.info(f"/config called with body: {data}")
-        app.logger.info(f"Parsed username: {username}")
-
-        if not username:
-            app.logger.warning("No username provided in /config")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-
-        ns = app.config["NAMESPACE"]
-
-        # 현재 실행 중인 Pod가 있는지 확인
-
-        try:
-            existing_pod = get_existing_pod(ns, username)
-            if existing_pod:
-                app.logger.info(f"Pod already exists for {username}: {existing_pod}")
-                return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-
-        except Exception:
-            app.logger.exception("Error while checking existing pod")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-
-
-        # Spring WAS로 사용자 승인정보 요청
-
-        try:
-            was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
-            app.logger.debug(f"Requesting user info from WAS: {was_url}")
-            was_response = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
-            was_response.raise_for_status()
-            user_info = was_response.json()
-            app.logger.debug(f"WAS response for {username}: {user_info}")
-        except Exception:
-            app.logger.exception("Failed to fetch user info from WAS")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
+        rest = pod_name[len("containerssh-"):]
+        username = rest.rsplit("-", 1)[0]
         
+        delete_nodeport_services(pod_name, ns)
+        release_nodeports(pod_name)
 
-        # Prometheus 노드 선택
+        load_k8s()
+        v1 = client.CoreV1Api()
+        v1.delete_namespaced_pod(pod_name, ns)
 
-        try:
-            node_list = [node["node_name"] for node in user_info["gpu_nodes"]]
-            app.logger.debug(f"Node list for Prometheus selection: {node_list}")
-            best_node = select_best_node_from_prometheus(
-                node_list,
-                app.config["PROM_URL"],
-                app.config["HTTP_TIMEOUT_SEC"]
-            )
-            app.logger.debug(f"Selected best node from Prometheus: {best_node}")
-        except Exception:
-            app.logger.exception("Failed to select best node from Prometheus")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-
-        try:
-            spec = build_pod_spec(username, user_info, best_node)
-            app.logger.info(f"Built pod spec for {username} on node {best_node}")
-            return jsonify(spec), 200
-
-        except Exception:
-            app.logger.exception("Failed to build pod spec")
-            return jsonify({"config": {}, "environment": {}, "metadata": {}, "files": {}}), 200
-
+        return jsonify({"status": "deleted"})
 
     except Exception as e:
-        app.logger.exception("Error in /config")
-        return jsonify({
-            "config": {},
-            "environment": {},
-            "metadata": {},
-            "files": {}
-        }), 200
+        return jsonify({"error": str(e)}), 500
 
 def _migrate_internal(data):
+
+    load_k8s()
+    v1 = client.CoreV1Api()
 
     username = data.get("username")
     nodes = data.get("nodes")  # resource group에 속한 node_id 목록
@@ -406,12 +521,11 @@ def _migrate_internal(data):
     ns = app.config["NAMESPACE"]
 
     # 1. 현재 Pod 확인
-    pod_name = get_existing_pod(ns, username)
-    if not pod_name:
+    old_pod_name = get_existing_pod(ns, username)
+    if not old_pod_name:
         return jsonify({"error": "no running pod"}), 404
 
-    v1 = client.CoreV1Api()
-    pod = v1.read_namespaced_pod(pod_name, ns)
+    pod = v1.read_namespaced_pod(old_pod_name, ns)
     current_node = pod.spec.node_name
 
     if current_node not in nodes:
@@ -426,10 +540,10 @@ def _migrate_internal(data):
             "reason": "no_candidate_node"
         }), 200
 
+    # 2. GPU score 계산
     prom_url = app.config["PROM_URL"]
     timeout = app.config["HTTP_TIMEOUT_SEC"]
 
-    # 2. GPU score 계산
     current_score = get_node_gpu_score(current_node, prom_url, timeout)
     scores = {
         node: get_node_gpu_score(node, prom_url, timeout)
@@ -457,28 +571,66 @@ def _migrate_internal(data):
     ).json()
 
     # 5. 기존 Pod 이미지 저장
-    ok = commit_and_save_user_image(username, pod_name, ns)
+    ok = commit_and_save_user_image(username, old_pod_name, ns)
     if not ok:
         return jsonify({
             "error": "image_commit_failed"
         }), 500
 
-    # 6-1. 기존 NodePort Service 삭제
-    delete_nodeport_services(username, ns)
-
-    # 6-2. 기존 Pod 삭제
-    delete_pod(pod_name, ns)
+    # 6. 새 Pod 이름 생성
+    new_pod_name = generate_pod_name(username)
 
     # 7. 새 노드에서 Pod 재생성
-    spec = build_pod_spec(username, user_info, best_node)
+    spec_wrapper, allocated_ports = build_pod_spec(
+        username,
+        user_info,
+        best_node,
+        new_pod_name
+    )
+
+    pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
+
+    try:
+        v1.create_namespaced_pod(namespace=ns, body=pod_spec)
+    except Exception:
+        release_nodeports(new_pod_name)
+        raise
+
+    # 8. Ready 대기
+    for _ in range(60):
+        pod = v1.read_namespaced_pod(new_pod_name, ns)
+        if is_pod_ready(pod):
+            break
+        time.sleep(1)
+    else:
+        # 새 Pod 실패 → 정리 후 종료
+        v1.delete_namespaced_pod(new_pod_name, ns)
+        release_nodeports(new_pod_name)
+        return jsonify({"error": "new pod failed to start"}), 500
+
+    # 9. 새 Pod 성공 후 Service 생성
+    try:
+        create_nodeport_services(
+            username,
+            ns,
+            new_pod_name,
+            allocated_ports
+        )
+    except Exception:
+        v1.delete_namespaced_pod(new_pod_name, ns)
+        release_nodeports(new_pod_name)
+        return jsonify({"error": "service creation failed"}), 500
+
+    # 10. 기존 Pod 정리
+    delete_nodeport_services(old_pod_name, ns)
+    release_nodeports(old_pod_name)
+    delete_pod(old_pod_name, ns)
 
     return jsonify({
         "status": "migrated",
         "from": current_node,
         "to": best_node,
-        "current_score": current_score,
-        "target_score": best_score,
-        "config": spec
+        "new_pod": new_pod_name
     }), 200
 
 
