@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: containerssh
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app: containerssh
+spec:
+  type: NodePort  # 필요에 따라 ClusterIP, LoadBalancer로 변경 가능
+  selector:
+    app: containerssh
+  ports:
+    - name: ssh
+      port: 2222
+      targetPort: 2222
+      protocol: TCP
+      nodePort: {{ .Values.service.nodePort }}  # 예: 9700~9797 중 하나

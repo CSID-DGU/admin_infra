@@ -1,0 +1,41 @@
+username: jy
+
+image:
+  repository: containerssh/containerssh
+  tag: v0.5
+
+guestImage:
+  repository: dguailab/containerssh-guest
+  tag: cuda11.8-cudnn8-dev-ubuntu22.04
+
+
+config:
+  #authPasswordUrl: http://containerssh-auth-service.cssh.svc.cluster.local
+  authPasswordUrl: http://210.94.179.19:9796/api/auth/users
+  authPubkeyUrl: http://containerssh-auth-service.cssh.svc.cluster.local
+  configServerUrl: http://containerssh-config-service.cssh.svc.cluster.local/config
+  namespace: cssh
+  podTtlSeconds: null
+  authTimeout: 60s
+  configServerTimeout: 10s
+
+service:
+  nodePort: 9730
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+log:
+  level: debug
+  format: text
+
+hostKey:
+  enabled: true
+  privateKeyPath: files/containerssh_host_ed25519
+  secretName: containerssh-hostkey
+
