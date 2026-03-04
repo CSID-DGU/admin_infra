@@ -2,7 +2,10 @@ import os
 import subprocess
 import re
 import fcntl
+import time
+import pymysql
 from typing import List, Optional
+import uuid
 
 from datetime import datetime
 from kubernetes import client, config as k8s_config
@@ -10,12 +13,29 @@ from kubernetes.stream import stream
 from flask import current_app as app
 from bg_img_redis import save_image_metadata, get_image_metadata
 
+def get_db_connection():
+    return pymysql.connect(
+        host=os.environ["DB_HOST"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        database=os.environ["DB_NAME"],
+        autocommit=False
+    )
+
 def load_k8s():
     # k8s client 초기
     try:
         k8s_config.load_incluster_config()
     except:
         k8s_config.load_kube_config()
+
+def is_pod_ready(pod):
+    if pod.status.phase != "Running":
+        return False
+    for cond in (pod.status.conditions or []):
+        if cond.type == "Ready" and cond.status == "True":
+            return True
+    return False
 
 
 # 기존 Pod가 있는지 확인 -> username당 Pod 1개만 유지
@@ -32,6 +52,9 @@ def get_existing_pod(namespace, username):
             return pod.metadata.name
     return None
 
+def generate_pod_name(username: str) -> str:
+    suffix = uuid.uuid4().hex[:8]
+    return f"containerssh-{username}-{suffix}"
 
 
 def delete_pod(pod_name, namespace):
@@ -45,7 +68,7 @@ def delete_pod(pod_name, namespace):
 #  NodePort Service 관련
 # ============================
 
-def create_nodeport_services(username: str, namespace: str, extra_ports: List[dict]):
+def create_nodeport_services(username: str, namespace: str, pod_name: str, extra_ports: List[dict]):
     """
     사용자 Pod용 NodePort Service 생성 (여러 포트 지원)
 
@@ -56,7 +79,6 @@ def create_nodeport_services(username: str, namespace: str, extra_ports: List[di
     """
     load_k8s()
     v1 = client.CoreV1Api()
-    pod_name = f"containerssh-{username}"
 
     for port_info in extra_ports:
         internal_port = port_info["internal_port"]  # Pod 내부 포트
@@ -72,6 +94,7 @@ def create_nodeport_services(username: str, namespace: str, extra_ports: List[di
                 labels={
                     "app": "containerssh-nodeport",
                     "username": username,
+                    "pod_name": pod_name,
                     "purpose": purpose
                 }
             ),
@@ -104,7 +127,7 @@ def create_nodeport_services(username: str, namespace: str, extra_ports: List[di
             raise
 
 
-def delete_nodeport_services(username: str, namespace: str):
+def delete_nodeport_services(pod_name: str, namespace: str):
     """사용자 Pod 삭제 시 관련 NodePort Service도 모두 삭제"""
     load_k8s()
     v1 = client.CoreV1Api()
@@ -113,14 +136,14 @@ def delete_nodeport_services(username: str, namespace: str):
         # username 라벨로 모든 관련 Service 조회
         services = v1.list_namespaced_service(
             namespace=namespace,
-            label_selector=f"username={username},app=containerssh-nodeport"
+            label_selector=f"pod_name={pod_name},app=containerssh-nodeport"
         )
 
         for svc in services.items:
             v1.delete_namespaced_service(svc.metadata.name, namespace)
             app.logger.info(f"Deleted service {svc.metadata.name}")
     except Exception as e:
-        app.logger.error(f"Failed to delete services for {username}: {e}")
+        app.logger.error(f"Failed to delete services for pod {pod_name}: {e}")
 
 
 # ============================
