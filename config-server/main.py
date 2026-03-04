@@ -481,7 +481,7 @@ def build_pod_spec(
 # //////////////////////// Pod 삭제 //////////////////////
 
 @app.route("/delete-pod", methods=["POST"])
-def delete_pod_api():
+def delete_pod():
 
     data = request.get_json(force=True)
     pod_name = data.get("pod_name")
