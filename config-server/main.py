@@ -55,7 +55,7 @@ app.config.from_mapping({
 
     # External endpoints & timeouts
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
-    "WAS_URL_TEMPLATE": "http://210.94.179.18:30083/api/requests/config/{username}",
+    "WAS_URL_TEMPLATE": "http://admin-prod.default/api/requests/config/{username}",,
     "HTTP_TIMEOUT_SEC": 3.0,
 
     # Default resources
