@@ -3,7 +3,7 @@ import json
 import redis
 from datetime import datetime
 
-REDIS_HOST = os.getenv("REDIS_HOST", "redis-bg-master.cssh.svc.cluster.local")
+REDIS_HOST = os.getenv("REDIS_HOST", "redis-bg-master.ailab-infra.svc.cluster.local")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 

@@ -51,7 +51,7 @@ app.logger.setLevel(logging.DEBUG)
 BASE_ETC_DIR = "/kube_share"
 app.config.from_mapping({
     # Namespace
-    "NAMESPACE": "cssh",
+    "NAMESPACE": "ailab-infra",
 
     # External endpoints & timeouts
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
