@@ -14,19 +14,31 @@ from flask import current_app as app
 from bg_img_redis import save_image_metadata, get_image_metadata
 
 def get_db_connection():
-    return pymysql.connect(
-        host=os.environ["DB_HOST"],
-        user=os.environ["DB_USER"],
-        password=os.environ["DB_PASSWORD"],
-        database=os.environ["DB_NAME"],
-        autocommit=False
-    )
+    try:
+        app.logger.debug("Creating DB connection")
 
+        conn = pymysql.connect(
+            host=os.environ["DB_HOST"],
+            user=os.environ["DB_USER"],
+            password=os.environ["DB_PASSWORD"],
+            database=os.environ["DB_NAME"],
+            autocommit=False
+        )
+
+        app.logger.debug("DB connection established")
+        return conn
+
+    except Exception:
+        app.logger.exception("Failed to create DB connection")
+        raise
+    
 def load_k8s():
     # k8s client 초기
     try:
+        app.logger.debug("Loading in-cluster Kubernetes config")
         k8s_config.load_incluster_config()
-    except:
+    except Exception:
+        app.logger.debug("In-cluster config failed, loading kubeconfig")
         k8s_config.load_kube_config()
 
 def is_pod_ready(pod):
@@ -40,6 +52,8 @@ def is_pod_ready(pod):
 
 # 기존 Pod가 있는지 확인 -> username당 Pod 1개만 유지
 def get_existing_pod(namespace, username):
+    app.logger.info(f"[POD CHECK] searching existing pod for user={username}")
+
     load_k8s()
 
     core_v1 = client.CoreV1Api()
@@ -48,20 +62,40 @@ def get_existing_pod(namespace, username):
         label_selector=f"containerssh_username={username}"
     )
     for pod in pods.items:
+        app.logger.debug(
+            f"[POD CHECK] found pod={pod.metadata.name} phase={pod.status.phase}"
+        )
+
         if pod.status.phase == "Running":
+            app.logger.info(f"[POD CHECK] running pod detected: {pod.metadata.name}")
             return pod.metadata.name
+    app.logger.info(f"[POD CHECK] no running pod for user={username}")
     return None
 
 def generate_pod_name(username: str) -> str:
     suffix = uuid.uuid4().hex[:8]
-    return f"containerssh-{username}-{suffix}"
+    pod_name = f"containerssh-{username}-{suffix}"
+
+    app.logger.debug(f"Generated pod name: {pod_name}")
+
+    return pod_name
 
 
-def delete_pod(pod_name, namespace):
-    load_k8s()
-    # Pod 삭제
-    v1 = client.CoreV1Api()
-    v1.delete_namespaced_pod(pod_name, namespace)
+def delete_pod_util(pod_name, namespace):
+
+    app.logger.info(f"[POD DELETE] deleting pod={pod_name} namespace={namespace}")
+
+    try:
+        load_k8s()
+        v1 = client.CoreV1Api()
+        # Pod 삭제
+        v1.delete_namespaced_pod(pod_name, namespace)
+
+        app.logger.info(f"[POD DELETE] pod deleted: {pod_name}")
+
+    except Exception:
+        app.logger.exception(f"[POD DELETE] failed for pod={pod_name}")
+        raise
 
 
 # ============================
@@ -77,6 +111,10 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
         namespace: k8s 네임스페이스
         extra_ports: [{"internal_port": 8888, "external_port": 10001, "usage_purpose": "jupyter"}, ...]
     """
+    app.logger.info(
+        f"[SERVICE CREATE] username={username} pod={pod_name} ports={extra_ports}"
+    )
+
     load_k8s()
     v1 = client.CoreV1Api()
 
@@ -86,6 +124,11 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
         purpose = port_info.get("usage_purpose", "custom")
 
         service_name = f"containerssh-{username}-{purpose}-{external_port}"
+
+        app.logger.debug(
+            f"[SERVICE CREATE] service={service_name} "
+            f"{internal_port}->{external_port}"
+        )
 
         service_body = client.V1Service(
             metadata=client.V1ObjectMeta(
@@ -115,20 +158,24 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
             # 기존 Service가 있으면 삭제 후 재생성
             try:
                 v1.delete_namespaced_service(service_name, namespace)
-                app.logger.info(f"Deleted existing service {service_name}")
+                app.logger.debug(f"[SERVICE CREATE] old service deleted {service_name}")
             except client.exceptions.ApiException as e:
                 if e.status != 404:
                     raise
 
             v1.create_namespaced_service(namespace, service_body)
-            app.logger.info(f"Created service {service_name}: {internal_port} -> NodePort {external_port}")
+            app.logger.info(
+                f"[SERVICE CREATE] created {service_name} "
+                f"nodeport={external_port}"
+            )
         except Exception as e:
-            app.logger.error(f"Failed to create service {service_name}: {e}")
+            app.logger.exception(f"[SERVICE CREATE] failed for {service_name}")
             raise
 
 
 def delete_nodeport_services(pod_name: str, namespace: str):
     """사용자 Pod 삭제 시 관련 NodePort Service도 모두 삭제"""
+    app.logger.info(f"[SERVICE DELETE] pod={pod_name}")
     load_k8s()
     v1 = client.CoreV1Api()
 
@@ -139,11 +186,17 @@ def delete_nodeport_services(pod_name: str, namespace: str):
             label_selector=f"pod_name={pod_name},app=containerssh-nodeport"
         )
 
+        app.logger.debug(
+            f"[SERVICE DELETE] {len(services.items)} services found"
+        )
+
         for svc in services.items:
             v1.delete_namespaced_service(svc.metadata.name, namespace)
-            app.logger.info(f"Deleted service {svc.metadata.name}")
+            app.logger.info(
+                f"[SERVICE DELETE] deleted service {svc.metadata.name}"
+            )
     except Exception as e:
-        app.logger.error(f"Failed to delete services for pod {pod_name}: {e}")
+        app.logger.exception(f"[SERVICE DELETE] failed for pod {pod_name}: {e}")
 
 
 # ============================

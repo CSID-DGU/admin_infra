@@ -17,7 +17,7 @@ load_dotenv()
 import logging, sys
 
 from utils import (
-    get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod,
+    get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile,get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_dir,
     read_passwd_lines, write_passwd_lines,
@@ -54,8 +54,8 @@ app.config.from_mapping({
     "NAMESPACE": "cssh",
 
     # External endpoints & timeouts
-    "PROM_URL": "http://210.94.179.19:9750",
-    "WAS_URL_TEMPLATE": "http://210.94.179.19:9796/api/requests/config/{username}",
+    "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
+    "WAS_URL_TEMPLATE": "http://210.94.179.18:30083/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
 
     # Default resources
@@ -97,12 +97,20 @@ app.config.from_mapping({
 def health():
     """
     서버 상태 확인 API
+
     ---
     tags:
-      - System
+    - System
+
+    summary: 서버 상태 확인
+
     responses:
-      200:
-        description: 서버가 살아있음
+
+    200:
+        description: 서버 정상
+        schema:
+        type: string
+        example: OK
     """
     return "OK", 200
 
@@ -122,6 +130,8 @@ def allocate_nodeports(username, pod_name, node_name, ports):
         ...
     ]
     """
+    app.logger.info(f"[NODEPORT] allocate start username={username} pod={pod_name} node={node_name}")
+    app.logger.debug(f"[NODEPORT] requested ports={ports}")
 
     conn = get_db_connection()
 
@@ -130,11 +140,13 @@ def allocate_nodeports(username, pod_name, node_name, ports):
 
             cur.execute("SELECT node_port FROM nodeport_allocations FOR UPDATE")
             used = {row[0] for row in cur.fetchall()}
-
+            app.logger.debug(f"[NODEPORT] used ports count={len(used)}")
             available = [
                 p for p in range(30000, 32768)
                 if p not in used
             ]
+
+            app.logger.debug(f"[NODEPORT] available ports count={len(available)}")
 
             if len(available) < len(ports):
                 raise Exception("Not enough NodePorts")
@@ -142,8 +154,10 @@ def allocate_nodeports(username, pod_name, node_name, ports):
             result_ports = []
 
             for idx, port in enumerate(ports):
+                app.logger.debug(f"[NODEPORT] assigning internal_port={port['internal_port']}")
 
                 node_port = available[idx]
+                app.logger.info(f"[NODEPORT] allocated {port['internal_port']} -> {node_port}")
 
                 cur.execute("""
                     INSERT INTO nodeport_allocations
@@ -163,35 +177,105 @@ def allocate_nodeports(username, pod_name, node_name, ports):
                     "external_port": node_port,
                     "usage_purpose": port.get("usage_purpose", "custom")
                 })
-
+            app.logger.info(f"[NODEPORT] allocation success total={len(result_ports)}")
             conn.commit()
             return result_ports
 
     except:
+        app.logger.exception(f"[NODEPORT] allocation failed pod={pod_name}")
         conn.rollback()
         raise
     finally:
         conn.close()
     
 def release_nodeports(pod_name):
+    app.logger.info(f"[NODEPORT] release start pod={pod_name}")
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
+            app.logger.debug(f"[NODEPORT] deleting DB rows for pod={pod_name}")
+
             cur.execute(
                 "DELETE FROM nodeport_allocations WHERE pod_name=%s",
                 (pod_name,)
             )
+
         conn.commit()
+        app.logger.info(f"[NODEPORT] release complete pod={pod_name}")
+    except Exception:
+        app.logger.exception(f"[NODEPORT] release failed pod={pod_name}")
+        raise
     finally:
         conn.close()
 
 
 @app.route("/create-pod", methods=["POST"])
 def create_pod():
+    """
+    사용자 컨테이너 Pod 생성 API
+
+    이 API는 Kubernetes에 사용자 Pod를 생성합니다.
+
+    동작 과정
+
+    1. WAS 서버에서 사용자 설정 조회
+    2. GPU 노드 중 가장 적합한 노드 선택
+    3. NodePort 자동 할당
+    4. Pod 생성
+    5. Service 생성
+
+    ---
+    tags:
+    - Pod
+
+    summary: 사용자 Pod 생성
+
+    description: |
+        특정 사용자 환경을 Kubernetes Pod로 생성합니다.
+
+    consumes:
+    - application/json
+
+    produces:
+    - application/json
+
+    parameters:
+
+    - in: body
+        name: body
+        required: true
+        schema:
+            $ref: '#/definitions/CreatePodRequest'
+
+    responses:
+
+    201:
+        description: Pod 생성 성공
+        schema:
+            $ref: '#/definitions/CreatePodResponse'
+
+    400:
+        description: username 누락
+        schema:
+            $ref: '#/definitions/ErrorResponse'
+
+    409:
+        description: 동일 Pod 이미 존재
+        schema:
+            $ref: '#/definitions/ErrorResponse'
+
+    500:
+        description: 서버 내부 오류
+        schema:
+            $ref: '#/definitions/ErrorResponse'
+    """
     data = request.get_json(force=True)
     username = data.get("username")
 
+    app.logger.info(f"[CREATE POD] request received - username={username}")
+
     if not username:
+        app.logger.warning("[CREATE POD] username missing in request")
         return jsonify({"error": "username required"}), 400
 
     ns = app.config["NAMESPACE"]
@@ -199,12 +283,17 @@ def create_pod():
     try:
         # WAS 조회
         was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
+        app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
+
         user_info = requests.get(
             was_url,
             timeout=app.config["HTTP_TIMEOUT_SEC"]
         ).json()
 
+        app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
+
         pod_name = generate_pod_name(username)
+        app.logger.info(f"[CREATE POD] generated pod_name={pod_name}")
 
         # pod_name 중복 확인
         load_k8s()
@@ -212,60 +301,83 @@ def create_pod():
 
         try:
             v1.read_namespaced_pod(pod_name, ns)
+            app.logger.warning(f"[CREATE POD] pod already exists: {pod_name}")
             return jsonify({"error": "pod already exists"}), 409
         except:
-            pass
+            app.logger.debug("[CREATE POD] pod does not exist yet")
 
         # Prometheus 기반 노드 선택
         node_list = [n["node_name"] for n in user_info["gpu_nodes"]]
+        app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
+
         best_node = select_best_node_from_prometheus(
             node_list,
             app.config["PROM_URL"],
             app.config["HTTP_TIMEOUT_SEC"]
         )
-
+        app.logger.info(f"[CREATE POD] selected best node: {best_node}")
+        
         # Pod spec 생성
+        app.logger.info("[CREATE POD] building pod spec")
+
         spec_wrapper, allocated_ports = build_pod_spec(
             username,
             user_info,
             best_node,
             pod_name
         )
+        app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
 
         pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
+        app.logger.info("[CREATE POD] pod spec built")
 
         load_k8s()
         v1 = client.CoreV1Api()
 
         # 실제 Pod 생성
         try:
+            app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+
             # 1. Pod 생성
             v1.create_namespaced_pod(
                 namespace=ns,
                 body=pod_spec
             )
 
+            app.logger.info("[CREATE POD] pod creation request sent")
+
             # 2. Ready 대기
-            for _ in range(60):
+            app.logger.info("[CREATE POD] waiting for pod to become Ready")
+            for i in range(60):
                 pod = v1.read_namespaced_pod(pod_name, ns)
                 if is_pod_ready(pod):
+                    app.logger.info(f"[CREATE POD] pod ready after {i+1} seconds")
                     break
                 time.sleep(1)
             else:
+                app.logger.error("[CREATE POD] pod failed to become ready")
+                app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
                 release_nodeports(pod_name)
                 v1.delete_namespaced_pod(pod_name, ns)
                 return jsonify({"error": "pod failed to start"}), 500
 
             # 3. Pod 성공 후 Service 생성
+            app.logger.info("[CREATE POD] creating NodePort services")
             create_nodeport_services(username, ns, pod_name, allocated_ports)
 
-        except Exception:
+            app.logger.info("[CREATE POD] services created successfully")
+
+        except Exception as e:
+            app.logger.error(f"[CREATE POD] pod creation failed: {str(e)}")
             release_nodeports(pod_name)
             try:
                 v1.delete_namespaced_pod(pod_name, ns)
+                app.logger.warning("[CREATE POD] failed pod deleted")
             except:
-                pass
+                app.logger.warning("[CREATE POD] cleanup pod deletion failed")
             raise
+
+        app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
 
         return jsonify({
             "status": "created",
@@ -275,7 +387,7 @@ def create_pod():
         }), 201
 
     except Exception as e:
-        app.logger.exception("create-pod failed")
+        app.logger.exception("[CREATE POD] unexpected error")
         return jsonify({"error": str(e)}), 500
 
 def build_pod_spec(
@@ -284,6 +396,8 @@ def build_pod_spec(
     target_node: str,
     pod_name: str
 ):
+    app.logger.info(f"[POD SPEC] start user={username} node={target_node}")
+    app.logger.debug(f"[POD SPEC] user_info={user_info}")
     ns = app.config["NAMESPACE"]
 
     image = load_user_image(username, user_info["image"])
@@ -296,10 +410,11 @@ def build_pod_spec(
         {"internal_port": 22, "usage_purpose": "ssh"},
         {"internal_port": 8888, "usage_purpose": "jupyter"},
     ]
+    app.logger.debug(f"[POD SPEC] base ports={ports}")
 
     # WAS 추가 포트
     ports.extend(user_info.get("additional_ports", []))
-
+    app.logger.info(f"[POD SPEC] final ports={ports}")
     # 포트 할당
     allocated_ports = allocate_nodeports(
         username=username,
@@ -307,6 +422,7 @@ def build_pod_spec(
         node_name=target_node,
         ports=ports
     )
+    app.logger.info(f"[POD SPEC] allocated_ports={allocated_ports}")
 
     cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
     memory_limit = app.config["DEFAULT_MEM_LIMIT"]
@@ -319,7 +435,10 @@ def build_pod_spec(
             num_gpu = node.get("num_gpu", 0)
             break
 
+    app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
+
     pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
+    app.logger.debug(f"[POD SPEC] pvc_name={pvc_name}")
 
     gpu_volume_mounts = []
     gpu_volumes = []
@@ -351,7 +470,7 @@ def build_pod_spec(
                     "type": "CharDevice"
                 }
             })
-
+            
     volume_mounts = [{
         "name": "user-home",
         "mountPath": f"/home/{username}",
@@ -377,6 +496,8 @@ def build_pod_spec(
 
     volume_mounts.extend(gpu_volume_mounts)
     volumes.extend(gpu_volumes)
+
+    app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
 
     group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
     volume_mounts.extend(group_mounts)
@@ -475,39 +596,96 @@ def build_pod_spec(
                     "metadata": {},
                     "files": {}
                 }
-
+    app.logger.info(f"[POD SPEC] complete pod_name={pod_name}")
     return spec, allocated_ports
 
 # //////////////////////// Pod 삭제 //////////////////////
 
 @app.route("/delete-pod", methods=["POST"])
 def delete_pod():
+    """
+    사용자 Pod 삭제 API
+
+    특정 Pod를 삭제하고 다음 리소스를 정리합니다.
+
+    - Kubernetes Pod
+    - NodePort Service
+    - NodePort DB allocation
+
+    ---
+    tags:
+    - Pod
+
+    summary: 사용자 Pod 삭제
+
+    consumes:
+    - application/json
+
+    parameters:
+
+    - in: body
+        name: body
+        required: true
+        schema:
+            $ref: '#/definitions/DeletePodRequest'
+
+    responses:
+
+    200:
+        description: Pod 삭제 성공
+        schema:
+            type: object
+            properties:
+                status:
+                type: string
+                example: deleted
+
+    400:
+        description: 잘못된 요청
+        schema:
+            $ref: '#/definitions/ErrorResponse'
+
+    500:
+        description: 삭제 실패
+        schema:
+            $ref: '#/definitions/ErrorResponse'
+    """
 
     data = request.get_json(force=True)
     pod_name = data.get("pod_name")
 
+    app.logger.info(f"[DELETE POD] request received - pod_name={pod_name}")
+
     if not pod_name:
+        app.logger.warning("[DELETE POD] pod_name missing")
         return jsonify({"error": "pod_name required"}), 400
 
     ns = app.config["NAMESPACE"]
 
     try:
         if not pod_name.startswith("containerssh-"):
+            app.logger.warning(f"[DELETE POD] invalid pod_name format: {pod_name}")
             return jsonify({"error": "invalid pod_name"}), 400
 
         rest = pod_name[len("containerssh-"):]
         username = rest.rsplit("-", 1)[0]
-        
+
+        app.logger.info(f"[DELETE POD] parsed username={username}")
+        app.logger.info("[DELETE POD] deleting NodePort services")
         delete_nodeport_services(pod_name, ns)
+        app.logger.info("[DELETE POD] releasing NodePort allocations")
         release_nodeports(pod_name)
 
+        app.logger.info(f"[DELETE POD] deleting pod from namespace={ns}")
         load_k8s()
         v1 = client.CoreV1Api()
         v1.delete_namespaced_pod(pod_name, ns)
+        app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
 
         return jsonify({"status": "deleted"})
 
     except Exception as e:
+        app.logger.exception("[DELETE POD] deletion failed")
         return jsonify({"error": str(e)}), 500
 
 def _migrate_internal(data):
@@ -566,10 +744,15 @@ def _migrate_internal(data):
 
     # 4. WAS에서 사용자 정보 조회
     was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
-    user_info = requests.get(
+    resp = requests.get(
         was_url,
         timeout=app.config["HTTP_TIMEOUT_SEC"]
-    ).json()
+    )
+
+    app.logger.info(f"[MIGRATE] WAS status={resp.status_code}")
+    app.logger.debug(f"[MIGRATE] WAS body={resp.text}")
+
+    user_info = resp.json()
 
     # 5. 기존 Pod 이미지 저장
     ok = commit_and_save_user_image(username, old_pod_name, ns)
@@ -625,7 +808,7 @@ def _migrate_internal(data):
     # 10. 기존 Pod 정리
     delete_nodeport_services(old_pod_name, ns)
     release_nodeports(old_pod_name)
-    delete_pod(old_pod_name, ns)
+    delete_pod_util(old_pod_name, ns)
 
     return jsonify({
         "status": "migrated",
@@ -639,38 +822,70 @@ def _migrate_internal(data):
 @app.route("/migrate", methods=["POST"])
 def migrate():
     """
-    실행 중인 사용자 Pod를 더 좋은 GPU 노드로 마이그레이션
+    Pod GPU 노드 마이그레이션
+
+    현재 실행 중인 사용자 Pod를 더 성능이 좋은 GPU 노드로 이동합니다.
+
+    동작 순서
+
+    1. 현재 Pod 조회
+    2. GPU score 계산
+    3. 더 좋은 노드 존재 시 마이그레이션
+    4. 기존 Pod commit
+    5. 새로운 Pod 생성
+    6. 기존 Pod 삭제
+
     ---
     tags:
-      - Migration
+    - Migration
+
+    summary: GPU 노드 마이그레이션
+
     consumes:
-      - application/json
+    - application/json
+
     parameters:
-      - in: body
+
+    - in: body
         name: body
         required: true
         schema:
-          type: object
-          required:
-            - username
-            - nodes
-          properties:
+            type: object
+            required:
+                - username
+                - nodes
+        properties:
+
             username:
-              type: string
-              example: alice
+            type: string
+            description: 사용자 이름
+            example: alice
+
             nodes:
-              type: array
-              items:
+            type: array
+            items:
                 type: string
-              example: ["gpu-node-1", "gpu-node-2"]
+            example:
+                - gpu-node-1
+                - gpu-node-2
+
             min_improvement_ratio:
-              type: number
-              example: 0.2
+            type: number
+            example: 0.2
+
     responses:
-      200:
-        description: 마이그레이션 결과
-      400:
+
+    200:
+        description: 마이그레이션 성공 또는 skip
+
+    400:
         description: 잘못된 요청
+
+    404:
+        description: 실행 중 Pod 없음
+
+    500:
+        description: 서버 오류
     """
     data = request.get_json(force=True)
     username = data.get("username")
@@ -692,36 +907,51 @@ def migrate():
 def create_or_resize_pvc():
     """
     PVC 생성 또는 용량 확장 API
+
     ---
     tags:
-      - Storage
-    consumes:
-      - application/json
+    - Storage
+
+    summary: PVC 생성 또는 확장
+
     parameters:
-      - in: body
+
+    - in: body
         name: body
         schema:
-          type: object
-          properties:
+        type: object
+        properties:
+
             pvcs:
-              type: array
-              items:
+            type: array
+            items:
                 type: object
                 properties:
-                  name:
+
+                name:
                     type: string
                     example: alice
-                  type:
+
+                type:
                     type: string
-                    example: user
-                  storage:
+                    enum:
+                    - user
+                    - group
+
+                storage:
                     type: integer
                     example: 50
+
     responses:
-      200:
-        description: PVC 처리 결과 목록
-      400:
+
+    200:
+        description: PVC 처리 결과
+
+    400:
         description: 잘못된 요청
+
+    500:
+        description: 서버 오류
     """
     data = request.get_json(force=True)
     pvcs = data.get("pvcs", [])
@@ -1004,7 +1234,20 @@ accounts_bp = Blueprint("accounts", __name__)
 # ---------- /etc/passwd CRUD ----------
 @accounts_bp.route("/users", methods=["GET"])
 def list_users():
-    """List all users in the system."""
+    """
+    사용자 목록 조회
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 시스템 사용자 목록
+
+    responses:
+
+    200:
+        description: 사용자 목록 반환
+    """
     try:
         lines = read_passwd_lines()
         users = []
@@ -1025,7 +1268,95 @@ def list_users():
 
 @accounts_bp.route("/users/<username>", methods=["GET"])
 def get_user(username: str):
-    """Get detailed user information including group memberships."""
+    """
+    특정 사용자 상세 정보 조회
+
+    사용자의 기본 계정 정보와 소속 그룹 정보를 반환합니다.
+
+    조회 정보
+
+    - UID
+    - GID
+    - 홈 디렉토리
+    - 쉘
+    - primary group
+    - supplementary groups
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 사용자 상세 정보 조회
+
+    parameters:
+
+    - in: path
+    name: username
+    required: true
+    type: string
+    description: 조회할 사용자 이름
+    example: user2100
+
+    responses:
+
+    200:
+        description: 사용자 정보 반환
+        schema:
+        type: object
+        properties:
+
+            user:
+            type: object
+            properties:
+
+                name:
+                type: string
+                example: user2100
+
+                uid:
+                type: integer
+                example: 2100
+
+                gid:
+                type: integer
+                example: 2100
+
+                home:
+                type: string
+                example: /home/user2100
+
+                shell:
+                type: string
+                example: /bin/bash
+
+            groups:
+            type: array
+            items:
+                type: object
+                properties:
+
+                name:
+                    type: string
+                    example: developers
+
+                gid:
+                    type: integer
+                    example: 3001
+
+                type:
+                    type: string
+                    example: supplementary
+
+    404:
+        description: 사용자 없음
+        schema:
+            $ref: '#/definitions/ErrorResponse'
+
+    500:
+        description: 서버 오류
+        schema:
+            $ref: '#/definitions/ErrorResponse'
+    """
     try:
         # Find user in passwd
         lines = read_passwd_lines()
@@ -1079,13 +1410,84 @@ def get_user(username: str):
 
 @accounts_bp.route("/users", methods=["PUT"])
 def create_user():
-    """Create a new user across passwd, group, shadow, and sudoers.
-    Required JSON: name, uid, gid, passwd_sha512
-    Optional: gecos, primary_group_name
-    Notes:
-      - home is auto-set to /home/{name}
-      - shell is fixed to /bin/bash
-      - passwd_sha512 must be a full SHA-512 crypt string (e.g., $6$...)
+    """
+    사용자 생성 API
+
+    시스템에 새로운 Linux 사용자를 생성합니다.
+
+    생성 대상 파일
+
+    - /etc/passwd
+    - /etc/shadow
+    - /etc/group
+    - /etc/sudoers.d/
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 사용자 생성
+
+    consumes:
+    - application/json
+
+    parameters:
+
+    - in: body
+    name: body
+    required: true
+    schema:
+
+        type: object
+        required:
+        - name
+        - uid
+        - gid
+        - passwd_sha512
+
+        properties:
+
+        name:
+            type: string
+            description: 사용자 이름
+            example: user2100
+
+        uid:
+            type: integer
+            description: 사용자 UID
+            example: 2100
+
+        gid:
+            type: integer
+            description: 기본 그룹 GID
+            example: 2100
+
+        passwd_sha512:
+            type: string
+            description: SHA-512 해시 패스워드
+            example: "$6$hash..."
+
+        gecos:
+            type: string
+            example: "GPU User"
+
+        primary_group_name:
+            type: string
+            example: user2100
+
+    responses:
+
+    201:
+        description: 사용자 생성 성공
+
+    400:
+        description: 필수 필드 누락
+
+    409:
+        description: 사용자 이미 존재
+
+    500:
+        description: 서버 오류
     """
     data = request.get_json(force=True)
     required = ["name", "uid", "gid", "passwd_sha512"]
@@ -1157,6 +1559,47 @@ def create_user():
 
 @accounts_bp.route("/users/<username>", methods=["DELETE"])
 def delete_user(username: str):
+    """
+    사용자 삭제 API
+
+    다음 정보를 제거합니다.
+
+    - /etc/passwd
+    - /etc/shadow
+    - /etc/group
+    - /etc/sudoers.d/
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 사용자 삭제
+
+    parameters:
+
+    - in: path
+    name: username
+    required: true
+    type: string
+    example: user2100
+
+    responses:
+
+    200:
+        description: 삭제 성공
+        schema:
+        type: object
+        properties:
+            status:
+            type: string
+            example: deleted
+
+    404:
+        description: 사용자 없음
+
+    500:
+        description: 서버 오류
+    """
     # Remove from /etc/passwd
     lines = read_passwd_lines()
     new_lines = []
@@ -1222,8 +1665,39 @@ def delete_user(username: str):
 
 @accounts_bp.route("/groups/<groupname>", methods=["DELETE"])
 def delete_group(groupname: str):
-    """Delete a group from the system.
-    This removes the group from /etc/group but does not affect users' primary groups.
+    """
+    그룹 삭제 API
+
+    특정 Linux 그룹을 삭제합니다.
+
+    주의
+
+    - 해당 그룹이 사용자 primary group이면 삭제 불가
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 그룹 삭제
+
+    parameters:
+
+    - in: path
+    name: groupname
+    required: true
+    type: string
+    example: developers
+
+    responses:
+
+    200:
+        description: 삭제 성공
+
+    400:
+        description: primary group 사용 중
+
+    404:
+        description: 그룹 없음
     """
     # Check if group exists
     g_lines = read_group_lines()
@@ -1265,9 +1739,60 @@ def delete_group(groupname: str):
 # ----------- Group management -----------
 @accounts_bp.route("/groups", methods=["PUT"])
 def add_group():
-    """Create a new group.
-    Required JSON: name, gid
-    Optional: members (array of usernames)
+    """
+    그룹 생성 API
+
+    시스템에 새로운 Linux 그룹을 생성합니다.
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 그룹 생성
+
+    consumes:
+    - application/json
+
+    parameters:
+
+    - in: body
+    name: body
+    required: true
+    schema:
+
+        type: object
+        required:
+        - name
+        - gid
+
+        properties:
+
+        name:
+            type: string
+            example: developers
+
+        gid:
+            type: integer
+            example: 3001
+
+        members:
+            type: array
+            items:
+            type: string
+            example:
+            - user2100
+            - user2101
+
+    responses:
+
+    201:
+        description: 그룹 생성 성공
+
+    400:
+        description: 잘못된 요청
+
+    409:
+        description: 그룹 이미 존재
     """
     data = request.get_json(force=True)
     required = ["name", "gid"]
@@ -1310,8 +1835,51 @@ def add_group():
 # ----------- Add user to supplementary groups -----------
 @accounts_bp.route("/users/<username>/groups", methods=["PUT"])
 def add_user_groups(username: str):
-    """Add user to one or more existing groups. Body: {"groups": [...]}
-    Groups must already exist. Does not touch primary group (by gid).
+    """
+    사용자 보조 그룹 추가 API
+
+    특정 사용자를 하나 이상의 supplementary group에 추가합니다.
+
+    ---
+    tags:
+    - Accounts
+
+    summary: 사용자 그룹 추가
+
+    parameters:
+
+    - in: path
+    name: username
+    required: true
+    type: string
+    example: user2100
+
+    - in: body
+    name: body
+    required: true
+    schema:
+
+        type: object
+        properties:
+
+        groups:
+            type: array
+            items:
+            type: string
+            example:
+            - developers
+            - ai-lab
+
+    responses:
+
+    200:
+        description: 그룹 추가 성공
+
+    404:
+        description: 사용자 또는 그룹 없음
+
+    400:
+        description: groups 필드 누락
     """
     data = request.get_json(force=True)
     groups = data.get("groups") or []
@@ -1381,7 +1949,80 @@ swagger_template = {
         "description": "Kubernetes Pod 동적 할당 및 시스템 계정 관리 API",
         "version": "1.0.0"
     },
-    "definitions": {}  # 정의가 없어도 에러 안 나도록 빈 객체 추가
+    # "definitions": {}  # 정의가 없어도 에러 안 나도록 빈 객체 추가
+    "definitions": {
+
+        "CreatePodRequest": {
+            "type": "object",
+            "required": ["username"],
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "Pod를 생성할 사용자 이름",
+                    "example": "user2100"
+                }
+            }
+        },
+
+        "CreatePodResponse": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "example": "created"
+                },
+                "node": {
+                    "type": "string",
+                    "example": "...RTX 3080..."
+                },
+                "pod_name": {
+                    "type": "string",
+                    "example": "containerssh-user2100-1"
+                },
+                "ports": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "internal_port": {
+                                "type": "integer",
+                                "example": 22
+                            },
+                            "external_port": {
+                                "type": "integer",
+                                "example": 30001
+                            },
+                            "usage_purpose": {
+                                "type": "string",
+                                "example": "ssh"
+                            }
+                        }
+                    }
+                }
+            }
+        },
+
+        "DeletePodRequest": {
+            "type": "object",
+            "required": ["pod_name"],
+            "properties": {
+                "pod_name": {
+                    "type": "string",
+                    "example": "containerssh-user2100-1"
+                }
+            }
+        },
+
+        "ErrorResponse": {
+            "type": "object",
+            "properties": {
+                "error": {
+                    "type": "string",
+                    "example": "username required"
+                }
+            }
+        }
+    }
 }
 
 app.config['SWAGGER'] = {
