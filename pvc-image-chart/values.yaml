@@ -1,6 +1,5 @@
 config:
-  namespace: cssh
-
+  namespace: ailab-infra
 imageStore:
   size: 500Gi
 
