@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: infra-mysql
-  namespace: cssh
+  namespace: ailab-infra
 spec:
   serviceName: infra-mysql
   replicas: 1
@@ -36,7 +36,7 @@ spec:
   - metadata:
       name: mysql-data
     spec:
-      storageClassName: nfs-mysql-dedicated
+      storageClassName: sc-mysql
       accessModes:
         - ReadWriteOnce
       resources:
@@ -47,7 +47,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: infra-mysql
-  namespace: cssh
+  namespace: ailab-infra
 spec:
   type: ClusterIP
   selector:
