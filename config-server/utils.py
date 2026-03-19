@@ -11,7 +11,7 @@ from datetime import datetime
 from kubernetes import client, config as k8s_config
 from kubernetes.stream import stream
 from flask import current_app as app
-#from bg_img_redis import save_image_metadata, get_image_metadata
+from bg_img_redis import save_image_metadata, get_image_metadata
 
 def get_db_connection():
     try:
