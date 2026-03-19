@@ -17,7 +17,7 @@ spec:
     spec:
       serviceAccountName: config-server
       nodeSelector:
-        kubernetes.io/hostname: farm8
+        kubernetes.io/hostname: csid-dgu-desktop
       containers:
         - name: config-server
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
