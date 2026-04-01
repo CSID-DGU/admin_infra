@@ -38,3 +38,14 @@ redis:
   host: redis-bg-master.ailab-infra.svc.cluster.local
   port: 6379
 
+# config-server를 배포할 노드 고정
+# csid-dgu-desktop은 control-plane 노드이므로=
+nodeSelector:
+  kubernetes.io/hostname: csid-dgu-desktop
+
+# 데스크탑의 NoSchedule taint를 허용
+tolerations:
+  - key: "node-role.kubernetes.io/control-plane"
+    operator: "Exists"
+    effect: "NoSchedule"
+
