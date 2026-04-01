@@ -18,10 +18,10 @@ resources:
     memory: 256Mi
 
 env:
-  nfsAddress: "100.100.100.120"
+  nfsAddress: "192.168.2.30"
 
 nfs:
-  server: "100.100.100.120"
+  server: "192.168.2.30"
   path: "/volume1/share"
 
 
@@ -39,7 +39,7 @@ redis:
   port: 6379
 
 # config-server를 배포할 노드 고정
-# csid-dgu-desktop은 control-plane 노드이므로=
+# csid-dgu-desktop은 control-plane 노드이므로 아래 tolerations와 함께 사용해야 한다.
 nodeSelector:
   kubernetes.io/hostname: csid-dgu-desktop
 
