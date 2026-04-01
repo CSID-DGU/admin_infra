@@ -16,7 +16,7 @@ spec:
         app: containerssh-config-server
     spec:
       serviceAccountName: config-server
-      {{- with .Values.nodeSelector }} #nodeSelector 설정이 있으면 적용
+      {{- with .Values.nodeSelector }}{{/* nodeSelector 설정이 있으면 적용 */}}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
