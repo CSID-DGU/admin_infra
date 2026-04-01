@@ -13,6 +13,6 @@ mountOptions:
   - wsize=1048576
   - timeo=600
 parameters:
-  server: 100.100.100.120
+  server: 192.168.2.30
   share: /volume1/share
   subdir: user-share/${pvc.uid}
