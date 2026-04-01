@@ -121,6 +121,100 @@ def load_k8s():
         k8s_config.load_kube_config()
 
 # ////////////////////// 포트 할당 //////////////////////
+def reconcile_nodeport_allocations(namespace: str) -> int:
+    """
+    MySQL의 nodeport_allocations 테이블과 실제 k8s NodePort Service 상태를 동기화
+
+    문제 상황:
+        - NodePort 할당 정보는 MySQL에 저장되고, 실제 Service는 k8s(etcd)에 존재.
+        - config-server를 거치지 않고 Service가 삭제되거나 (kubectl delete svc와 같은 상황)
+          config-server 자체가 비정상 종료되어 release_nodeports()가 호출되지 않으면
+          MySQL에는 포트가 점유된 채로 남아 포트 고갈이 발생 가능성 UP
+
+    동기화 방향: k8s → MySQL  (k8s가 단일 소스)
+        - k8s에 실제로 존재하는 NodePort Service의 pod_name 목록을 조회한다.
+        - MySQL에는 있지만 k8s에 없는 pod_name 행을 stale로 판단하고 삭제한다.
+
+    호출 시점:
+        - allocate_nodeports() 시작 시 lazy하게 호출된다.
+        - 포트를 새로 점유하기 전에 항상 실제 상태와 맞춰 사용 가능 포트를 최대화한다.
+
+    Args:
+        namespace: NodePort Service가 존재하는 k8s 네임스페이스
+
+    Returns:
+        int: 삭제된 stale 행 수 (0이면 동기화 불필요했음을 의미)
+    """
+    app.logger.info(f"[RECONCILE] start namespace={namespace}")
+
+    # ── 1. k8s에서 실제 살아있는 NodePort Service의 pod_name 집합 조회 ──
+    #    label_selector로 config-server가 관리하는 Service만 필터링한다.
+    #    (app=containerssh-nodeport 라벨은 create_nodeport_services()에서 부여)
+    from utils import load_k8s
+    load_k8s()
+    v1 = client.CoreV1Api()
+
+    try:
+        services = v1.list_namespaced_service(
+            namespace=namespace,
+            label_selector="app=containerssh-nodeport"
+        )
+    except Exception:
+        # k8s API 조회 실패 시 reconcile을 건너뛰기.
+        # 포트 할당은 계속 진행하되, 다음 호출 때 다시 시도.
+        app.logger.warning("[RECONCILE] k8s API call failed, skipping reconcile")
+        return 0
+
+    # Service 메타데이터의 pod_name 라벨에서 실제 살아있는 pod 이름 수집
+    live_pod_names = {
+        svc.metadata.labels["pod_name"]
+        for svc in services.items
+        if svc.metadata.labels and "pod_name" in svc.metadata.labels
+    }
+    app.logger.debug(f"[RECONCILE] live pods in k8s: {live_pod_names}")
+
+    # ── 2. MySQL에서 현재 점유 중인 pod_name 목록 조회 ──
+    conn = get_db_connection()
+    deleted_count = 0 #삭제된 stale 행 수
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT pod_name FROM nodeport_allocations")
+            db_pod_names = {row[0] for row in cur.fetchall()}
+            app.logger.debug(f"[RECONCILE] pods in MySQL: {db_pod_names}")
+
+            # k8s에는 없지만 MySQL에는 남아있는 stale pod_name 계산
+            stale_pod_names = db_pod_names - live_pod_names
+
+            if not stale_pod_names:
+                app.logger.info("[RECONCILE] no stale entries, DB is in sync")
+                return 0
+
+            app.logger.info(f"[RECONCILE] stale pods to remove: {stale_pod_names}")
+
+            # stale pod의 모든 NodePort 할당 행을 삭제한다.
+            for pod in stale_pod_names:
+                cur.execute(
+                    "DELETE FROM nodeport_allocations WHERE pod_name=%s",
+                    (pod,)
+                )
+                deleted_count += cur.rowcount
+                app.logger.info(f"[RECONCILE] removed {cur.rowcount} rows for stale pod={pod}")
+
+        conn.commit()
+        app.logger.info(f"[RECONCILE] done, total deleted={deleted_count}")
+        return deleted_count
+
+    except Exception:
+        app.logger.exception("[RECONCILE] failed, rolling back")
+        conn.rollback()
+        # reconcile 실패는 치명적이지 않으므로 예외를 삼키고 0을 반환.
+        # allocate_nodeports()는 stale 제거 없이 계속 진행.
+        return 0
+    finally:
+        conn.close()
+
+
 def allocate_nodeports(username, pod_name, node_name, ports):
     """
     ports:
@@ -133,10 +227,14 @@ def allocate_nodeports(username, pod_name, node_name, ports):
     app.logger.info(f"[NODEPORT] allocate start username={username} pod={pod_name} node={node_name}")
     app.logger.debug(f"[NODEPORT] requested ports={ports}")
 
-    conn = get_db_connection()
+    # 포트 할당 전에 MySQL과 k8s 실제 상태를 먼저 동기화한다.
+    # stale 행이 정리되어야 available 포트 계산이 정확해져야함.
+    reconcile_nodeport_allocations(namespace=app.config["NAMESPACE"]) #포트 할당 전에 MySQL과 k8s 실제 상태를 먼저 동기화
+
+    conn = get_db_connection() #DB 연결
 
     try:
-        with conn.cursor() as cur:
+        with conn.cursor() as cur: #DB 커서 생성 (python pymysql 라이브러리)
 
             cur.execute("SELECT node_port FROM nodeport_allocations FOR UPDATE")
             used = {row[0] for row in cur.fetchall()}
@@ -178,8 +276,8 @@ def allocate_nodeports(username, pod_name, node_name, ports):
                     "usage_purpose": port.get("usage_purpose", "custom")
                 })
             app.logger.info(f"[NODEPORT] allocation success total={len(result_ports)}")
-            conn.commit()
-            return result_ports
+            conn.commit() #Commit changes to stable storage.
+            return result_ports #Return the allocated ports.
 
     except:
         app.logger.exception(f"[NODEPORT] allocation failed pod={pod_name}")
