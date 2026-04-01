@@ -106,11 +106,11 @@ def health():
 
     responses:
 
-    200:
+      200:
         description: 서버 정상
         schema:
-        type: string
-        example: OK
+          type: string
+          example: OK
     """
     return "OK", 200
 
@@ -241,33 +241,30 @@ def create_pod():
 
     parameters:
 
-    - in: body
+      - in: body
         name: body
         required: true
         schema:
-            $ref: '#/definitions/CreatePodRequest'
+          $ref: '#/definitions/CreatePodRequest'
 
     responses:
 
-    201:
+      201:
         description: Pod 생성 성공
         schema:
-            $ref: '#/definitions/CreatePodResponse'
-
-    400:
+          $ref: '#/definitions/CreatePodResponse'
+      400:
         description: username 누락
         schema:
-            $ref: '#/definitions/ErrorResponse'
-
-    409:
+          $ref: '#/definitions/ErrorResponse'
+      409:
         description: 동일 Pod 이미 존재
         schema:
-            $ref: '#/definitions/ErrorResponse'
-
-    500:
+          $ref: '#/definitions/ErrorResponse'
+      500:
         description: 서버 내부 오류
         schema:
-            $ref: '#/definitions/ErrorResponse'
+          $ref: '#/definitions/ErrorResponse'
     """
     data = request.get_json(force=True)
     username = data.get("username")
@@ -623,32 +620,30 @@ def delete_pod():
 
     parameters:
 
-    - in: body
+      - in: body
         name: body
         required: true
         schema:
-            $ref: '#/definitions/DeletePodRequest'
+          $ref: '#/definitions/DeletePodRequest'
 
     responses:
 
-    200:
+      200:
         description: Pod 삭제 성공
         schema:
-            type: object
-            properties:
-                status:
-                type: string
-                example: deleted
-
-    400:
+          type: object
+          properties:
+            status:
+              type: string
+              example: deleted
+      400:
         description: 잘못된 요청
         schema:
-            $ref: '#/definitions/ErrorResponse'
-
-    500:
+          $ref: '#/definitions/ErrorResponse'
+      500:
         description: 삭제 실패
         schema:
-            $ref: '#/definitions/ErrorResponse'
+          $ref: '#/definitions/ErrorResponse'
     """
 
     data = request.get_json(force=True)
@@ -846,45 +841,39 @@ def migrate():
 
     parameters:
 
-    - in: body
+      - in: body
         name: body
         required: true
         schema:
-            type: object
-            required:
-                - username
-                - nodes
-        properties:
-
+          type: object
+          required:
+            - username
+            - nodes
+          properties:
             username:
-            type: string
-            description: 사용자 이름
-            example: alice
-
+              type: string
+              description: 사용자 이름
+              example: alice
             nodes:
-            type: array
-            items:
+              type: array
+              items:
                 type: string
-            example:
+              example:
                 - gpu-node-1
                 - gpu-node-2
-
             min_improvement_ratio:
-            type: number
-            example: 0.2
+              type: number
+              example: 0.2
 
     responses:
 
-    200:
+      200:
         description: 마이그레이션 성공 또는 skip
-
-    400:
+      400:
         description: 잘못된 요청
-
-    404:
+      404:
         description: 실행 중 Pod 없음
-
-    500:
+      500:
         description: 서버 오류
     """
     data = request.get_json(force=True)
@@ -916,41 +905,35 @@ def create_or_resize_pvc():
 
     parameters:
 
-    - in: body
+      - in: body
         name: body
         schema:
-        type: object
-        properties:
-
+          type: object
+          properties:
             pvcs:
-            type: array
-            items:
+              type: array
+              items:
                 type: object
                 properties:
-
-                name:
+                  name:
                     type: string
                     example: alice
-
-                type:
+                  type:
                     type: string
                     enum:
-                    - user
-                    - group
-
-                storage:
+                      - user
+                      - group
+                  storage:
                     type: integer
                     example: 50
 
     responses:
 
-    200:
+      200:
         description: PVC 처리 결과
-
-    400:
+      400:
         description: 잘못된 요청
-
-    500:
+      500:
         description: 서버 오류
     """
     data = request.get_json(force=True)
@@ -1146,6 +1129,8 @@ def delete_pvc():
         description: 삭제 결과
       400:
         description: 잘못된 요청
+      500:
+        description: 서버 오류
     """
     data = request.get_json(force=True)
     pvcs = data.get("pvcs", [])
@@ -1245,8 +1230,10 @@ def list_users():
 
     responses:
 
-    200:
+      200:
         description: 사용자 목록 반환
+      500:
+        description: 서버 오류
     """
     try:
         lines = read_passwd_lines()
@@ -1290,72 +1277,60 @@ def get_user(username: str):
 
     parameters:
 
-    - in: path
-    name: username
-    required: true
-    type: string
-    description: 조회할 사용자 이름
-    example: user2100
+      - in: path
+        name: username
+        required: true
+        type: string
+        description: 조회할 사용자 이름
+        example: user2100
 
     responses:
 
-    200:
+      200:
         description: 사용자 정보 반환
         schema:
-        type: object
-        properties:
-
+          type: object
+          properties:
             user:
-            type: object
-            properties:
-
+              type: object
+              properties:
                 name:
-                type: string
-                example: user2100
-
+                  type: string
+                  example: user2100
                 uid:
-                type: integer
-                example: 2100
-
+                  type: integer
+                  example: 2100
                 gid:
-                type: integer
-                example: 2100
-
+                  type: integer
+                  example: 2100
                 home:
-                type: string
-                example: /home/user2100
-
+                  type: string
+                  example: /home/user2100
                 shell:
-                type: string
-                example: /bin/bash
-
+                  type: string
+                  example: /bin/bash
             groups:
-            type: array
-            items:
+              type: array
+              items:
                 type: object
                 properties:
-
-                name:
+                  name:
                     type: string
                     example: developers
-
-                gid:
+                  gid:
                     type: integer
                     example: 3001
-
-                type:
+                  type:
                     type: string
                     example: supplementary
-
-    404:
+      404:
         description: 사용자 없음
         schema:
-            $ref: '#/definitions/ErrorResponse'
-
-    500:
+          $ref: '#/definitions/ErrorResponse'
+      500:
         description: 서버 오류
         schema:
-            $ref: '#/definitions/ErrorResponse'
+          $ref: '#/definitions/ErrorResponse'
     """
     try:
         # Find user in passwd
@@ -1433,60 +1408,49 @@ def create_user():
 
     parameters:
 
-    - in: body
-    name: body
-    required: true
-    schema:
-
-        type: object
-        required:
-        - name
-        - uid
-        - gid
-        - passwd_sha512
-
-        properties:
-
-        name:
-            type: string
-            description: 사용자 이름
-            example: user2100
-
-        uid:
-            type: integer
-            description: 사용자 UID
-            example: 2100
-
-        gid:
-            type: integer
-            description: 기본 그룹 GID
-            example: 2100
-
-        passwd_sha512:
-            type: string
-            description: SHA-512 해시 패스워드
-            example: "$6$hash..."
-
-        gecos:
-            type: string
-            example: "GPU User"
-
-        primary_group_name:
-            type: string
-            example: user2100
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - name
+            - uid
+            - gid
+            - passwd_sha512
+          properties:
+            name:
+              type: string
+              description: 사용자 이름
+              example: user2100
+            uid:
+              type: integer
+              description: 사용자 UID
+              example: 2100
+            gid:
+              type: integer
+              description: 기본 그룹 GID
+              example: 2100
+            passwd_sha512:
+              type: string
+              description: SHA-512 해시 패스워드
+              example: "$6$hash..."
+            gecos:
+              type: string
+              example: "GPU User"
+            primary_group_name:
+              type: string
+              example: user2100
 
     responses:
 
-    201:
+      201:
         description: 사용자 생성 성공
-
-    400:
+      400:
         description: 필수 필드 누락
-
-    409:
+      409:
         description: 사용자 이미 존재
-
-    500:
+      500:
         description: 서버 오류
     """
     data = request.get_json(force=True)
@@ -1577,27 +1541,25 @@ def delete_user(username: str):
 
     parameters:
 
-    - in: path
-    name: username
-    required: true
-    type: string
-    example: user2100
+      - in: path
+        name: username
+        required: true
+        type: string
+        example: user2100
 
     responses:
 
-    200:
+      200:
         description: 삭제 성공
         schema:
-        type: object
-        properties:
+          type: object
+          properties:
             status:
-            type: string
-            example: deleted
-
-    404:
+              type: string
+              example: deleted
+      404:
         description: 사용자 없음
-
-    500:
+      500:
         description: 서버 오류
     """
     # Remove from /etc/passwd
@@ -1682,21 +1644,19 @@ def delete_group(groupname: str):
 
     parameters:
 
-    - in: path
-    name: groupname
-    required: true
-    type: string
-    example: developers
+      - in: path
+        name: groupname
+        required: true
+        type: string
+        example: developers
 
     responses:
 
-    200:
+      200:
         description: 삭제 성공
-
-    400:
+      400:
         description: primary group 사용 중
-
-    404:
+      404:
         description: 그룹 없음
     """
     # Check if group exists
@@ -1755,43 +1715,36 @@ def add_group():
 
     parameters:
 
-    - in: body
-    name: body
-    required: true
-    schema:
-
-        type: object
-        required:
-        - name
-        - gid
-
-        properties:
-
-        name:
-            type: string
-            example: developers
-
-        gid:
-            type: integer
-            example: 3001
-
-        members:
-            type: array
-            items:
-            type: string
-            example:
-            - user2100
-            - user2101
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - name
+            - gid
+          properties:
+            name:
+              type: string
+              example: developers
+            gid:
+              type: integer
+              example: 3001
+            members:
+              type: array
+              items:
+                type: string
+              example:
+                - user2100
+                - user2101
 
     responses:
 
-    201:
+      201:
         description: 그룹 생성 성공
-
-    400:
+      400:
         description: 잘못된 요청
-
-    409:
+      409:
         description: 그룹 이미 존재
     """
     data = request.get_json(force=True)
@@ -1848,37 +1801,32 @@ def add_user_groups(username: str):
 
     parameters:
 
-    - in: path
-    name: username
-    required: true
-    type: string
-    example: user2100
-
-    - in: body
-    name: body
-    required: true
-    schema:
-
-        type: object
-        properties:
-
-        groups:
-            type: array
-            items:
-            type: string
-            example:
-            - developers
-            - ai-lab
+      - in: path
+        name: username
+        required: true
+        type: string
+        example: user2100
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            groups:
+              type: array
+              items:
+                type: string
+              example:
+                - developers
+                - ai-lab
 
     responses:
 
-    200:
+      200:
         description: 그룹 추가 성공
-
-    404:
+      404:
         description: 사용자 또는 그룹 없음
-
-    400:
+      400:
         description: groups 필드 누락
     """
     data = request.get_json(force=True)
