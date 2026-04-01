@@ -121,37 +121,57 @@ def load_k8s():
         k8s_config.load_kube_config()
 
 # ////////////////////// 포트 할당 //////////////////////
+
+# reconcile 쓰로틀: 마지막 실행 시각(Unix timestamp). 앱 시작 시 0으로 초기화.
+_last_reconcile_ts: float = 0.0
+# 최소 실행 간격(초). allocate_nodeports() 호출 시 in-flight pod 오탐을 방지하기 위해
+# 5분 간격으로 제한한다. (allocate -> Service 생성까지 통상 30초 이내이므로 충분한 여유)
+_RECONCILE_INTERVAL_SEC: int = 300
+
+
 def reconcile_nodeport_allocations(namespace: str) -> int:
     """
-    MySQL의 nodeport_allocations 테이블과 실제 k8s NodePort Service 상태를 동기화
+    MySQL의 nodeport_allocations 테이블과 실제 k8s NodePort Service 상태를 동기화.
 
     문제 상황:
         - NodePort 할당 정보는 MySQL에 저장되고, 실제 Service는 k8s(etcd)에 존재.
-        - config-server를 거치지 않고 Service가 삭제되거나 (kubectl delete svc와 같은 상황)
-          config-server 자체가 비정상 종료되어 release_nodeports()가 호출되지 않으면
-          MySQL에는 포트가 점유된 채로 남아 포트 고갈이 발생 가능성 UP
+        - config-server를 거치지 않고 Service가 삭제되거나 (kubectl delete svc 등),
+          config-server 비정상 종료로 release_nodeports()가 호출되지 않으면
+          MySQL에 포트가 점유된 채로 남아 포트 고갈 발생 가능.
 
-    동기화 방향: k8s → MySQL  (k8s가 단일 소스)
-        - k8s에 실제로 존재하는 NodePort Service의 pod_name 목록을 조회한다.
-        - MySQL에는 있지만 k8s에 없는 pod_name 행을 stale로 판단하고 삭제한다.
+    동기화 방향: k8s -> MySQL  (k8s가 단일 진실 소스)
+        - k8s에 실제 존재하는 NodePort Service의 pod_name 목록 조회.
+        - MySQL에는 있지만 k8s에 없는 pod_name 행을 stale로 판단해 삭제.
 
-    호출 시점:
-        - allocate_nodeports() 시작 시 lazy하게 호출된다.
-        - 포트를 새로 점유하기 전에 항상 실제 상태와 맞춰 사용 가능 포트를 최대화한다.
+    In-flight 오탐 방지:
+        - allocate_nodeports() 이후 create_nodeport_services() 전까지
+          DB에는 pod_name이 있지만 k8s Service는 아직 없는 구간이 존재한다.
+        - 이 구간에 reconcile이 실행되면 새 pod를 stale로 오판할 수 있다.
+        - _RECONCILE_INTERVAL_SEC(300초) 쓰로틀로 이 문제를 방지한다.
 
     Args:
         namespace: NodePort Service가 존재하는 k8s 네임스페이스
 
     Returns:
-        int: 삭제된 stale 행 수 (0이면 동기화 불필요했음을 의미)
+        int: 삭제된 stale 행 수 (0이면 동기화 불필요 또는 쓰로틀로 스킵)
     """
+    global _last_reconcile_ts
+
+    # ── 쓰로틀 체크: 마지막 실행으로부터 _RECONCILE_INTERVAL_SEC 이내면 스킵 ──
+    now = time.time()
+    elapsed = now - _last_reconcile_ts
+    if elapsed < _RECONCILE_INTERVAL_SEC:
+        app.logger.debug(
+            f"[RECONCILE] skipped (throttle: {int(_RECONCILE_INTERVAL_SEC - elapsed)}s remaining)"
+        )
+        return 0
+
     app.logger.info(f"[RECONCILE] start namespace={namespace}")
 
     # ── 1. k8s에서 실제 살아있는 NodePort Service의 pod_name 집합 조회 ──
-    #    label_selector로 config-server가 관리하는 Service만 필터링한다.
+    #    label_selector로 config-server가 관리하는 Service만 필터링.
     #    (app=containerssh-nodeport 라벨은 create_nodeport_services()에서 부여)
-    from utils import load_k8s
-    load_k8s()
+    load_k8s()  # utils.load_k8s — main.py 상단 import에서 가져옴
     v1 = client.CoreV1Api()
 
     try:
@@ -159,13 +179,12 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
             namespace=namespace,
             label_selector="app=containerssh-nodeport"
         )
-    except Exception:
-        # k8s API 조회 실패 시 reconcile을 건너뛰기.
-        # 포트 할당은 계속 진행하되, 다음 호출 때 다시 시도.
-        app.logger.warning("[RECONCILE] k8s API call failed, skipping reconcile")
+    except Exception as e:
+        # k8s API 실패 시 reconcile 스킵. 포트 할당은 계속하고 다음 주기에 재시도.
+        app.logger.warning("[RECONCILE] k8s API call failed, skipping reconcile: %s", e, exc_info=True)
         return 0
 
-    # Service 메타데이터의 pod_name 라벨에서 실제 살아있는 pod 이름 수집
+    # Service 메타데이터의 pod_name 라벨에서 살아있는 pod 이름 수집
     live_pod_names = {
         svc.metadata.labels["pod_name"]
         for svc in services.items
@@ -175,7 +194,7 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
 
     # ── 2. MySQL에서 현재 점유 중인 pod_name 목록 조회 ──
     conn = get_db_connection()
-    deleted_count = 0 #삭제된 stale 행 수
+    deleted_count = 0
 
     try:
         with conn.cursor() as cur:
@@ -188,11 +207,12 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
 
             if not stale_pod_names:
                 app.logger.info("[RECONCILE] no stale entries, DB is in sync")
+                _last_reconcile_ts = time.time()
                 return 0
 
             app.logger.info(f"[RECONCILE] stale pods to remove: {stale_pod_names}")
 
-            # stale pod의 모든 NodePort 할당 행을 삭제한다.
+            # stale pod의 모든 NodePort 할당 행을 삭제
             for pod in stale_pod_names:
                 cur.execute(
                     "DELETE FROM nodeport_allocations WHERE pod_name=%s",
@@ -202,14 +222,14 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
                 app.logger.info(f"[RECONCILE] removed {cur.rowcount} rows for stale pod={pod}")
 
         conn.commit()
+        _last_reconcile_ts = time.time()
         app.logger.info(f"[RECONCILE] done, total deleted={deleted_count}")
         return deleted_count
 
     except Exception:
         app.logger.exception("[RECONCILE] failed, rolling back")
         conn.rollback()
-        # reconcile 실패는 치명적이지 않으므로 예외를 삼키고 0을 반환.
-        # allocate_nodeports()는 stale 제거 없이 계속 진행.
+        # reconcile 실패는 non-fatal. allocate_nodeports()는 stale 제거 없이 계속 진행.
         return 0
     finally:
         conn.close()
@@ -227,9 +247,10 @@ def allocate_nodeports(username, pod_name, node_name, ports):
     app.logger.info(f"[NODEPORT] allocate start username={username} pod={pod_name} node={node_name}")
     app.logger.debug(f"[NODEPORT] requested ports={ports}")
 
-    # 포트 할당 전에 MySQL과 k8s 실제 상태를 먼저 동기화한다.
-    # stale 행이 정리되어야 available 포트 계산이 정확해져야함.
-    reconcile_nodeport_allocations(namespace=app.config["NAMESPACE"]) #포트 할당 전에 MySQL과 k8s 실제 상태를 먼저 동기화
+    # 포트 할당 전에 MySQL과 k8s 실제 상태를 동기화한다.
+    # stale 행이 정리되어야 available 포트 계산이 정확해진다.
+    # 5분 쓰로틀 적용 — in-flight pod 오탐 방지 및 k8s/DB 부하 경감.
+    reconcile_nodeport_allocations(namespace=app.config["NAMESPACE"])
 
     conn = get_db_connection() #DB 연결
 
@@ -880,7 +901,7 @@ def _migrate_internal(data):
             break
         time.sleep(1)
     else:
-        # 새 Pod 실패 → 정리 후 종료
+        # 새 Pod 실패 -> 정리 후 종료
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
         return jsonify({"error": "new pod failed to start"}), 500
@@ -1095,7 +1116,7 @@ def create_or_resize_pvc():
                 try:
                     existing_pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
                     app.logger.info(f"PVC {pvc_name} already exists, performing resize operation")
-                    # Exists → resize
+                    # Exists -> resize
                     patch_body = {
                         "spec": {
                             "resources": {
