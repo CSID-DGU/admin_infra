@@ -30,6 +30,7 @@ from utils import (
     delete_directory_if_exists,
     get_group_members_home_volumes,
     select_best_node_from_prometheus,
+    resolve_k8s_node_name,
     load_user_image,
     commit_and_save_user_image,
     create_nodeport_services,
@@ -167,6 +168,10 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
         return 0
 
     app.logger.info(f"[RECONCILE] start namespace={namespace}")
+    # 쓰로틀 기준 시각: 성공/실패와 무관하게 "시도" 단위로 갱신한다.
+    # k8s·DB 오류로 조기 return 되면 이전에는 타임스탬프가 안 바뀌어 연속 재호출 시 스로틀이 무려화됐고,
+    # in-flight(Pod 행만 있고 Service 아직 없음) 구간에서 오삭제 위험이 커졌다.
+    _last_reconcile_ts = time.time()
 
     # ── 1. k8s에서 실제 살아있는 NodePort Service의 pod_name 집합 조회 ──
     #    label_selector로 config-server가 관리하는 Service만 필터링.
@@ -207,7 +212,6 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
 
             if not stale_pod_names:
                 app.logger.info("[RECONCILE] no stale entries, DB is in sync")
-                _last_reconcile_ts = time.time()
                 return 0
 
             app.logger.info(f"[RECONCILE] stale pods to remove: {stale_pod_names}")
@@ -222,7 +226,6 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
                 app.logger.info(f"[RECONCILE] removed {cur.rowcount} rows for stale pod={pod}")
 
         conn.commit()
-        _last_reconcile_ts = time.time()
         app.logger.info(f"[RECONCILE] done, total deleted={deleted_count}")
         return deleted_count
 
@@ -268,7 +271,7 @@ def allocate_nodeports(username, pod_name, node_name, ports):
             app.logger.debug(f"[NODEPORT] available ports count={len(available)}")
 
             if len(available) < len(ports):
-                raise Exception("Not enough NodePorts")
+                raise ValueError("Not enough NodePorts")
 
             result_ports = []
 
@@ -436,12 +439,15 @@ def create_pod():
         # Pod spec 생성
         app.logger.info("[CREATE POD] building pod spec")
 
-        spec_wrapper, allocated_ports = build_pod_spec(
-            username,
-            user_info,
-            best_node,
-            pod_name
-        )
+        try:
+            spec_wrapper, allocated_ports = build_pod_spec(
+                username,
+                user_info,
+                best_node,
+                pod_name
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
         app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
 
         pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
@@ -516,6 +522,15 @@ def build_pod_spec(
     app.logger.debug(f"[POD SPEC] user_info={user_info}")
     ns = app.config["NAMESPACE"]
 
+    canonical = resolve_k8s_node_name(target_node)
+    if not canonical:
+        raise ValueError(f"unknown kubernetes node: {target_node!r}")
+    if canonical != target_node:
+        app.logger.info(
+            f"[POD SPEC] nodeName will use canonical {canonical!r} (was {target_node!r})"
+        )
+    target_node = canonical
+
     image = load_user_image(username, user_info["image"])
     uid = user_info["uid"]
     gid_list = user_info["gid"]
@@ -544,8 +559,9 @@ def build_pod_spec(
     memory_limit = app.config["DEFAULT_MEM_LIMIT"]
     num_gpu = 0
 
+    tn_key = target_node.lower()
     for node in gpu_nodes:
-        if node["node_name"] == target_node:
+        if (node.get("node_name") or "").lower() == tn_key:
             cpu_limit = node.get("cpu_limit", cpu_limit)
             memory_limit = node.get("memory_limit", memory_limit)
             num_gpu = node.get("num_gpu", 0)
@@ -813,6 +829,15 @@ def _migrate_internal(data):
 
     ns = app.config["NAMESPACE"]
 
+    if nodes:
+        canon = []
+        for n in nodes:
+            c = resolve_k8s_node_name(n)
+            if not c:
+                return jsonify({"error": f"unknown kubernetes node: {n!r}"}), 400
+            canon.append(c)
+        nodes = canon
+
     # 1. 현재 Pod 확인
     old_pod_name = get_existing_pod(ns, username)
     if not old_pod_name:
@@ -879,12 +904,15 @@ def _migrate_internal(data):
     new_pod_name = generate_pod_name(username)
 
     # 7. 새 노드에서 Pod 재생성
-    spec_wrapper, allocated_ports = build_pod_spec(
-        username,
-        user_info,
-        best_node,
-        new_pod_name
-    )
+    try:
+        spec_wrapper, allocated_ports = build_pod_spec(
+            username,
+            user_info,
+            best_node,
+            new_pod_name
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
 
