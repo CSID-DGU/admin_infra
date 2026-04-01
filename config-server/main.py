@@ -421,7 +421,11 @@ def create_pod():
             app.logger.debug("[CREATE POD] pod does not exist yet")
 
         # Prometheus 기반 노드 선택
-        node_list = [n["node_name"] for n in user_info["gpu_nodes"]]
+        node_list = [
+            str(n["node_name"]).strip().lower()
+            for n in user_info["gpu_nodes"]
+            if n.get("node_name")
+        ]
         app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
 
         best_node = select_best_node_from_prometheus(
