@@ -30,6 +30,7 @@ from utils import (
     delete_directory_if_exists,
     get_group_members_home_volumes,
     select_best_node_from_prometheus,
+    resolve_k8s_node_name,
     load_user_image,
     commit_and_save_user_image,
     create_nodeport_services,
@@ -143,12 +144,6 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
         - k8s에 실제 존재하는 NodePort Service의 pod_name 목록 조회.
         - MySQL에는 있지만 k8s에 없는 pod_name 행을 stale로 판단해 삭제.
 
-    In-flight 오탐 방지:
-        - allocate_nodeports() 이후 create_nodeport_services() 전까지
-          DB에는 pod_name이 있지만 k8s Service는 아직 없는 구간이 존재한다.
-        - 이 구간에 reconcile이 실행되면 새 pod를 stale로 오판할 수 있다.
-        - _RECONCILE_INTERVAL_SEC(300초) 쓰로틀로 이 문제를 방지한다.
-
     Args:
         namespace: NodePort Service가 존재하는 k8s 네임스페이스
 
@@ -167,6 +162,8 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
         return 0
 
     app.logger.info(f"[RECONCILE] start namespace={namespace}")
+    # 쓰로틀 기준 시각: 성공/실패와 무관하게 "시도" 단위로 갱신한다.
+    _last_reconcile_ts = time.time()
 
     # ── 1. k8s에서 실제 살아있는 NodePort Service의 pod_name 집합 조회 ──
     #    label_selector로 config-server가 관리하는 Service만 필터링.
@@ -207,7 +204,6 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
 
             if not stale_pod_names:
                 app.logger.info("[RECONCILE] no stale entries, DB is in sync")
-                _last_reconcile_ts = time.time()
                 return 0
 
             app.logger.info(f"[RECONCILE] stale pods to remove: {stale_pod_names}")
@@ -222,7 +218,6 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
                 app.logger.info(f"[RECONCILE] removed {cur.rowcount} rows for stale pod={pod}")
 
         conn.commit()
-        _last_reconcile_ts = time.time()
         app.logger.info(f"[RECONCILE] done, total deleted={deleted_count}")
         return deleted_count
 
@@ -248,8 +243,8 @@ def allocate_nodeports(username, pod_name, node_name, ports):
     app.logger.debug(f"[NODEPORT] requested ports={ports}")
 
     # 포트 할당 전에 MySQL과 k8s 실제 상태를 동기화한다.
-    # stale 행이 정리되어야 available 포트 계산이 정확해진다.
-    # 5분 쓰로틀 적용 — in-flight pod 오탐 방지 및 k8s/DB 부하 경감.
+    # stale 행이 정리되어야 available 포트 계산이 정확해짐/
+    # 5분 쓰로틀 적용 — in-flight pod 오탐 방지 및 k8s/DB 부하 줄어듬
     reconcile_nodeport_allocations(namespace=app.config["NAMESPACE"])
 
     conn = get_db_connection() #DB 연결
@@ -268,7 +263,7 @@ def allocate_nodeports(username, pod_name, node_name, ports):
             app.logger.debug(f"[NODEPORT] available ports count={len(available)}")
 
             if len(available) < len(ports):
-                raise Exception("Not enough NodePorts")
+                raise ValueError("Not enough NodePorts")
 
             result_ports = []
 
@@ -300,7 +295,10 @@ def allocate_nodeports(username, pod_name, node_name, ports):
             conn.commit() #Commit changes to stable storage.
             return result_ports #Return the allocated ports.
 
-    except:
+    except ValueError:
+        conn.rollback()
+        raise
+    except Exception:
         app.logger.exception(f"[NODEPORT] allocation failed pod={pod_name}")
         conn.rollback()
         raise
@@ -432,16 +430,23 @@ def create_pod():
             app.config["HTTP_TIMEOUT_SEC"]
         )
         app.logger.info(f"[CREATE POD] selected best node: {best_node}")
-        
+
         # Pod spec 생성
         app.logger.info("[CREATE POD] building pod spec")
 
-        spec_wrapper, allocated_ports = build_pod_spec(
-            username,
-            user_info,
-            best_node,
-            pod_name
-        )
+        try:
+            if not best_node:
+                raise ValueError(
+                    "no suitable node selected (check gpu_nodes and Prometheus metrics)"
+                )
+            spec_wrapper, allocated_ports = build_pod_spec(
+                username,
+                user_info,
+                best_node,
+                pod_name
+            )
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
         app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
 
         pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
@@ -516,6 +521,15 @@ def build_pod_spec(
     app.logger.debug(f"[POD SPEC] user_info={user_info}")
     ns = app.config["NAMESPACE"]
 
+    canonical = resolve_k8s_node_name(target_node)
+    if not canonical:
+        raise ValueError(f"unknown kubernetes node: {target_node!r}")
+    if canonical != target_node:
+        app.logger.info(
+            f"[POD SPEC] nodeName will use canonical {canonical!r} (was {target_node!r})"
+        )
+    target_node = canonical
+
     image = load_user_image(username, user_info["image"])
     uid = user_info["uid"]
     gid_list = user_info["gid"]
@@ -538,182 +552,190 @@ def build_pod_spec(
         node_name=target_node,
         ports=ports
     )
-    app.logger.info(f"[POD SPEC] allocated_ports={allocated_ports}")
-
-    cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
-    memory_limit = app.config["DEFAULT_MEM_LIMIT"]
-    num_gpu = 0
-
-    for node in gpu_nodes:
-        if node["node_name"] == target_node:
-            cpu_limit = node.get("cpu_limit", cpu_limit)
-            memory_limit = node.get("memory_limit", memory_limit)
-            num_gpu = node.get("num_gpu", 0)
-            break
-
-    app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
-
-    pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
-    app.logger.debug(f"[POD SPEC] pvc_name={pvc_name}")
-
-    gpu_volume_mounts = []
-    gpu_volumes = []
-
-    if num_gpu > 0:
-        for i in range(num_gpu):
-            gpu_volume_mounts.append({
-                "name": f"nvidia{i}",
-                "mountPath": f"/dev/nvidia{i}"
-            })
-            gpu_volumes.append({
-                "name": f"nvidia{i}",
-                "hostPath": {
-                    "path": f"/dev/nvidia{i}",
-                    "type": "CharDevice"
-                }
-            })
-
-        for dev in app.config["NVIDIA_AUX_DEVICES"]:
-            mount_name = dev.replace("-", "")
-            gpu_volume_mounts.append({
-                "name": mount_name,
-                "mountPath": f"/dev/{dev}"
-            })
-            gpu_volumes.append({
-                "name": mount_name,
-                "hostPath": {
-                    "path": f"/dev/{dev}",
-                    "type": "CharDevice"
-                }
-            })
-            
-    volume_mounts = [{
-        "name": "user-home",
-        "mountPath": f"/home/{username}",
-        "readOnly": False
-    }]
-    volume_mounts.append({
-        "name": "image-store",
-        "mountPath": "/image-store",
-        "readOnly": False
-    })
-    volumes = [{
-        "name": "user-home",
-        "persistentVolumeClaim": {
-            "claimName": pvc_name
-        }
-    }]
-    volumes.append({
-        "name": "image-store",
-        "persistentVolumeClaim": {
-            "claimName": "pvc-image-store"
-        }
-    })
-
-    volume_mounts.extend(gpu_volume_mounts)
-    volumes.extend(gpu_volumes)
-
-    app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
-
-    group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
-    volume_mounts.extend(group_mounts)
-    volumes.extend(group_vols)
-
-    host_etc_mounts = []
-    for sub in app.config["HOST_ETC_SUBPATHS"]:
-        sub_fmt = sub.format(username=username)
-        mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
-        host_etc_mounts.append({
-            "name": "host-etc",
-            "mountPath": mount_path,
-            "subPath": sub_fmt,
-            "readOnly": True
+    try:
+        app.logger.info(f"[POD SPEC] allocated_ports={allocated_ports}")
+        cpu_limit = app.config["DEFAULT_CPU_LIMIT"]
+        memory_limit = app.config["DEFAULT_MEM_LIMIT"]
+        num_gpu = 0
+    
+        tn_key = target_node.lower()
+        for node in gpu_nodes:
+            if (node.get("node_name") or "").lower() == tn_key:
+                cpu_limit = node.get("cpu_limit", cpu_limit)
+                memory_limit = node.get("memory_limit", memory_limit)
+                num_gpu = node.get("num_gpu", 0)
+                break
+    
+        app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
+    
+        pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
+        app.logger.debug(f"[POD SPEC] pvc_name={pvc_name}")
+    
+        gpu_volume_mounts = []
+        gpu_volumes = []
+    
+        if num_gpu > 0:
+            for i in range(num_gpu):
+                gpu_volume_mounts.append({
+                    "name": f"nvidia{i}",
+                    "mountPath": f"/dev/nvidia{i}"
+                })
+                gpu_volumes.append({
+                    "name": f"nvidia{i}",
+                    "hostPath": {
+                        "path": f"/dev/nvidia{i}",
+                        "type": "CharDevice"
+                    }
+                })
+    
+            for dev in app.config["NVIDIA_AUX_DEVICES"]:
+                mount_name = dev.replace("-", "")
+                gpu_volume_mounts.append({
+                    "name": mount_name,
+                    "mountPath": f"/dev/{dev}"
+                })
+                gpu_volumes.append({
+                    "name": mount_name,
+                    "hostPath": {
+                        "path": f"/dev/{dev}",
+                        "type": "CharDevice"
+                    }
+                })
+                
+        volume_mounts = [{
+            "name": "user-home",
+            "mountPath": f"/home/{username}",
+            "readOnly": False
+        }]
+        volume_mounts.append({
+            "name": "image-store",
+            "mountPath": "/image-store",
+            "readOnly": False
         })
-    volume_mounts.extend(host_etc_mounts)
-
-    volumes.append({
-        "name": "host-etc",
-        "hostPath": {"path": "/etc", "type": "Directory"}
-    })
-
-    spec = {
-                "config": {
-                    "backend": "kubernetes",
-                    "kubernetes": {
-                        "connection": {
-                                "host": "https://kubernetes.default.svc",
-                                "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-                                "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"
-                            },
-                        "pod": {
-                            "metadata": {
-                                "name": pod_name,
-                                "namespace": ns,
-                                "labels": {
-                                    "app": "containerssh-guest",
-                                    "managed-by": "containerssh",
-                                    "containerssh_username": username,
-                                    "containerssh_pod_name": pod_name
-                                }
-                            },
-                            "spec": {
-                                    "nodeName": target_node,
-                                    "securityContext": {
-                                        "runAsUser": uid,
-                                        "runAsGroup": uid,
-                                        "fsGroup": uid
-                                        # "runAsGroup": gid,
-                                        # "fsGroup": gid
-                                    },
-                                    "containers": [
-                                        {
-                                            "name": "shell",
-                                            "image": image,
-                                            "imagePullPolicy": "Never",
-                                            "stdin": True,
-                                            "tty": True,
-                                            "ports": [
-                                                {
-                                                    "containerPort": m["internal_port"],
-                                                    "protocol": "TCP"
-                                                }
-                                                for m in allocated_ports
-                                            ],
-                                            "env": [
-                                                {"name": "USER", "value": username},
-                                                {"name": "USER_ID", "value": username},
-                                                {"name": "USER_PW", "value": "1234"},
-                                                {"name": "UID", "value": str(uid)},
-                                                {"name": "HOME", "value": f"/home/{username}"},
-                                                {"name": "SHELL", "value": "/bin/bash"}
-                                            ],
-                                            "resources": {
-                                                "requests": {
-                                                    "cpu": app.config["DEFAULT_CPU_REQUEST"],
-                                                    "memory": app.config["DEFAULT_MEM_REQUEST"]
+        volumes = [{
+            "name": "user-home",
+            "persistentVolumeClaim": {
+                "claimName": pvc_name
+            }
+        }]
+        volumes.append({
+            "name": "image-store",
+            "persistentVolumeClaim": {
+                "claimName": "pvc-image-store"
+            }
+        })
+    
+        volume_mounts.extend(gpu_volume_mounts)
+        volumes.extend(gpu_volumes)
+    
+        app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
+    
+        group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
+        volume_mounts.extend(group_mounts)
+        volumes.extend(group_vols)
+    
+        host_etc_mounts = []
+        for sub in app.config["HOST_ETC_SUBPATHS"]:
+            sub_fmt = sub.format(username=username)
+            mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
+            host_etc_mounts.append({
+                "name": "host-etc",
+                "mountPath": mount_path,
+                "subPath": sub_fmt,
+                "readOnly": True
+            })
+        volume_mounts.extend(host_etc_mounts)
+    
+        volumes.append({
+            "name": "host-etc",
+            "hostPath": {"path": "/etc", "type": "Directory"}
+        })
+    
+        spec = {
+                    "config": {
+                        "backend": "kubernetes",
+                        "kubernetes": {
+                            "connection": {
+                                    "host": "https://kubernetes.default.svc",
+                                    "cacertFile": "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                                    "bearerTokenFile": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+                                },
+                            "pod": {
+                                "metadata": {
+                                    "name": pod_name,
+                                    "namespace": ns,
+                                    "labels": {
+                                        "app": "containerssh-guest",
+                                        "managed-by": "containerssh",
+                                        "containerssh_username": username,
+                                        "containerssh_pod_name": pod_name
+                                    }
+                                },
+                                "spec": {
+                                        "nodeName": target_node,
+                                        "securityContext": {
+                                            "runAsUser": uid,
+                                            "runAsGroup": uid,
+                                            "fsGroup": uid
+                                            # "runAsGroup": gid,
+                                            # "fsGroup": gid
+                                        },
+                                        "containers": [
+                                            {
+                                                "name": "shell",
+                                                "image": image,
+                                                "imagePullPolicy": "Never",
+                                                "stdin": True,
+                                                "tty": True,
+                                                "ports": [
+                                                    {
+                                                        "containerPort": m["internal_port"],
+                                                        "protocol": "TCP"
+                                                    }
+                                                    for m in allocated_ports
+                                                ],
+                                                "env": [
+                                                    {"name": "USER", "value": username},
+                                                    {"name": "USER_ID", "value": username},
+                                                    {"name": "USER_PW", "value": "1234"},
+                                                    {"name": "UID", "value": str(uid)},
+                                                    {"name": "HOME", "value": f"/home/{username}"},
+                                                    {"name": "SHELL", "value": "/bin/bash"}
+                                                ],
+                                                "resources": {
+                                                    "requests": {
+                                                        "cpu": app.config["DEFAULT_CPU_REQUEST"],
+                                                        "memory": app.config["DEFAULT_MEM_REQUEST"]
+                                                    },
+                                                    "limits": {
+                                                        "cpu": cpu_limit,
+                                                        "memory": memory_limit
+                                                    }
                                                 },
-                                                "limits": {
-                                                    "cpu": cpu_limit,
-                                                    "memory": memory_limit
-                                                }
-                                            },
-                                            "volumeMounts": volume_mounts
-                                        }
-                                    ],
-                                    "volumes": volumes,
-                                    "restartPolicy": "Never"
+                                                "volumeMounts": volume_mounts
+                                            }
+                                        ],
+                                        "volumes": volumes,
+                                        "restartPolicy": "Never"
+                                    }
                                 }
                             }
-                        }
-                    },
-                    "environment": {
-                        "USER": {"value": username, "sensitive": False}
-                    },
-                    "metadata": {},
-                    "files": {}
-                }
-    app.logger.info(f"[POD SPEC] complete pod_name={pod_name}")
-    return spec, allocated_ports
+                        },
+                        "environment": {
+                            "USER": {"value": username, "sensitive": False}
+                        },
+                        "metadata": {},
+                        "files": {}
+                    }
+        app.logger.info(f"[POD SPEC] complete pod_name={pod_name}")
+        return spec, allocated_ports
+    except Exception:
+        app.logger.warning(
+            "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s",
+            pod_name,
+        )
+        release_nodeports(pod_name)
+        raise
 
 # //////////////////////// Pod 삭제 //////////////////////
 
@@ -813,6 +835,15 @@ def _migrate_internal(data):
 
     ns = app.config["NAMESPACE"]
 
+    if nodes:
+        canon = []
+        for n in nodes:
+            c = resolve_k8s_node_name(n)
+            if not c:
+                return jsonify({"error": f"unknown kubernetes node: {n!r}"}), 400
+            canon.append(c)
+        nodes = canon
+
     # 1. 현재 Pod 확인
     old_pod_name = get_existing_pod(ns, username)
     if not old_pod_name:
@@ -879,12 +910,15 @@ def _migrate_internal(data):
     new_pod_name = generate_pod_name(username)
 
     # 7. 새 노드에서 Pod 재생성
-    spec_wrapper, allocated_ports = build_pod_spec(
-        username,
-        user_info,
-        best_node,
-        new_pod_name
-    )
+    try:
+        spec_wrapper, allocated_ports = build_pod_spec(
+            username,
+            user_info,
+            best_node,
+            new_pod_name
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
 
