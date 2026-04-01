@@ -41,6 +41,35 @@ def load_k8s():
         app.logger.debug("In-cluster config failed, loading kubeconfig")
         k8s_config.load_kube_config()
 
+
+def resolve_k8s_node_name(candidate: Optional[str]) -> Optional[str]:
+    """
+    WAS/Prometheus 등에서 온 node 이름과 실제 Node.metadata.name 대소문자가
+    달라도 cluster에 등록된 정식 이름으로 맞추자 nodeName 바인딩은 대소문자까지 일치해야 한다.
+    """
+    if candidate is None:
+        return None
+    s = str(candidate).strip()
+    if not s:
+        return None
+    load_k8s()
+    v1 = client.CoreV1Api()
+    try:
+        resp = v1.list_node()
+    except Exception:
+        app.logger.exception("[NODE] list_node failed while resolving %r", s)
+        return None
+    key = s.lower()
+    for n in resp.items or []:
+        if n.metadata.name.lower() == key:
+            real = n.metadata.name
+            if real != s:
+                app.logger.info("[NODE] resolved node name %r -> %r", s, real)
+            return real
+    app.logger.warning("[NODE] no cluster node matches %r (case-insensitive)", s)
+    return None
+
+
 def is_pod_ready(pod):
     if pod.status.phase != "Running":
         return False
