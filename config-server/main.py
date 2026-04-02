@@ -528,6 +528,9 @@ def build_pod_spec(
     app.logger.debug(f"[POD SPEC] user_info={user_info}")
     ns = app.config["NAMESPACE"]
 
+    # subPath mounts require the source files to already exist on the NFS share.
+    ensure_etc_layout()
+
     canonical = resolve_k8s_node_name(target_node)
     if not canonical:
         raise ValueError(f"unknown kubernetes node: {target_node!r}")
