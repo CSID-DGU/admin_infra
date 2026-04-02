@@ -37,6 +37,8 @@ spec:
               value: "{{ .Values.nfs.server }}"
             - name: NFS_PATH
               value: "{{ .Values.nfs.path }}"
+            - name: SUDO_ALLOWED_COMMANDS
+              value: "{{ .Values.security.sudoAllowedCommands }}"
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
           readinessProbe:
