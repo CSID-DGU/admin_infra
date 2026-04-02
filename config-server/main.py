@@ -687,7 +687,7 @@ def build_pod_spec(
                     source_subpath = "bash.bash_logout"
                 elif sub == "bashrc":
                     mount_path = f"/home/{username}/.bashrc"
-                    source_subpath = "bash.bashrc"
+                    source_subpath = "bashrc"
                 else:
                     mount_path = f"/etc/{sub_fmt}"
                     source_subpath = sub_fmt
