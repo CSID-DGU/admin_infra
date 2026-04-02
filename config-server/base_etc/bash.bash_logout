@@ -1,0 +1,77 @@
+#!/bin/bash
+# SSH Session Logout Handler
+# This script runs when a user logs out from their shell session
+
+# ============================================================================
+# Custom Logout Hooks - Add your extended functionality here
+# ============================================================================
+# Create log directory in persistent storage
+log_dir="$HOME/.kube_logs"
+mkdir -p "$log_dir"
+
+# Log file path
+log_file="$log_dir/logout.log"
+
+# Get initial timestamp for start message
+initial_utc_epoch=$(date -u +%s)
+initial_kst_epoch=$((initial_utc_epoch + 32400))
+initial_timestamp=$(date -d "@$initial_kst_epoch" '+%Y-%m-%d %H:%M:%S KST' 2>/dev/null) || initial_timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+echo "[$initial_timestamp] start logout process" >> "$log_file"
+
+# ============================================================================
+# Custom function called before logout processing
+on_farewell_custom() {
+    # Get timestamp inside function to ensure it's available
+    local utc_epoch=$(date -u +%s)
+    local kst_epoch=$((utc_epoch + 32400))
+    local timestamp=$(date -d "@$kst_epoch" '+%Y-%m-%d %H:%M:%S KST' 2>/dev/null) || timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    local pod_name
+    pod_name=$(hostname)
+
+    echo "[$timestamp] start farewell process" >> "$log_file"
+
+    # Add timeout and better error handling for curl
+    if curl -s --connect-timeout 10 --max-time 30 -X POST "http://210.94.179.19:9732/report-background" \
+        -H "Content-Type: application/json" \
+        -d "{\"username\": \"$USER\", \"pod_name\": \"$pod_name\"}" \
+        >> "$log_file" 2>&1; then
+        echo "[$timestamp] Report sent for user '$USER', pod '$pod_name'" >> "$log_file"
+    else
+        echo "[$timestamp] Failed to send report for user '$USER', pod '$pod_name'" >> "$log_file"
+    fi
+
+    return 0
+}
+# Get current timestamp in Korean time - simplified approach
+utc_epoch=$(date -u +%s)
+kst_epoch=$((utc_epoch + 32400))
+timestamp=$(date -d "@$kst_epoch" '+%Y-%m-%d %H:%M:%S KST' 2>/dev/null) || timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+user=${USER:-"unknown"}
+hostname=$(hostname 2>/dev/null || echo "unknown")
+# Use original PID if available, otherwise current PID
+actual_pid=${ORIGINAL_PID:-$$}
+
+# Execute custom logout hook first
+echo "[$timestamp] About to call on_farewell_custom" >> "$log_file"
+on_farewell_custom
+hook_result=$?
+echo "[$timestamp] on_farewell_custom returned with code: $hook_result" >> "$log_file"
+
+# Check if custom hook blocked the logout
+if [ $hook_result -ne 0 ]; then
+    echo "[$timestamp] Logout blocked by custom hook (exit code: $hook_result)" >> "$log_file"
+    exit $hook_result
+fi
+
+# Write logout event to log file
+echo "[$timestamp] User '$user' logged out from hostname '$hostname' (PID: $actual_pid)" >> "$log_file"
+
+# Also log environment info for debugging
+echo "[$timestamp] Environment: HOME=$HOME, PWD=$PWD, SHELL=$SHELL, Monitor_PID=${ORIGINAL_PID:-'not_set'}" >> "$log_file"
+
+# Ensure log file is readable
+chmod 644 "$log_file"
+
+exit 0
