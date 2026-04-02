@@ -28,3 +28,30 @@ roleRef:
   kind: Role
   name: config-server-role
   apiGroup: rbac.authorization.k8s.io
+---
+# nodes는 cluster-scoped — resolve_k8s_node_name() 등에서 list/get node 필요
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "containerssh-config-server.fullname" . }}-node-reader
+  labels:
+    app: containerssh-config-server
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "containerssh-config-server.fullname" . }}-node-reader-binding
+  labels:
+    app: containerssh-config-server
+subjects:
+  - kind: ServiceAccount
+    name: config-server
+    namespace: {{ .Values.config.namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "containerssh-config-server.fullname" . }}-node-reader
+  apiGroup: rbac.authorization.k8s.io
