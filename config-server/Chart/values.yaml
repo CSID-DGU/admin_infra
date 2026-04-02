@@ -24,6 +24,9 @@ nfs:
   server: "192.168.2.30"
   path: "/volume1/share"
 
+security:
+  sudoAllowedCommands: ""
+
 
 config:
   namespace: ailab-infra

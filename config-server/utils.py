@@ -13,6 +13,8 @@ from kubernetes.stream import stream
 from flask import current_app as app
 from bg_img_redis import save_image_metadata, get_image_metadata
 
+DEFAULT_BASE_ETC_TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "base_etc")
+
 def get_db_connection():
     try:
         app.logger.debug("Creating DB connection")
@@ -329,12 +331,41 @@ def ensure_file(path: str) -> None:
         with open(path, "a"):
             pass
 
+
+def ensure_seeded_file(path: str, template_name: str) -> None:
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+    template_dir = app.config.get("BASE_ETC_TEMPLATE_DIR", DEFAULT_BASE_ETC_TEMPLATE_DIR)
+    template_path = os.path.join(template_dir, template_name)
+
+    with open(path, "a+", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            return
+
+        if not os.path.exists(template_path):
+            app.logger.warning("[ETC INIT] template missing for %s: %s", path, template_path)
+            return
+
+        with open(template_path, "r", encoding="utf-8") as tf:
+            content = tf.read()
+
+        f.seek(0)
+        f.write(content)
+        f.truncate()
+        app.logger.info("[ETC INIT] seeded %s from %s", path, template_path)
+
 def ensure_etc_layout() -> None:
     ensure_dir(app.config["BASE_ETC_DIR"])
     ensure_dir(app.config["SUDOERS_DIR"])
-    ensure_file(app.config["PASSWD_PATH"])
-    ensure_file(app.config["GROUP_PATH"])
-    ensure_file(app.config["SHADOW_PATH"])
+    ensure_seeded_file(app.config["PASSWD_PATH"], "passwd")
+    ensure_seeded_file(app.config["GROUP_PATH"], "group")
+    ensure_seeded_file(app.config["SHADOW_PATH"], "shadow")
+    ensure_seeded_file(app.config["BASH_LOGOUT_PATH"], "bash.bash_logout")
+    ensure_seeded_file(app.config["BASHRC_PATH"], "bashrc")
 
 # ---- /etc/passwd & /etc/group parsing ----
 PASSWD_FIELDS = ["name","passwd","uid","gid","gecos","home","shell"]
