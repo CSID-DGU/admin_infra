@@ -641,30 +641,57 @@ def build_pod_spec(
         volumes.extend(group_vols)
     # 계정 파일 마운트 -> NFS 마운트 대체
         account_file_mounts = []
+        # fallback 세팅
         for sub in app.config["ACCOUNT_FILE_SUBPATHS"]:
             sub_fmt = sub.format(username=username)
-            mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
+            if sub.startswith("sudoers.d/"):
+                mount_path = f"/etc/sudoers.d/{username}"
+            elif sub == "bash.bash_logout":
+                mount_path = f"/home/{username}/.bash_logout"
+            else:
+                mount_path = f"/etc/{sub_fmt}"
             account_file_mounts.append({
                 "name": "account-files",
                 "mountPath": mount_path,
                 "subPath": sub_fmt,
                 "readOnly": True
             })
-        volume_mounts.extend(account_file_mounts)
 
         account_nfs_server = app.config["ACCOUNT_NFS_SERVER"]
         account_nfs_path = app.config["ACCOUNT_NFS_PATH"]
-        if not account_nfs_server or not account_nfs_path:
-            raise RuntimeError("NFS_SERVER and NFS_PATH must be configured for account file mounts")
+        if account_nfs_server and account_nfs_path:
+            volume_mounts.extend(account_file_mounts)
+            volumes.append({
+                "name": "account-files",
+                "nfs": {
+                    "server": account_nfs_server,
+                    "path": account_nfs_path,
+                    "readOnly": True
+                }
+            })
+        else:
+            app.logger.warning(
+                "[POD SPEC] NFS_SERVER/NFS_PATH missing, falling back to legacy hostPath /etc mounts"
+            )
+            legacy_etc_mounts = []
+            for sub in app.config["ACCOUNT_FILE_SUBPATHS"]:
+                if sub == "bash.bash_logout":
+                    continue
 
-        volumes.append({
-            "name": "account-files",
-            "nfs": {
-                "server": account_nfs_server,
-                "path": account_nfs_path,
-                "readOnly": True
-            }
-        })
+                sub_fmt = sub.format(username=username)
+                mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
+                legacy_etc_mounts.append({
+                    "name": "host-etc",
+                    "mountPath": mount_path,
+                    "subPath": sub_fmt,
+                    "readOnly": True
+                })
+
+            volume_mounts.extend(legacy_etc_mounts)
+            volumes.append({
+                "name": "host-etc",
+                "hostPath": {"path": "/etc", "type": "Directory"}
+            })
     
         spec = {
                     "config": {
