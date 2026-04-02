@@ -72,7 +72,7 @@ app.config.from_mapping({
     "PVC_SIZE_UNIT": "Gi",
 
     # Mounts & devices
-    "HOST_ETC_SUBPATHS": [
+    "ACCOUNT_FILE_SUBPATHS": [
         "passwd",
         "group",
         "shadow",
@@ -86,6 +86,8 @@ app.config.from_mapping({
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
     "BASE_ETC_DIR": BASE_ETC_DIR,
+    "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
+    "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
     "PASSWD_PATH": BASE_ETC_DIR + "/passwd",
     "GROUP_PATH": BASE_ETC_DIR + "/group",
     "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
@@ -637,22 +639,31 @@ def build_pod_spec(
         group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
         volume_mounts.extend(group_mounts)
         volumes.extend(group_vols)
-    
-        host_etc_mounts = []
-        for sub in app.config["HOST_ETC_SUBPATHS"]:
+    # 계정 파일 마운트 -> NFS 마운트 대체
+        account_file_mounts = []
+        for sub in app.config["ACCOUNT_FILE_SUBPATHS"]:
             sub_fmt = sub.format(username=username)
             mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
-            host_etc_mounts.append({
-                "name": "host-etc",
+            account_file_mounts.append({
+                "name": "account-files",
                 "mountPath": mount_path,
                 "subPath": sub_fmt,
                 "readOnly": True
             })
-        volume_mounts.extend(host_etc_mounts)
-    
+        volume_mounts.extend(account_file_mounts)
+
+        account_nfs_server = app.config["ACCOUNT_NFS_SERVER"]
+        account_nfs_path = app.config["ACCOUNT_NFS_PATH"]
+        if not account_nfs_server or not account_nfs_path:
+            raise RuntimeError("NFS_SERVER and NFS_PATH must be configured for account file mounts")
+
         volumes.append({
-            "name": "host-etc",
-            "hostPath": {"path": "/etc", "type": "Directory"}
+            "name": "account-files",
+            "nfs": {
+                "server": account_nfs_server,
+                "path": account_nfs_path,
+                "readOnly": True
+            }
         })
     
         spec = {
