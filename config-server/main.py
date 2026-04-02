@@ -72,12 +72,12 @@ app.config.from_mapping({
     "PVC_SIZE_UNIT": "Gi",
 
     # Mounts & devices
-    "HOST_ETC_SUBPATHS": [
+    "ACCOUNT_FILE_SUBPATHS": [
         "passwd",
         "group",
         "shadow",
-        "sudoers.d/{username}",
         "bash.bash_logout",
+        "bashrc",
     ],
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -86,6 +86,11 @@ app.config.from_mapping({
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
     "BASE_ETC_DIR": BASE_ETC_DIR,
+    "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
+    "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
+    "SUDO_ALLOWED_COMMANDS": [
+        cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
+    ],
     "PASSWD_PATH": BASE_ETC_DIR + "/passwd",
     "GROUP_PATH": BASE_ETC_DIR + "/group",
     "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
@@ -515,6 +520,64 @@ def create_pod():
         app.logger.exception("[CREATE POD] unexpected error")
         return jsonify({"error": str(e)}), 500
 
+
+def _normalize_gid_list(raw_gid) -> List[int]:
+    if raw_gid is None:
+        return []
+    if isinstance(raw_gid, list):
+        values = raw_gid
+    else:
+        values = [raw_gid]
+    out = []
+    for value in values:
+        if isinstance(value, int):
+            out.append(value)
+        elif str(value).isdigit():
+            out.append(int(value))
+    return out
+
+
+def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str]:
+    primary_gid = None
+    for line in read_passwd_lines():
+        rec = parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            primary_gid = rec["gid"]
+            break
+
+    if primary_gid is None and gid_list:
+        primary_gid = gid_list[0]
+
+    if primary_gid is None:
+        raise ValueError(f"primary gid not found for user {username!r}")
+
+    primary_group_name = username
+    for line in read_group_lines():
+        rec = parse_group_line(line)
+        if rec and rec["gid"] == primary_gid:
+            primary_group_name = rec["name"]
+            break
+
+    return primary_gid, primary_group_name
+
+
+def _get_sudo_allowed_commands() -> List[str]:
+    return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
+
+
+def _build_sudoers_policy(username: str) -> Optional[str]:
+    allowed_commands = _get_sudo_allowed_commands()
+    if not allowed_commands:
+        return None
+    return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
+
+
+def _get_account_file_subpaths() -> List[str]:
+    subpaths = list(app.config["ACCOUNT_FILE_SUBPATHS"])
+    if _get_sudo_allowed_commands():
+        subpaths.append("sudoers.d/{username}")
+    return subpaths
+
 def build_pod_spec(
     username: str,
     user_info: dict,
@@ -524,6 +587,9 @@ def build_pod_spec(
     app.logger.info(f"[POD SPEC] start user={username} node={target_node}")
     app.logger.debug(f"[POD SPEC] user_info={user_info}")
     ns = app.config["NAMESPACE"]
+
+    # subPath mounts require the source files to already exist on the NFS share.
+    ensure_etc_layout()
 
     canonical = resolve_k8s_node_name(target_node)
     if not canonical:
@@ -536,7 +602,8 @@ def build_pod_spec(
 
     image = load_user_image(username, user_info["image"])
     uid = user_info["uid"]
-    gid_list = user_info["gid"]
+    gid_list = _normalize_gid_list(user_info["gid"])
+    primary_gid, primary_group_name = _resolve_primary_group(username, gid_list)
     gpu_nodes = user_info.get("gpu_nodes", [])
     
     # 기본 포트
@@ -637,23 +704,69 @@ def build_pod_spec(
         group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
         volume_mounts.extend(group_mounts)
         volumes.extend(group_vols)
-    
-        host_etc_mounts = []
-        for sub in app.config["HOST_ETC_SUBPATHS"]:
+    # 계정 파일 마운트 -> NFS 마운트 대체
+        account_file_mounts = []
+        # fallback 세팅
+        for sub in _get_account_file_subpaths():
             sub_fmt = sub.format(username=username)
-            mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
-            host_etc_mounts.append({
-                "name": "host-etc",
+            if sub.startswith("sudoers.d/"):
+                mount_path = f"/etc/sudoers.d/{username}"
+            elif sub == "bash.bash_logout":
+                mount_path = f"/home/{username}/.bash_logout"
+            elif sub == "bashrc":
+                mount_path = f"/home/{username}/.bashrc"
+            else:
+                mount_path = f"/etc/{sub_fmt}"
+            account_file_mounts.append({
+                "name": "account-files",
                 "mountPath": mount_path,
                 "subPath": sub_fmt,
                 "readOnly": True
             })
-        volume_mounts.extend(host_etc_mounts)
-    
-        volumes.append({
-            "name": "host-etc",
-            "hostPath": {"path": "/etc", "type": "Directory"}
-        })
+
+        account_nfs_server = app.config["ACCOUNT_NFS_SERVER"]
+        account_nfs_path = app.config["ACCOUNT_NFS_PATH"]
+        if account_nfs_server and account_nfs_path:
+            volume_mounts.extend(account_file_mounts)
+            volumes.append({
+                "name": "account-files",
+                "nfs": {
+                    "server": account_nfs_server,
+                    "path": account_nfs_path,
+                    "readOnly": True
+                }
+            })
+        else:
+            app.logger.warning(
+                "[POD SPEC] NFS_SERVER/NFS_PATH missing, falling back to legacy hostPath /etc mounts"
+            )
+            legacy_etc_mounts = []
+            for sub in _get_account_file_subpaths():
+                sub_fmt = sub.format(username=username)
+                if sub.startswith("sudoers.d/"):
+                    mount_path = f"/etc/sudoers.d/{username}"
+                    source_subpath = sub_fmt
+                elif sub == "bash.bash_logout":
+                    mount_path = f"/home/{username}/.bash_logout"
+                    source_subpath = "bash.bash_logout"
+                elif sub == "bashrc":
+                    mount_path = f"/home/{username}/.bashrc"
+                    source_subpath = "bashrc"
+                else:
+                    mount_path = f"/etc/{sub_fmt}"
+                    source_subpath = sub_fmt
+                legacy_etc_mounts.append({
+                    "name": "host-etc",
+                    "mountPath": mount_path,
+                    "subPath": source_subpath,
+                    "readOnly": True
+                })
+
+            volume_mounts.extend(legacy_etc_mounts)
+            volumes.append({
+                "name": "host-etc",
+                "hostPath": {"path": "/etc", "type": "Directory"}
+            })
     
         spec = {
                     "config": {
@@ -677,13 +790,6 @@ def build_pod_spec(
                                 },
                                 "spec": {
                                         "nodeName": target_node,
-                                        "securityContext": {
-                                            "runAsUser": uid,
-                                            "runAsGroup": uid,
-                                            "fsGroup": uid
-                                            # "runAsGroup": gid,
-                                            # "fsGroup": gid
-                                        },
                                         "containers": [
                                             {
                                                 "name": "shell",
@@ -701,8 +807,11 @@ def build_pod_spec(
                                                 "env": [
                                                     {"name": "USER", "value": username},
                                                     {"name": "USER_ID", "value": username},
-                                                    {"name": "USER_PW", "value": "1234"},
+                                                    {"name": "USER_GROUP", "value": primary_group_name},
+                                                    {"name": "TARGET_UID", "value": str(uid)},
+                                                    {"name": "TARGET_GID", "value": str(primary_gid)},
                                                     {"name": "UID", "value": str(uid)},
+                                                    {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"}
                                                 ],
@@ -1667,14 +1776,17 @@ def create_user():
     sh_lines.append(format_shadow_entry(shadow_entry))
     write_shadow_lines(sh_lines)
 
-    # 4) sudoers
-    ensure_sudoers_dir()
-    s_path = os.path.join(app.config["SUDOERS_DIR"], name)
-    tmp = s_path + ".tmp"
-    with LockedFile(tmp, "w") as f:
-        f.write(f"{name} ALL=(ALL) NOPASSWD:ALL\n")
-    os.replace(tmp, s_path)
-    os.chmod(s_path, 0o440)
+    # 4) sudoers (optional, password-protected whitelist only)
+    s_path = None
+    sudoers_policy = _build_sudoers_policy(name)
+    if sudoers_policy:
+        ensure_sudoers_dir()
+        s_path = os.path.join(app.config["SUDOERS_DIR"], name)
+        tmp = s_path + ".tmp"
+        with LockedFile(tmp, "w") as f:
+            f.write(sudoers_policy)
+        os.replace(tmp, s_path)
+        os.chmod(s_path, 0o440)
 
     return jsonify({"status": "created", "user": entry, "group": {"name": pg_name, "gid": target_gid}, "sudoers": s_path}), 201
 
