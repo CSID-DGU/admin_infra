@@ -76,7 +76,6 @@ app.config.from_mapping({
         "passwd",
         "group",
         "shadow",
-        "sudoers.d/{username}",
         "bash.bash_logout",
         "bashrc",
     ],
@@ -89,6 +88,9 @@ app.config.from_mapping({
     "BASE_ETC_DIR": BASE_ETC_DIR,
     "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
     "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
+    "SUDO_ALLOWED_COMMANDS": [
+        cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
+    ],
     "PASSWD_PATH": BASE_ETC_DIR + "/passwd",
     "GROUP_PATH": BASE_ETC_DIR + "/group",
     "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
@@ -518,6 +520,64 @@ def create_pod():
         app.logger.exception("[CREATE POD] unexpected error")
         return jsonify({"error": str(e)}), 500
 
+
+def _normalize_gid_list(raw_gid) -> List[int]:
+    if raw_gid is None:
+        return []
+    if isinstance(raw_gid, list):
+        values = raw_gid
+    else:
+        values = [raw_gid]
+    out = []
+    for value in values:
+        if isinstance(value, int):
+            out.append(value)
+        elif str(value).isdigit():
+            out.append(int(value))
+    return out
+
+
+def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str]:
+    primary_gid = None
+    for line in read_passwd_lines():
+        rec = parse_passwd_line(line)
+        if rec and rec["name"] == username:
+            primary_gid = rec["gid"]
+            break
+
+    if primary_gid is None and gid_list:
+        primary_gid = gid_list[0]
+
+    if primary_gid is None:
+        raise ValueError(f"primary gid not found for user {username!r}")
+
+    primary_group_name = username
+    for line in read_group_lines():
+        rec = parse_group_line(line)
+        if rec and rec["gid"] == primary_gid:
+            primary_group_name = rec["name"]
+            break
+
+    return primary_gid, primary_group_name
+
+
+def _get_sudo_allowed_commands() -> List[str]:
+    return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
+
+
+def _build_sudoers_policy(username: str) -> Optional[str]:
+    allowed_commands = _get_sudo_allowed_commands()
+    if not allowed_commands:
+        return None
+    return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
+
+
+def _get_account_file_subpaths() -> List[str]:
+    subpaths = list(app.config["ACCOUNT_FILE_SUBPATHS"])
+    if _get_sudo_allowed_commands():
+        subpaths.append("sudoers.d/{username}")
+    return subpaths
+
 def build_pod_spec(
     username: str,
     user_info: dict,
@@ -542,7 +602,8 @@ def build_pod_spec(
 
     image = load_user_image(username, user_info["image"])
     uid = user_info["uid"]
-    gid_list = user_info["gid"]
+    gid_list = _normalize_gid_list(user_info["gid"])
+    primary_gid, primary_group_name = _resolve_primary_group(username, gid_list)
     gpu_nodes = user_info.get("gpu_nodes", [])
     
     # 기본 포트
@@ -646,7 +707,7 @@ def build_pod_spec(
     # 계정 파일 마운트 -> NFS 마운트 대체
         account_file_mounts = []
         # fallback 세팅
-        for sub in app.config["ACCOUNT_FILE_SUBPATHS"]:
+        for sub in _get_account_file_subpaths():
             sub_fmt = sub.format(username=username)
             if sub.startswith("sudoers.d/"):
                 mount_path = f"/etc/sudoers.d/{username}"
@@ -680,7 +741,7 @@ def build_pod_spec(
                 "[POD SPEC] NFS_SERVER/NFS_PATH missing, falling back to legacy hostPath /etc mounts"
             )
             legacy_etc_mounts = []
-            for sub in app.config["ACCOUNT_FILE_SUBPATHS"]:
+            for sub in _get_account_file_subpaths():
                 sub_fmt = sub.format(username=username)
                 if sub.startswith("sudoers.d/"):
                     mount_path = f"/etc/sudoers.d/{username}"
@@ -729,13 +790,6 @@ def build_pod_spec(
                                 },
                                 "spec": {
                                         "nodeName": target_node,
-                                        "securityContext": {
-                                            "runAsUser": uid,
-                                            "runAsGroup": uid,
-                                            "fsGroup": uid
-                                            # "runAsGroup": gid,
-                                            # "fsGroup": gid
-                                        },
                                         "containers": [
                                             {
                                                 "name": "shell",
@@ -753,8 +807,11 @@ def build_pod_spec(
                                                 "env": [
                                                     {"name": "USER", "value": username},
                                                     {"name": "USER_ID", "value": username},
-                                                    {"name": "USER_PW", "value": "1234"},
+                                                    {"name": "USER_GROUP", "value": primary_group_name},
+                                                    {"name": "TARGET_UID", "value": str(uid)},
+                                                    {"name": "TARGET_GID", "value": str(primary_gid)},
                                                     {"name": "UID", "value": str(uid)},
+                                                    {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"}
                                                 ],
@@ -1719,14 +1776,17 @@ def create_user():
     sh_lines.append(format_shadow_entry(shadow_entry))
     write_shadow_lines(sh_lines)
 
-    # 4) sudoers
-    ensure_sudoers_dir()
-    s_path = os.path.join(app.config["SUDOERS_DIR"], name)
-    tmp = s_path + ".tmp"
-    with LockedFile(tmp, "w") as f:
-        f.write(f"{name} ALL=(ALL) NOPASSWD:ALL\n")
-    os.replace(tmp, s_path)
-    os.chmod(s_path, 0o440)
+    # 4) sudoers (optional, password-protected whitelist only)
+    s_path = None
+    sudoers_policy = _build_sudoers_policy(name)
+    if sudoers_policy:
+        ensure_sudoers_dir()
+        s_path = os.path.join(app.config["SUDOERS_DIR"], name)
+        tmp = s_path + ".tmp"
+        with LockedFile(tmp, "w") as f:
+            f.write(sudoers_policy)
+        os.replace(tmp, s_path)
+        os.chmod(s_path, 0o440)
 
     return jsonify({"status": "created", "user": entry, "group": {"name": pg_name, "gid": target_gid}, "sudoers": s_path}), 201
 
