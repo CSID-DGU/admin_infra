@@ -113,11 +113,6 @@ def config():
                         },
                         "spec": {
                             "nodeName": best_node,
-                            "securityContext": {
-                                "runAsUser": uid,
-                                "runAsGroup": gid,
-                                "fsGroup": gid
-                            },
                             "containers": [
                                 {
                                     "name": "shell",
@@ -128,8 +123,11 @@ def config():
                                     "env": [
                                         {"name": "USER", "value": username},
                                         {"name": "USER_ID", "value": username},
-                                        {"name": "USER_PW", "value": "1234"},
+                                        {"name": "USER_GROUP", "value": username},
+                                        {"name": "TARGET_UID", "value": str(uid)},
+                                        {"name": "TARGET_GID", "value": str(gid)},
                                         {"name": "UID", "value": str(uid)},
+                                        {"name": "GID", "value": str(gid)},
                                         {"name": "HOME", "value": f"/home/{username}"},
                                         {"name": "SHELL", "value": "/bin/bash"}
                                     ],
@@ -421,14 +419,8 @@ def create_user():
     sh_lines.append(format_shadow_entry(shadow_entry))
     write_shadow_lines(sh_lines)
 
-    # 4) sudoers
-    ensure_sudoers_dir()
-    s_path = os.path.join(app.config["SUDOERS_DIR"], name)
-    tmp = s_path + ".tmp"
-    with LockedFile(tmp, "w") as f:
-        f.write(f"{name} ALL=(ALL) NOPASSWD:ALL\n")
-    os.replace(tmp, s_path)
-    os.chmod(s_path, 0o440)
+    # 4) sudoers (optional, password-protected whitelist only)
+    s_path = None
 
     return jsonify({"status": "created", "user": entry, "group": {"name": pg_name, "gid": target_gid}, "sudoers": s_path}), 201
 
