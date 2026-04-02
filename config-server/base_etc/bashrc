@@ -1,0 +1,215 @@
+# ~/.bashrc: executed by bash(1) for non-login shells.
+
+# If not running interactively, don't do anything
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+
+# Create log directory early
+mkdir -p "$HOME/.kube_logs"
+
+# Basic bash settings
+export HISTCONTROL=ignoreboth
+export HISTSIZE=1000
+export HISTFILESIZE=2000
+shopt -s histappend
+shopt -s checkwinsize
+
+# Colored prompt
+export PS1='\[\033[01;32m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+
+# Enable color support
+if [ -x /usr/bin/dircolors ]; then
+    test -r ~/.dircolors && eval "$(dircolors -b ~/.dircolors)" || eval "$(dircolors -b)"
+    alias ls='ls --color=auto'
+    alias grep='grep --color=auto'
+    alias fgrep='fgrep --color=auto'
+    alias egrep='egrep --color=auto'
+fi
+
+# Common aliases
+alias ll='ls -alF'
+alias la='ls -A'
+alias l='ls -CF'
+
+# -----------------------------------------------------------------------------
+# Run-once guard for logout to prevent duplicate executions from alias/trap/monitor
+# -----------------------------------------------------------------------------
+run_logout_once() {
+    local sid="${SESSION_ID:-${1:-${ORIGINAL_PID:-$$}}}"
+    local lock="/tmp/.logout_once_${sid}"
+
+    ( set -o noclobber; echo "$$ $(date +%s)" > "$lock" ) 2>/dev/null || {
+        echo "$(kst_date): logout already executed once for SID=${sid} (lock=${lock})" >> "$HOME/.kube_logs/monitor.log"
+        return 0
+    }
+
+    bash "$HOME/.bash_logout"
+}
+
+# -----------------------------------------------------------------------------
+# Logout function - can be configured for blocking or non-blocking mode
+# -----------------------------------------------------------------------------
+safe_logout() {
+    local original_pid=${1:-$$}
+    local blocking_mode=${LOGOUT_BLOCKING_MODE:-false}
+
+    export ORIGINAL_PID="$original_pid"
+
+    if [ "$blocking_mode" = "true" ]; then
+        run_logout_once "$original_pid"
+        return $?
+    else
+        run_logout_once "$original_pid" >/dev/null 2>&1 &
+        return 0
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Set up traps with run-once guard via safe_logout
+# -----------------------------------------------------------------------------
+trap 'echo "$(kst_date): EXIT trap triggered for PID $$" >> "$HOME/.kube_logs/monitor.log"; ORIGINAL_PID=$$ safe_logout $$' EXIT
+
+test_trap() {
+    echo "$(kst_date): Test trap executed for PID $$" >> /tmp/trap_test.log
+    safe_logout $$
+}
+trap 'test_trap' USR1
+
+alias exit='safe_logout $$; builtin exit'
+alias bye='safe_logout $$; builtin exit'
+alias quit='safe_logout $$; builtin exit'
+
+# -----------------------------------------------------------------------------
+# SSH session monitoring approach with better logging and unique session tracking
+# -----------------------------------------------------------------------------
+kst_date() {
+    local utc_epoch
+    local kst_epoch
+    utc_epoch=$(date -u +%s)
+    kst_epoch=$((utc_epoch + 32400))
+
+    if [ $# -eq 0 ]; then
+        date -d "@$kst_epoch" '+%Y-%m-%d %H:%M:%S KST' 2>/dev/null || date '+%Y-%m-%d %H:%M:%S'
+    else
+        date -d "@$kst_epoch" "$@" 2>/dev/null || date "$@"
+    fi
+}
+
+ssh_session_monitor() {
+    local main_bash_pid=$$
+    local session_id="${main_bash_pid}_$(date +%s)_${RANDOM}"
+    local session_file="/tmp/ssh_session_$session_id"
+
+    export SESSION_ID="$session_id"
+
+    mkdir -p "$HOME/.kube_logs"
+    local monitor_log="$HOME/.kube_logs/monitor.log"
+
+    if [ -f "/tmp/monitor_active_${main_bash_pid}" ]; then
+        echo "$(kst_date): Monitor already active for PID ${main_bash_pid}, skipping" >> "$monitor_log"
+        return
+    fi
+
+    echo "$session_id" > "/tmp/monitor_active_${main_bash_pid}"
+    echo "$(kst_date): Session started - PID: ${main_bash_pid}, PPID: $(ps -o ppid= -p ${main_bash_pid} | tr -d ' '), Session ID: $session_id" >> "$monitor_log"
+    echo "$(kst_date): Environment - PWD: $PWD, USER: $USER, SSH_CLIENT: ${SSH_CLIENT:-none}" >> "$monitor_log"
+    echo "$session_id" > "$session_file"
+
+    {
+        local loop_count=0
+        local initial_ppid
+        initial_ppid=$(ps -o ppid= -p ${main_bash_pid} 2>/dev/null | tr -d ' ')
+        echo "$(kst_date): Starting session monitor for PID ${main_bash_pid} (initial PPID: $initial_ppid)" >> "$monitor_log"
+
+        while true; do
+            local current_ppid
+            local process_exists
+            local is_bash
+            local recheck_ppid
+
+            sleep 5
+            loop_count=$((loop_count + 1))
+
+            if [ $((loop_count % 6)) -eq 0 ]; then
+                echo "$(kst_date): Monitor active - Loop $loop_count, PID ${main_bash_pid} still running" >> "$monitor_log"
+            fi
+
+            if ! kill -0 ${main_bash_pid} 2>/dev/null || ! ps -p ${main_bash_pid} >/dev/null 2>&1; then
+                echo "$(kst_date): Bash process ${main_bash_pid} terminated - triggering logout script" >> "$monitor_log"
+                safe_logout ${main_bash_pid}
+                rm -f "$session_file" "/tmp/monitor_active_${main_bash_pid}"
+                echo "$(kst_date): Session monitor for PID ${main_bash_pid} completed" >> "$monitor_log"
+                break
+            fi
+
+            current_ppid=$(ps -o ppid= -p ${main_bash_pid} 2>/dev/null | tr -d ' ')
+            process_exists=$(ps -p ${main_bash_pid} >/dev/null 2>&1 && echo "yes" || echo "no")
+            is_bash=$(ps -p ${main_bash_pid} -o args= 2>/dev/null | grep -q "bash" && echo "yes" || echo "no")
+
+            if [ $((loop_count % 5)) -eq 0 ]; then
+                echo "$(kst_date): Debug - PID ${main_bash_pid} PPID: $current_ppid, Process: $process_exists, IsBash: $is_bash" >> "$monitor_log"
+            fi
+
+            if [ "$process_exists" = "yes" ] && [ "$is_bash" = "yes" ] && [ "$initial_ppid" != "0" ] && [ "$initial_ppid" != "1" ]; then
+                if ([ "$current_ppid" = "1" ] || [ "$current_ppid" = "0" ]) && [ "$current_ppid" != "$initial_ppid" ]; then
+                    echo "$(kst_date): Parent process died (PPID: $initial_ppid -> $current_ppid) for PID ${main_bash_pid} - SSH likely disconnected" >> "$monitor_log"
+
+                    sleep 3
+                    recheck_ppid=$(ps -o ppid= -p ${main_bash_pid} 2>/dev/null | tr -d ' ')
+                    echo "$(kst_date): PPID recheck: $recheck_ppid" >> "$monitor_log"
+
+                    if ([ "$recheck_ppid" = "1" ] || [ "$recheck_ppid" = "0" ]) && kill -0 ${main_bash_pid} 2>/dev/null; then
+                        echo "$(kst_date): CONFIRMED SSH disconnection for PID ${main_bash_pid} (orphaned process, PPID=$recheck_ppid) - triggering logout script" >> "$monitor_log"
+                        safe_logout ${main_bash_pid}
+                        rm -f "$session_file" "/tmp/monitor_active_${main_bash_pid}"
+                        echo "$(kst_date): Session monitor for PID ${main_bash_pid} completed" >> "$monitor_log"
+                        break
+                    else
+                        echo "$(kst_date): False alarm for PID ${main_bash_pid} - Parent process restored (PPID=$recheck_ppid)" >> "$monitor_log"
+                    fi
+                fi
+            fi
+        done
+    } &
+
+    disown $!
+    echo "Monitor started for session $session_id at $(kst_date)" > "$HOME/.kube_logs/monitor_${session_id}.info"
+}
+
+if [[ $- == *i* ]]; then
+    ssh_session_monitor
+fi
+
+check_session() {
+    local current_ppid
+    current_ppid=$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')
+    if [ -n "$current_ppid" ] && [ "$current_ppid" != "1" ]; then
+        echo "$(date +%s)" > "/tmp/session_active_$$"
+    fi
+}
+
+PROMPT_COMMAND="check_session"
+
+alias monitor_status='echo "=== Persistent monitor files ==="; ls -la $HOME/.kube_logs/monitor_* 2>/dev/null; echo "=== Temp session files ==="; ls -la /tmp/monitor_active_* /tmp/ssh_session_* 2>/dev/null || echo "No temp files found"'
+alias cleanup_old_monitors='echo "Persistent logs:"; ls -la $HOME/.kube_logs/monitor_* 2>/dev/null; echo "Temp files:"; find /tmp -name "monitor_*" -o -name "ssh_session_*" -o -name "session_active_*" | xargs ls -la 2>/dev/null; echo "Use: rm $HOME/.kube_logs/monitor_* /tmp/monitor_* /tmp/ssh_session_* /tmp/session_active_* to clean up"'
+alias monitor_log='cat $HOME/.kube_logs/monitor.log 2>/dev/null || echo "No monitor log found"'
+alias logout_log='ls -la $HOME/.kube_logs/ 2>/dev/null && cat $HOME/.kube_logs/logout.log 2>/dev/null || echo "No logout logs found"'
+alias session_info='echo "Current PID: $$, PPID: $(ps -o ppid= -p $$), Terminal: $([ -t 0 ] && echo "Connected" || echo "Disconnected")"'
+alias timezone_info='echo "System time: $(date)"; echo "UTC time: $(date -u)"; echo "KST attempt: $(kst_date)"; ls -la /usr/share/zoneinfo/Asia/Seoul 2>/dev/null || echo "Seoul timezone file not found"'
+
+BASHRC_VERSION="v0.10"
+
+cd ~
+
+echo "Welcome to ContainerSSH! Logout logging is enabled. ($BASHRC_VERSION)"
+echo "Current session: PID=$$, Terminal=$([ -t 0 ] && echo 'Connected' || echo 'Disconnected')"
+echo "Available logout commands: exit, bye, quit"
+echo "Session monitoring commands:"
+echo "  monitor_status - Show monitor file status"
+echo "  monitor_log    - Show current session monitor log"
+echo "  logout_log     - Show logout logs"
+echo "  session_info   - Show current session info"
+echo "  timezone_info  - Debug timezone settings"
+echo "  kill -USR1 $$  - Test logout script manually"
