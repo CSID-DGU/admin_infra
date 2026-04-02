@@ -33,6 +33,10 @@ spec:
           env:
             - name: NFS_ADDRESS
               value: "{{ .Values.env.nfsAddress }}"
+            - name: NFS_SERVER
+              value: "{{ .Values.nfs.server }}"
+            - name: NFS_PATH
+              value: "{{ .Values.nfs.path }}"
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
           readinessProbe:
