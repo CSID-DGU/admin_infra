@@ -78,6 +78,7 @@ app.config.from_mapping({
         "shadow",
         "sudoers.d/{username}",
         "bash.bash_logout",
+        "bashrc",
     ],
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -648,6 +649,8 @@ def build_pod_spec(
                 mount_path = f"/etc/sudoers.d/{username}"
             elif sub == "bash.bash_logout":
                 mount_path = f"/home/{username}/.bash_logout"
+            elif sub == "bashrc":
+                mount_path = f"/home/{username}/.bashrc"
             else:
                 mount_path = f"/etc/{sub_fmt}"
             account_file_mounts.append({
@@ -675,15 +678,23 @@ def build_pod_spec(
             )
             legacy_etc_mounts = []
             for sub in app.config["ACCOUNT_FILE_SUBPATHS"]:
-                if sub == "bash.bash_logout":
-                    continue
-
                 sub_fmt = sub.format(username=username)
-                mount_path = f"/etc/sudoers.d/{username}" if sub.startswith("sudoers.d/") else f"/etc/{sub_fmt}"
+                if sub.startswith("sudoers.d/"):
+                    mount_path = f"/etc/sudoers.d/{username}"
+                    source_subpath = sub_fmt
+                elif sub == "bash.bash_logout":
+                    mount_path = f"/home/{username}/.bash_logout"
+                    source_subpath = "bash.bash_logout"
+                elif sub == "bashrc":
+                    mount_path = f"/home/{username}/.bashrc"
+                    source_subpath = "bash.bashrc"
+                else:
+                    mount_path = f"/etc/{sub_fmt}"
+                    source_subpath = sub_fmt
                 legacy_etc_mounts.append({
                     "name": "host-etc",
                     "mountPath": mount_path,
-                    "subPath": sub_fmt,
+                    "subPath": source_subpath,
                     "readOnly": True
                 })
 
