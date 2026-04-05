@@ -296,25 +296,38 @@ def commit_and_save_user_image(username, pod_name, namespace):
 #  Group / Volume 관련
 # ============================
 # ---- File lock helpers ----
+def _local_lockfile_path(nfs_path: str) -> str:
+    """NFS 경로에 대응하는 로컬(/tmp) 락 파일 경로를 반환한다.
+    NFS 위에서는 flock/lockf 모두 NFS lockd 의존으로 불안정하므로,
+    락 자체는 로컬 파일시스템에서 수행한다."""
+    safe = nfs_path.replace("/", "_")
+    return f"/tmp/cssh_lock{safe}"
+
+
 class LockedFile:
-    """Context manager for POSIX advisory file locks using fcntl.lockf (NFS-compatible)."""
+    """Context manager for file locks using a local(/tmp) lock file.
+    NFS 마운트 위의 파일을 안전하게 읽고 쓰기 위해 락은 로컬 파일로 관리한다."""
     def __init__(self, path: str, mode: str):
         self.path = path
         self.mode = mode
         self.f = None
+        self._lock_f = None
 
     def __enter__(self):
-        self.f = open(self.path, self.mode)
-        # Exclusive lock for writes, shared lock for reads
         lock_type = fcntl.LOCK_SH if "r" in self.mode and "+" not in self.mode and "w" not in self.mode and "a" not in self.mode else fcntl.LOCK_EX
-        fcntl.lockf(self.f.fileno(), lock_type)
+        self._lock_f = open(_local_lockfile_path(self.path), "a+")
+        fcntl.lockf(self._lock_f.fileno(), lock_type)
+        self.f = open(self.path, self.mode)
         return self.f
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            fcntl.lockf(self.f.fileno(), fcntl.LOCK_UN)
+            if self.f:
+                self.f.close()
         finally:
-            self.f.close()
+            if self._lock_f:
+                fcntl.lockf(self._lock_f.fileno(), fcntl.LOCK_UN)
+                self._lock_f.close()
 
 # ---- Ensure base etc layout ----
 
@@ -340,23 +353,24 @@ def ensure_seeded_file(path: str, template_name: str) -> None:
     template_dir = app.config.get("BASE_ETC_TEMPLATE_DIR", DEFAULT_BASE_ETC_TEMPLATE_DIR)
     template_path = os.path.join(template_dir, template_name)
 
-    with open(path, "a+", encoding="utf-8") as f:
-        fcntl.lockf(f.fileno(), fcntl.LOCK_EX)
-        f.seek(0, os.SEEK_END)
-        if f.tell() > 0:
-            return
+    with open(_local_lockfile_path(path), "a+") as lock_f:
+        fcntl.lockf(lock_f.fileno(), fcntl.LOCK_EX)
+        with open(path, "a+", encoding="utf-8") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() > 0:
+                return
 
-        if not os.path.exists(template_path):
-            app.logger.warning("[ETC INIT] template missing for %s: %s", path, template_path)
-            return
+            if not os.path.exists(template_path):
+                app.logger.warning("[ETC INIT] template missing for %s: %s", path, template_path)
+                return
 
-        with open(template_path, "r", encoding="utf-8") as tf:
-            content = tf.read()
+            with open(template_path, "r", encoding="utf-8") as tf:
+                content = tf.read()
 
-        f.seek(0)
-        f.write(content)
-        f.truncate()
-        app.logger.info("[ETC INIT] seeded %s from %s", path, template_path)
+            f.seek(0)
+            f.write(content)
+            f.truncate()
+            app.logger.info("[ETC INIT] seeded %s from %s", path, template_path)
 
 def ensure_etc_layout() -> None:
     ensure_dir(app.config["BASE_ETC_DIR"])
