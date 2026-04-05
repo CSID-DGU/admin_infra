@@ -297,7 +297,7 @@ def commit_and_save_user_image(username, pod_name, namespace):
 # ============================
 # ---- File lock helpers ----
 class LockedFile:
-    """Context manager for POSIX advisory file locks using fcntl.flock."""
+    """Context manager for POSIX advisory file locks using fcntl.lockf (NFS-compatible)."""
     def __init__(self, path: str, mode: str):
         self.path = path
         self.mode = mode
@@ -307,12 +307,12 @@ class LockedFile:
         self.f = open(self.path, self.mode)
         # Exclusive lock for writes, shared lock for reads
         lock_type = fcntl.LOCK_SH if "r" in self.mode and "+" not in self.mode and "w" not in self.mode and "a" not in self.mode else fcntl.LOCK_EX
-        fcntl.flock(self.f.fileno(), lock_type)
+        fcntl.lockf(self.f.fileno(), lock_type)
         return self.f
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            fcntl.flock(self.f.fileno(), fcntl.LOCK_UN)
+            fcntl.lockf(self.f.fileno(), fcntl.LOCK_UN)
         finally:
             self.f.close()
 
@@ -341,7 +341,7 @@ def ensure_seeded_file(path: str, template_name: str) -> None:
     template_path = os.path.join(template_dir, template_name)
 
     with open(path, "a+", encoding="utf-8") as f:
-        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        fcntl.lockf(f.fileno(), fcntl.LOCK_EX)
         f.seek(0, os.SEEK_END)
         if f.tell() > 0:
             return
