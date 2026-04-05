@@ -1288,7 +1288,7 @@ def create_or_resize_pvc():
                     pvc_body = client.V1PersistentVolumeClaim(
                         metadata=client.V1ObjectMeta(
                             name=pvc_name,
-                            annotations={"nfs.io/name": name, "nfs.io/type": pvc_type}
+                            annotations={"nfs.io/username": name, "nfs.io/type": pvc_type}
                         ),
                         spec=client.V1PersistentVolumeClaimSpec(
                             access_modes=["ReadWriteMany"],
