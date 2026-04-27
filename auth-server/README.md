@@ -1,11 +1,11 @@
 # ContainerSSH Authentication Server with MySQL
 
-ContainerSSH를 위한 MySQL 기반 인증 서버입니다. 패스워드 인증, 공개키 인증, 그리고 **REST API를 통한 사용자 관리 기능**을 제공합니다.
+ContainerSSH를 위한 MySQL 기반 인증 서버이다. 패스워드 인증, 공개키 인증, 그리고 **REST API를 통한 사용자 관리 기능**을 제공한다.
 
 ## 🆕 새로운 기능
 
 ### REST API 사용자 관리
-복잡한 Makefile 명령어 대신 **HTTP API**로 사용자를 관리할 수 있습니다!
+복잡한 Makefile 명령어 대신 **HTTP API**로 사용자를 관리할 수 있다!
 
 - **웹 브라우저에서 관리**: Swagger UI (`http://localhost:8080/docs`)
 - **API 호출로 관리**: curl 명령어로 간단하게
@@ -42,7 +42,7 @@ make port-forward
 
 ### 2. 웹 인터페이스로 관리
 
-브라우저에서 `http://localhost:8080/docs`로 접속하면 **Swagger UI**에서 모든 API를 테스트할 수 있습니다!
+브라우저에서 `http://localhost:8080/docs`로 접속하면 **Swagger UI**에서 모든 API를 테스트할 수 있다!
 
 ### 3. API로 사용자 관리
 
@@ -221,16 +221,16 @@ curl http://localhost:8000/docs
 
 | 파일/디렉토리 | 역할 | 주요 입력 | 주요 출력/효과 |
 | --- | --- | --- | --- |
-| `app/` | FastAPI 애플리케이션 코드입니다. 인증 API, 사용자/키 관리 API, DB model/service를 포함합니다. | ContainerSSH webhook 요청, REST API 요청, MySQL | 인증 결과 JSON, 사용자/키 DB 변경 |
-| `k8s/` | 인증 서버와 MySQL을 Kubernetes에 배포하는 manifest입니다. | `kubectl apply`, Secret/ConfigMap 값 | Deployment, Service, MySQL 초기 schema |
-| `scripts/` | 운영/테스트용 CLI와 shell script입니다. | CLI args, 포트포워딩된 API, DB 환경변수 | 사용자/키 변경, 테스트 결과, 보안 manifest 재생성 |
-| `Dockerfile` | 인증 서버 컨테이너 이미지를 빌드합니다. | `requirements.txt`, `app/` | Python 3.11 slim 기반 uvicorn 이미지 |
-| `Makefile` | 빌드, 배포, 포트포워딩, 테스트 API 호출 shortcut을 제공합니다. | make target, `USER`, `PASSWORD`, kubectl 컨텍스트 | Docker image, Kubernetes 배포/로그/테스트 실행 |
-| `docker-compose.yml` | 로컬 개발용 MySQL, auth-server, Adminer 구성을 제공합니다. | Docker Compose | 로컬 MySQL/API/Adminer 컨테이너 |
-| `requirements.txt` | FastAPI 서버 런타임 의존성입니다. | pip | FastAPI, uvicorn, SQLAlchemy, PyMySQL, passlib 등 설치 |
-| `.dockerignore` | Docker build context 제외 규칙입니다. | Docker build | 불필요 파일 제외 |
+| `app/` | FastAPI 애플리케이션 코드이다. 인증 API, 사용자/키 관리 API, DB model/service를 포함한다. | ContainerSSH webhook 요청, REST API 요청, MySQL | 인증 결과 JSON, 사용자/키 DB 변경 |
+| `k8s/` | 인증 서버와 MySQL을 Kubernetes에 배포하는 manifest이다. | `kubectl apply`, Secret/ConfigMap 값 | Deployment, Service, MySQL 초기 schema |
+| `scripts/` | 운영/테스트용 CLI와 shell script이다. | CLI args, 포트포워딩된 API, DB 환경변수 | 사용자/키 변경, 테스트 결과, 보안 manifest 재생성 |
+| `Dockerfile` | 인증 서버 컨테이너 이미지를 빌드한다. | `requirements.txt`, `app/` | Python 3.11 slim 기반 uvicorn 이미지 |
+| `Makefile` | 빌드, 배포, 포트포워딩, 테스트 API 호출 shortcut을 제공한다. | make target, `USER`, `PASSWORD`, kubectl 컨텍스트 | Docker image, Kubernetes 배포/로그/테스트 실행 |
+| `docker-compose.yml` | 로컬 개발용 MySQL, auth-server, Adminer 구성을 제공한다. | Docker Compose | 로컬 MySQL/API/Adminer 컨테이너 |
+| `requirements.txt` | FastAPI 서버 런타임 의존성이다. | pip | FastAPI, uvicorn, SQLAlchemy, PyMySQL, passlib 등 설치 |
+| `.dockerignore` | Docker build context 제외 규칙이다. | Docker build | 불필요 파일 제외 |
 
-자세한 클래스/함수/입출력은 각 하위 디렉토리 README를 참고하세요.
+자세한 클래스/함수/입출력은 각 하위 디렉토리 README를 참고한다.
 
 ## 보안 고려사항
 
@@ -289,8 +289,8 @@ MIT License
 
 ---
 
-🎉 **이제 복잡한 명령어 없이 브라우저나 간단한 curl 명령어로 사용자를 관리할 수 있습니다!**
+🎉 **이제 복잡한 명령어 없이 브라우저나 간단한 curl 명령어로 사용자를 관리할 수 있다!**
 
 - 📖 **API 문서**: http://localhost:8080/docs
 - 🚀 **빠른 시작**: `make api-examples`
-- 💬 **도움이 필요하면**: GitHub Issues에 문의하세요
+- 💬 **문의**: GitHub Issues
