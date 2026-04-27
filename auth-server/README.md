@@ -217,6 +217,21 @@ make run
 curl http://localhost:8000/docs
 ```
 
+## 디렉토리와 파일 상세
+
+| 파일/디렉토리 | 역할 | 주요 입력 | 주요 출력/효과 |
+| --- | --- | --- | --- |
+| `app/` | FastAPI 애플리케이션 코드입니다. 인증 API, 사용자/키 관리 API, DB model/service를 포함합니다. | ContainerSSH webhook 요청, REST API 요청, MySQL | 인증 결과 JSON, 사용자/키 DB 변경 |
+| `k8s/` | 인증 서버와 MySQL을 Kubernetes에 배포하는 manifest입니다. | `kubectl apply`, Secret/ConfigMap 값 | Deployment, Service, MySQL 초기 schema |
+| `scripts/` | 운영/테스트용 CLI와 shell script입니다. | CLI args, 포트포워딩된 API, DB 환경변수 | 사용자/키 변경, 테스트 결과, 보안 manifest 재생성 |
+| `Dockerfile` | 인증 서버 컨테이너 이미지를 빌드합니다. | `requirements.txt`, `app/` | Python 3.11 slim 기반 uvicorn 이미지 |
+| `Makefile` | 빌드, 배포, 포트포워딩, 테스트 API 호출 shortcut을 제공합니다. | make target, `USER`, `PASSWORD`, kubectl 컨텍스트 | Docker image, Kubernetes 배포/로그/테스트 실행 |
+| `docker-compose.yml` | 로컬 개발용 MySQL, auth-server, Adminer 구성을 제공합니다. | Docker Compose | 로컬 MySQL/API/Adminer 컨테이너 |
+| `requirements.txt` | FastAPI 서버 런타임 의존성입니다. | pip | FastAPI, uvicorn, SQLAlchemy, PyMySQL, passlib 등 설치 |
+| `.dockerignore` | Docker build context 제외 규칙입니다. | Docker build | 불필요 파일 제외 |
+
+자세한 클래스/함수/입출력은 각 하위 디렉토리 README를 참고하세요.
+
 ## 보안 고려사항
 
 1. **API 접근 제어**: 프로덕션에서는 API 엔드포인트에 인증 추가 권장
