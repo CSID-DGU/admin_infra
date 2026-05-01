@@ -66,7 +66,8 @@ app.config.from_mapping({
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
     # PVC / storage policy
-    "STORAGE_CLASS_NAME": "nfs-nas-v3-expandable",
+    "USER_STORAGE_CLASS": "nfs-user-storage",
+    "GROUP_STORAGE_CLASS": "nfs-group-storage",
     "PVC_NAME_PATTERN": "pvc-{username}-share",
     "PVC_ACCESS_MODES": ["ReadWriteMany"],
     "PVC_SIZE_UNIT": "Gi",
@@ -1255,7 +1256,13 @@ def create_or_resize_pvc():
             else:
                 pvc_name = f"pvc-{name}-share"
 
-            app.logger.info(f"PVC name determined: {pvc_name}")
+            storage_class = (
+                app.config["GROUP_STORAGE_CLASS"]
+                if pvc_type == "group"
+                else app.config["USER_STORAGE_CLASS"]
+            )
+
+            app.logger.info(f"PVC name determined: {pvc_name}, storage_class: {storage_class}")
 
             try:
                 # Check if PVC exists
@@ -1295,7 +1302,7 @@ def create_or_resize_pvc():
                             resources=client.V1ResourceRequirements(
                                 requests={"storage": storage}
                             ),
-                            storage_class_name="nfs-nas-v3-expandable"
+                            storage_class_name=storage_class
                         )
                     )
                     core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
