@@ -41,6 +41,8 @@ spec:
               value: "{{ .Values.security.sudoAllowedCommands }}"
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
+            - name: NFS_SHARE_ROOT
+              value: "/kube_share"
           readinessProbe:
             httpGet:
               path: /health
