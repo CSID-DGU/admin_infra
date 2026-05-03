@@ -59,7 +59,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `read_passwd_lines`, `write_passwd_lines`, `parse_passwd_line`, `format_passwd_entry` | function group | passwd 파일을 읽고 쓰며 행과 dict를 상호 변환한다. | passwd lines 또는 entry dict | passwd line list 또는 formatted line |
 | `read_group_lines`, `write_group_lines`, `parse_group_line`, `format_group_entry` | function group | group 파일을 읽고 쓰며 멤버 목록을 dict로 변환한다. | group lines 또는 entry dict | group line list 또는 formatted line |
 | `read_shadow_lines`, `write_shadow_lines`, `parse_shadow_line`, `format_shadow_entry` | function group | shadow 파일을 읽고 쓰며 패스워드 aging 필드를 변환한다. | shadow lines 또는 entry dict | shadow line list 또는 formatted line |
-| `create_directory_with_permissions`, `delete_directory_if_exists` | function | NFS PVC 디렉토리를 만들고 uid/gid 권한을 맞추거나 삭제한다. | username/PV name, pvc_type, optional username | NFS 디렉토리 생성/권한 변경/삭제 |
+| `create_directory_with_permissions`, `delete_directory_if_exists` | function | CSI 서브디렉터리(`NFS_SHARE_ROOT`/user/ 또는 …/group-volumes/)에 대해 권한을 맞추거나 삭제한다. | PVC 이름·타입·lookup 이름 | 디렉터리 생성(chown/chmod) 또는 삭제 |
 | `get_node_gpu_score`, `select_best_node_from_prometheus` | function | Prometheus query로 GPU 노드 부하 점수를 계산하고 최적 노드를 고른다. | node list, Prometheus URL, timeout | score float 또는 best node |
 
 ## `bg_img_redis.py` 함수
@@ -162,7 +162,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 각 PVC 요청마다 `name`, `type`, `storage`, optional `pvc_name`을 읽는다. `type`은 `user` 또는 `group`만 허용한다. PVC 이름은 직접 받은 `pvc_name`이 있으면 그것을 쓰고, 없으면 user는 `pvc-<name>-share`, group은 `pvc-<name>-group-share`로 만든다.
 
-이미 PVC가 있으면 Kubernetes patch API로 storage request를 수정해 resize한다. 없으면 새 PVC를 만들고 최대 30초 동안 Bound 상태와 PV 이름을 기다린다. PV 이름을 얻으면 `create_directory_with_permissions()`에 PV 이름과 원래 사용자/그룹 이름을 넘겨 NFS 실제 디렉토리 소유권과 권한을 맞춘다. 여러 PVC를 한 요청에서 처리하므로 응답은 항상 `results` 배열 중심이다.
+이미 PVC가 있으면 Kubernetes patch API로 storage request를 수정해 resize한다. 없으면 새 PVC를 만들고 최대 30초 동안 Bound 상태와 PV 이름을 기다린다. Bound 후 `create_directory_with_permissions(pvc_name, type, name)`로 `/kube_share` 마운트 아래 CSI 경로(`user/<pvc>` 또는 `group-volumes/<pvc>`)의 소유권을 맞춘다. 여러 PVC를 한 요청에서 처리하므로 응답은 항상 `results` 배열 중심이다.
 
 ### `create_user`
 
