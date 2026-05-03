@@ -15,4 +15,5 @@ mountOptions:
 parameters:
   server: 
   share: /volume1/share
-  subdir: group/${pvc.metadata.name}
+  # change th name 
+  subdir: group-volumes/${pvc.metadata.name}
