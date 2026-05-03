@@ -66,8 +66,9 @@ app.config.from_mapping({
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
     # PVC / storage policy
-    "STORAGE_CLASS_NAME": "nfs-nas-v3-expandable",
-    "PVC_NAME_PATTERN": "pvc-{username}-share",
+    "USER_STORAGE_CLASS": "nfs-user-storage",
+    "GROUP_STORAGE_CLASS": "nfs-group-storage",
+    "DEFAULT_PVC_SIZE": 50,
     "PVC_ACCESS_MODES": ["ReadWriteMany"],
     "PVC_SIZE_UNIT": "Gi",
 
@@ -670,7 +671,7 @@ def build_pod_spec(
     
         app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
     
-        pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
+        pvc_name = username  # 새 컨벤션: user PVC 이름 = username
         app.logger.debug(f"[POD SPEC] pvc_name={pvc_name}")
     
         gpu_volume_mounts = []
@@ -1189,16 +1190,39 @@ def migrate():
 
 
 
+def _parse_pvc_request(data: dict) -> list:
+    """요청 바디에서 pvcs 목록 파싱. legacy 단일 포맷도 지원."""
+    pvcs = data.get("pvcs", [])
+    if not pvcs and data.get("username"):
+        pvcs = [{
+            "name": data["username"],
+            "type": "user",
+            "storage": data.get("storage"),
+        }]
+    return pvcs
+
+
+def _resolve_pvc_name(name: str, pvc_type: str) -> str:
+    """새 컨벤션: PVC 이름 = name (user → username, group → groupname)."""
+    return name
+
+
+def _resolve_storage_class(pvc_type: str) -> str:
+    if pvc_type == "group":
+        return app.config["GROUP_STORAGE_CLASS"]
+    return app.config["USER_STORAGE_CLASS"]
+
+
 @app.route("/pvc", methods=["POST"])
-def create_or_resize_pvc():
+def create_pvc():
     """
-    PVC 생성 또는 용량 확장 API
+    PVC 생성 API (생성 전용 — 이미 존재하면 409)
 
     ---
     tags:
     - Storage
 
-    summary: PVC 생성 또는 확장
+    summary: PVC 생성
 
     parameters:
 
@@ -1222,28 +1246,149 @@ def create_or_resize_pvc():
                       - group
                   storage:
                     type: integer
+                    description: 용량(Gi). 생략 시 기본값 적용
                     example: 50
 
     responses:
 
       200:
-        description: PVC 처리 결과
+        description: PVC 생성 결과 목록
       400:
         description: 잘못된 요청
       500:
         description: 서버 오류
     """
     data = request.get_json(force=True)
-    pvcs = data.get("pvcs", [])
-    
-    # Legacy support for old format
-    if not pvcs and data.get("username") and data.get("storage"):
-        pvcs = [{
-            "name": data["username"],
-            "type": "user",
-            "storage": data["storage"]
-        }]
-    
+    pvcs = _parse_pvc_request(data)
+
+    if not pvcs:
+        return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
+
+    results = []
+    namespace = app.config["NAMESPACE"]
+    default_size = app.config["DEFAULT_PVC_SIZE"]
+
+    try:
+        load_k8s()
+        core_v1 = client.CoreV1Api()
+
+        for pvc_config in pvcs:
+            name = pvc_config.get("name")
+            pvc_type = pvc_config.get("type", "user")
+            storage_raw = pvc_config.get("storage") or default_size
+
+            if not name:
+                results.append({"error": f"name is required for {pvc_config}"})
+                continue
+
+            if pvc_type not in ["user", "group"]:
+                results.append({"error": f"type must be 'user' or 'group' for {name}"})
+                continue
+
+            storage = f"{storage_raw}Gi"
+            pvc_name = _resolve_pvc_name(name, pvc_type)
+            sc_name = _resolve_storage_class(pvc_type)
+
+            app.logger.info(f"[PVC CREATE] name={pvc_name} type={pvc_type} storage={storage} sc={sc_name}")
+
+            try:
+                try:
+                    core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+                    results.append({"error": f"PVC {pvc_name} already exists", "name": name, "pvc_name": pvc_name})
+                    continue
+                except client.exceptions.ApiException as e:
+                    if e.status != 404:
+                        results.append({"error": f"Kubernetes API error for {name}: {e.body}"})
+                        continue
+
+                pvc_body = client.V1PersistentVolumeClaim(
+                    metadata=client.V1ObjectMeta(
+                        name=pvc_name,
+                        annotations={"nfs.io/username": name, "nfs.io/type": pvc_type}
+                    ),
+                    spec=client.V1PersistentVolumeClaimSpec(
+                        access_modes=["ReadWriteMany"],
+                        resources=client.V1ResourceRequirements(
+                            requests={"storage": storage}
+                        ),
+                        storage_class_name=sc_name
+                    )
+                )
+                core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+                app.logger.info(f"[PVC CREATE] created {pvc_name}")
+
+                # PVC가 Bound될 때까지 대기 후 디렉터리 권한 설정
+                max_wait, pv_name = 30, None
+                for _ in range(max_wait):
+                    pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
+                    if pvc.status.phase == "Bound" and pvc.spec.volume_name:
+                        pv_name = pvc.spec.volume_name
+                        break
+                    time.sleep(1)
+
+                if pv_name:
+                    create_directory_with_permissions(pv_name, pvc_type, username=name)
+                else:
+                    app.logger.warning(f"[PVC CREATE] PVC not bound after {max_wait}s, skipping dir setup")
+
+                results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
+
+            except Exception as e:
+                results.append({"error": f"Failed to process {name}: {str(e)}"})
+
+        return jsonify({"results": results})
+
+    except Exception as e:
+        return jsonify({"results": [{"error": str(e)}]}), 500
+
+
+@app.route("/pvc", methods=["PATCH"])
+def resize_pvc():
+    """
+    PVC 용량 확장 API (리사이즈 전용 — 없으면 404)
+
+    ---
+    tags:
+    - Storage
+
+    summary: PVC 용량 확장
+
+    parameters:
+
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            pvcs:
+              type: array
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: alice
+                  type:
+                    type: string
+                    enum:
+                      - user
+                      - group
+                  storage:
+                    type: integer
+                    example: 100
+
+    responses:
+
+      200:
+        description: PVC 리사이즈 결과 목록
+      400:
+        description: 잘못된 요청
+      500:
+        description: 서버 오류
+    """
+    data = request.get_json(force=True)
+    pvcs = _parse_pvc_request(data)
+
     if not pvcs:
         return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
 
@@ -1251,120 +1396,46 @@ def create_or_resize_pvc():
     namespace = app.config["NAMESPACE"]
 
     try:
-        try:
-            k8s_config.load_incluster_config()
-        except:
-            k8s_config.load_kube_config()
-
+        load_k8s()
         core_v1 = client.CoreV1Api()
 
         for pvc_config in pvcs:
             name = pvc_config.get("name")
             pvc_type = pvc_config.get("type", "user")
             storage_raw = pvc_config.get("storage")
-            custom_pvc_name = pvc_config.get("pvc_name")
-
-            app.logger.info(f"Processing PVC request: name={name}, type={pvc_type}, storage={storage_raw}")
 
             if not name or not storage_raw:
-                app.logger.error(f"Missing required fields for {pvc_config}")
-                results.append({"error": f"name and storage required for {pvc_config}"})
+                results.append({"error": f"name and storage are required for resize: {pvc_config}"})
                 continue
 
             if pvc_type not in ["user", "group"]:
-                app.logger.error(f"Invalid PVC type '{pvc_type}' for {name}")
                 results.append({"error": f"type must be 'user' or 'group' for {name}"})
                 continue
 
             storage = f"{storage_raw}Gi"
+            pvc_name = _resolve_pvc_name(name, pvc_type)
 
-            # PVC naming
-            if custom_pvc_name:
-                pvc_name = custom_pvc_name
-            elif pvc_type == "group":
-                pvc_name = f"pvc-{name}-group-share"
-            else:
-                pvc_name = f"pvc-{name}-share"
-
-            app.logger.info(f"PVC name determined: {pvc_name}")
+            app.logger.info(f"[PVC RESIZE] name={pvc_name} storage={storage}")
 
             try:
-                # Check if PVC exists
-                app.logger.info(f"Checking if PVC {pvc_name} already exists...")
                 try:
-                    existing_pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-                    app.logger.info(f"PVC {pvc_name} already exists, performing resize operation")
-                    # Exists -> resize
-                    patch_body = {
-                        "spec": {
-                            "resources": {
-                                "requests": {
-                                    "storage": storage
-                                }
-                            }
-                        }
-                    }
-                    core_v1.patch_namespaced_persistent_volume_claim(
-                        name=pvc_name,
-                        namespace=namespace,
-                        body=patch_body
-                    )
-                    results.append({"status": "resized", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
+                    core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
                 except client.exceptions.ApiException as e:
-                    if e.status != 404:
-                        results.append({"error": f"Kubernetes API error for {name}: {e.body}"})
+                    if e.status == 404:
+                        results.append({"error": f"PVC {pvc_name} not found", "name": name, "pvc_name": pvc_name})
                         continue
+                    results.append({"error": f"Kubernetes API error for {name}: {e.body}"})
+                    continue
 
-                    # PVC doesn't exist → create
-                    pvc_body = client.V1PersistentVolumeClaim(
-                        metadata=client.V1ObjectMeta(
-                            name=pvc_name,
-                            annotations={"nfs.io/username": name, "nfs.io/type": pvc_type}
-                        ),
-                        spec=client.V1PersistentVolumeClaimSpec(
-                            access_modes=["ReadWriteMany"],
-                            resources=client.V1ResourceRequirements(
-                                requests={"storage": storage}
-                            ),
-                            storage_class_name="nfs-nas-v3-expandable"
-                        )
-                    )
-                    core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-                    app.logger.info(f"Created PVC: {pvc_name}")
-
-                    # Wait for PVC to be bound and get the actual PV name
-                    import time
-                    max_wait = 30  # 30 seconds timeout
-                    wait_time = 0
-                    pv_name = None
-
-                    app.logger.info(f"Waiting for PVC {pvc_name} to be bound...")
-                    while wait_time < max_wait:
-                        try:
-                            pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-                            app.logger.debug(f"PVC status: {pvc.status.phase}, volume_name: {pvc.spec.volume_name}")
-                            if pvc.status.phase == "Bound" and pvc.spec.volume_name:
-                                pv_name = pvc.spec.volume_name
-                                app.logger.info(f"PVC bound to PV: {pv_name}")
-                                break
-                        except Exception as e:
-                            app.logger.debug(f"Error checking PVC status: {e}")
-                        time.sleep(1)
-                        wait_time += 1
-
-                    # NFS storage class automatically creates directory, but we need to set proper ownership and permissions
-                    if pv_name:
-                        app.logger.info(f"Creating directory with PV name: {pv_name}")
-                        create_directory_with_permissions(pv_name, pvc_type, username=name)
-                    else:
-                        app.logger.warning(f"Failed to get PV name after {max_wait}s, using fallback: {name}")
-                        # Fallback to original behavior if PV name not found
-                        create_directory_with_permissions(name, pvc_type)
-                    
-                    results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
+                core_v1.patch_namespaced_persistent_volume_claim(
+                    name=pvc_name,
+                    namespace=namespace,
+                    body={"spec": {"resources": {"requests": {"storage": storage}}}}
+                )
+                results.append({"status": "resized", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
 
             except Exception as e:
-                results.append({"error": f"Failed to process {name}: {str(e)}"})
+                results.append({"error": f"Failed to resize {name}: {str(e)}"})
 
         return jsonify({"results": results})
 
