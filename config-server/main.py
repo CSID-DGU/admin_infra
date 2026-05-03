@@ -561,6 +561,27 @@ def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str
     return primary_gid, primary_group_name
 
 
+def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]:
+    """Map supplementary GIDs to (group_name, gid) pairs.
+
+    Excludes the user's primary group (not shared) and any GID with no
+    matching entry in the local group file. Order follows gid_list.
+    """
+    result: List[tuple] = []
+    seen = set()
+    g_lines = read_group_lines()
+    for gid in gid_list:
+        if gid == primary_gid or gid in seen:
+            continue
+        seen.add(gid)
+        for line in g_lines:
+            rec = parse_group_line(line)
+            if rec and rec["gid"] == gid:
+                result.append((rec["name"], gid))
+                break
+    return result
+
+
 def _get_sudo_allowed_commands() -> List[str]:
     return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
 
@@ -698,7 +719,23 @@ def build_pod_spec(
     
         volume_mounts.extend(gpu_volume_mounts)
         volumes.extend(gpu_volumes)
-    
+
+        # 그룹 공유 볼륨 마운트: /shared/<groupname> -> pvc-<groupname>-group-share
+        shared_groups = _resolve_shared_groups(gid_list, primary_gid)
+        app.logger.info(f"[POD SPEC] shared groups: {shared_groups}")
+        for group_name, _gid in shared_groups:
+            volume_mounts.append({
+                "name": f"shared-{group_name}",
+                "mountPath": f"/shared/{group_name}",
+                "readOnly": False
+            })
+            volumes.append({
+                "name": f"shared-{group_name}",
+                "persistentVolumeClaim": {
+                    "claimName": f"pvc-{group_name}-group-share"
+                }
+            })
+
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
     # 계정 파일 마운트 -> NFS 마운트 대체
         account_file_mounts = []
@@ -809,7 +846,8 @@ def build_pod_spec(
                                                     {"name": "UID", "value": str(uid)},
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
-                                                    {"name": "SHELL", "value": "/bin/bash"}
+                                                    {"name": "SHELL", "value": "/bin/bash"},
+                                                    {"name": "SHARED_GROUPS", "value": ",".join(f"{n}:{g}" for n, g in shared_groups)}
                                                 ],
                                                 "resources": {
                                                     "requests": {
