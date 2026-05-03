@@ -404,10 +404,15 @@ def create_pod():
         was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
         app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
 
-        user_info = requests.get(
-            was_url,
-            timeout=app.config["HTTP_TIMEOUT_SEC"]
-        ).json()
+        resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
+        user_info = resp.json()
+        # WAS가 HTTP 200 + body {"status": 404} 형태로 유저 없음을 알리는 경우 처리
+        if user_info.get("status") == 404 or resp.status_code == 404:
+            app.logger.warning(f"[CREATE POD] user {username!r} not found in WAS")
+            return jsonify({"error": f"user {username!r} not found in WAS"}), 404
+        if resp.status_code >= 400:
+            app.logger.error(f"[CREATE POD] WAS returned {resp.status_code}")
+            return jsonify({"error": f"WAS returned {resp.status_code} for user {username!r}"}), 502
 
         app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
 
@@ -601,9 +606,35 @@ def build_pod_spec(
     target_node = canonical
 
     image = load_user_image(username, user_info["image"])
-    uid = user_info["uid"]
-    gid_list = _normalize_gid_list(user_info["gid"])
-    primary_gid, primary_group_name = _resolve_primary_group(username, gid_list)
+
+    # passwd가 uid/gid의 단일 진실 소스 — WAS 값은 무시
+    passwd_rec = None
+    for _line in read_passwd_lines():
+        _rec = parse_passwd_line(_line)
+        if _rec and _rec["name"] == username:
+            passwd_rec = _rec
+            break
+    if passwd_rec is None:
+        raise ValueError(
+            f"user {username!r} not found in /etc/passwd — "
+            "PUT /accounts/users로 계정을 먼저 생성하세요"
+        )
+    uid = passwd_rec["uid"]
+    primary_gid = passwd_rec["gid"]
+    primary_group_name = username
+    for _line in read_group_lines():
+        _rec = parse_group_line(_line)
+        if _rec and _rec["gid"] == primary_gid:
+            primary_group_name = _rec["name"]
+            break
+
+    # group 멤버 홈 마운트용 gid 목록: groups 배열(신규 포맷) 우선, 없으면 gid 필드
+    groups_from_was = user_info.get("groups", [])
+    if groups_from_was and isinstance(groups_from_was, list) and isinstance(groups_from_was[0], dict):
+        gid_list = [g["gid"] for g in groups_from_was if isinstance(g, dict) and "gid" in g]
+    else:
+        gid_list = _normalize_gid_list(user_info.get("gid"))
+
     gpu_nodes = user_info.get("gpu_nodes", [])
     
     # 기본 포트
@@ -1649,6 +1680,16 @@ def get_user(username: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def _allocate_next_uid(lines, min_uid: int = 10000) -> int:
+    """passwd 라인 목록에서 min_uid 이상인 uid 중 최댓값 + 1을 반환."""
+    max_uid = min_uid - 1
+    for line in lines:
+        rec = parse_passwd_line(line)
+        if rec and rec["uid"] >= min_uid:
+            max_uid = max(max_uid, rec["uid"])
+    return max_uid + 1
+
+
 @accounts_bp.route("/users", methods=["PUT"])
 def create_user():
     """
@@ -1681,8 +1722,6 @@ def create_user():
           type: object
           required:
             - name
-            - uid
-            - gid
             - passwd_sha512
           properties:
             name:
@@ -1691,11 +1730,11 @@ def create_user():
               example: user2100
             uid:
               type: integer
-              description: 사용자 UID
+              description: 사용자 UID (생략 시 자동 할당, 지정 시 중복 체크)
               example: 2100
             gid:
               type: integer
-              description: 기본 그룹 GID
+              description: 기본 그룹 GID (생략 시 uid와 동일하게 할당)
               example: 2100
             passwd_sha512:
               type: string
@@ -1720,21 +1759,42 @@ def create_user():
         description: 서버 오류
     """
     data = request.get_json(force=True)
-    required = ["name", "uid", "gid", "passwd_sha512"]
+    required = ["name", "passwd_sha512"]
     missing = [k for k in required if k not in data]
     if missing:
         return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
 
     name = data["name"]
     lines = read_passwd_lines()
+
+    # username 중복 체크
     if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
         return jsonify({"error": "user already exists"}), 409
+
+    # uid: WAS가 지정하면 그대로, 없으면 자동 할당
+    if "uid" in data:
+        uid = int(data["uid"])
+        # 지정된 uid 중복 체크
+        dup = next((parse_passwd_line(l)["name"] for l in lines
+                    if (parse_passwd_line(l) or {}).get("uid") == uid), None)
+        if dup:
+            return jsonify({"error": f"uid {uid} is already used by {dup!r}"}), 409
+    else:
+        uid = _allocate_next_uid(lines)
+        app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} for user={name}")
+
+    # gid: WAS가 지정하면 그대로, 없으면 uid와 동일하게 할당 (1:1 primary group 관행)
+    if "gid" in data:
+        gid = int(data["gid"])
+    else:
+        gid = uid
+        app.logger.info(f"[ACCOUNTS] auto-assigned gid={gid} for user={name}")
 
     entry = {
         "name": name,
         "passwd": "x",  # shadow-based auth
-        "uid": int(data["uid"]),
-        "gid": int(data["gid"]),
+        "uid": uid,
+        "gid": gid,
         "gecos": data.get("gecos", ""),
         "home": f"/home/{name}",
         "shell": "/bin/bash",
