@@ -1,5 +1,5 @@
 cd ~/admin_infra
-helm upgrade pvc-test-jy ./pvc-chart -n containerssh
+helm upgrade --install pvc-test-jy ./pvc-chart -n cssh
 
-kubectl get pv -n containerssh
-kubectl get pvc -n containerssh
+kubectl get pvc -n cssh
+kubectl get pv | grep -E 'pvc-jy-share|nfs-user-storage' || kubectl get pv

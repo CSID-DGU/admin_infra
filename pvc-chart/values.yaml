@@ -1,5 +1,8 @@
 
-storageClass: nfs-nas-v3-expandable
+# type "user" or "group"
+# - user  -> pvc-<username>-share  storageClass: nfs-user-storage
+# - group -> pvc-<username>-group-share  storageClass: nfs-group-storage
+type: user
 
 basePath: /volume1/share
 username: jy

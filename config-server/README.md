@@ -59,9 +59,8 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `read_passwd_lines`, `write_passwd_lines`, `parse_passwd_line`, `format_passwd_entry` | function group | passwd 파일을 읽고 쓰며 행과 dict를 상호 변환한다. | passwd lines 또는 entry dict | passwd line list 또는 formatted line |
 | `read_group_lines`, `write_group_lines`, `parse_group_line`, `format_group_entry` | function group | group 파일을 읽고 쓰며 멤버 목록을 dict로 변환한다. | group lines 또는 entry dict | group line list 또는 formatted line |
 | `read_shadow_lines`, `write_shadow_lines`, `parse_shadow_line`, `format_shadow_entry` | function group | shadow 파일을 읽고 쓰며 패스워드 aging 필드를 변환한다. | shadow lines 또는 entry dict | shadow line list 또는 formatted line |
-| `create_directory_with_permissions`, `delete_directory_if_exists` | function | NFS PVC 디렉토리를 만들고 uid/gid 권한을 맞추거나 삭제한다. | username/PV name, pvc_type, optional username | NFS 디렉토리 생성/권한 변경/삭제 |
+| `create_directory_with_permissions`, `delete_directory_if_exists` | function | CSI 서브디렉터리(`NFS_SHARE_ROOT`/user/ 또는 …/group-volumes/)에 대해 권한을 맞추거나 삭제한다. | PVC 이름·타입·lookup 이름 | 디렉터리 생성(chown/chmod) 또는 삭제 |
 | `get_node_gpu_score`, `select_best_node_from_prometheus` | function | Prometheus query로 GPU 노드 부하 점수를 계산하고 최적 노드를 고른다. | node list, Prometheus URL, timeout | score float 또는 best node |
-| `get_group_members_home_volumes` | function | 같은 그룹 구성원의 홈 PVC를 읽기 전용 mount로 추가하기 위한 spec 조각을 만든다. | gid list, current username | `(volume_mounts, volumes)` |
 
 ## `bg_img_redis.py` 함수
 
@@ -98,7 +97,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 3. `generate_pod_name()`으로 `containerssh-<username>-<random>` 형식의 Pod 이름을 만든다.
 4. Kubernetes API로 같은 이름의 Pod가 이미 있는지 확인한다. 충돌하면 409를 반환한다.
 5. WAS에서 받은 `gpu_nodes`를 후보 노드 목록으로 만들고, `select_best_node_from_prometheus()`로 GPU 사용량 점수가 가장 낮은 노드를 고른다.
-6. `build_pod_spec()`를 호출해 Kubernetes Pod spec과 NodePort 할당 결과를 만든다. 이 단계 안에서 계정 파일 준비, 이미지 선택, PVC mount, GPU device mount, 그룹 공유 홈 mount, NodePort DB 할당이 함께 처리된다.
+6. `build_pod_spec()`를 호출해 Kubernetes Pod spec과 NodePort 할당 결과를 만든다. 이 단계 안에서 계정 파일 준비, 이미지 선택, PVC mount, GPU device mount, NodePort DB 할당이 함께 처리된다.
 7. Kubernetes에 Pod를 생성하고 최대 60초 동안 Ready 상태를 기다린다.
 8. Pod가 Ready가 되면 `create_nodeport_services()`로 SSH/Jupyter/추가 포트용 NodePort Service를 생성한다.
 9. 성공하면 `{status, node, pod_name, ports}`를 201로 반환한다.
@@ -117,7 +116,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 4. passwd/group 파일을 읽어 사용자의 primary gid와 group name을 결정한다.
 5. 기본 포트 22(ssh), 8888(jupyter)에 WAS의 `additional_ports`를 더한 뒤 `allocate_nodeports()`로 외부 NodePort를 선점한다.
 6. 선택된 GPU 노드 정보에서 CPU, memory, GPU 개수를 읽고 resource limit과 GPU device hostPath mount를 구성한다.
-7. 사용자 홈 PVC, image-store PVC, 같은 그룹 구성원 홈 PVC, 계정 파일(passwd/group/shadow/bashrc/bash_logout/sudoers)을 volume과 volumeMount로 추가한다.
+7. 사용자 홈 PVC, image-store PVC, 계정 파일(passwd/group/shadow/bashrc/bash_logout/sudoers)을 volume과 volumeMount로 추가한다.
 8. 최종 Pod metadata, container env, resource, volume spec을 dict로 만들어 반환한다.
 
 이 함수에서 NodePort 할당이 이미 일어나므로, spec 생성 후 예외가 발생하면 `release_nodeports()`를 호출해 DB allocation을 되돌린다. 따라서 이 함수는 단순 dict builder가 아니라 "Pod 생성 전에 필요한 외부 상태를 일부 선점하는 함수"로 이해하는 편이 정확하다.
@@ -163,7 +162,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 각 PVC 요청마다 `name`, `type`, `storage`, optional `pvc_name`을 읽는다. `type`은 `user` 또는 `group`만 허용한다. PVC 이름은 직접 받은 `pvc_name`이 있으면 그것을 쓰고, 없으면 user는 `pvc-<name>-share`, group은 `pvc-<name>-group-share`로 만든다.
 
-이미 PVC가 있으면 Kubernetes patch API로 storage request를 수정해 resize한다. 없으면 새 PVC를 만들고 최대 30초 동안 Bound 상태와 PV 이름을 기다린다. PV 이름을 얻으면 `create_directory_with_permissions()`에 PV 이름과 원래 사용자/그룹 이름을 넘겨 NFS 실제 디렉토리 소유권과 권한을 맞춘다. 여러 PVC를 한 요청에서 처리하므로 응답은 항상 `results` 배열 중심이다.
+이미 PVC가 있으면 Kubernetes patch API로 storage request를 수정해 resize한다. 없으면 새 PVC를 만들고 최대 30초 동안 Bound 상태와 PV 이름을 기다린다. Bound 후 `create_directory_with_permissions(pvc_name, type, name)`로 `/kube_share` 마운트 아래 CSI 경로(`user/<pvc>` 또는 `group-volumes/<pvc>`)의 소유권을 맞춘다. 여러 PVC를 한 요청에서 처리하므로 응답은 항상 `results` 배열 중심이다.
 
 ### `create_user`
 
