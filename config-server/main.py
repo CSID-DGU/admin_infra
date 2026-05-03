@@ -1730,12 +1730,10 @@ def create_user():
               example: user2100
             uid:
               type: integer
-              description: 사용자 UID (생략 시 자동 할당, 지정 시 중복 체크)
-              example: 2100
+              description: (무시됨) uid/gid는 인프라에서 자동 할당
             gid:
               type: integer
-              description: 기본 그룹 GID (생략 시 uid와 동일하게 할당)
-              example: 2100
+              description: (무시됨) gid는 uid와 동일하게 자동 할당
             passwd_sha512:
               type: string
               description: SHA-512 해시 패스워드
@@ -1771,24 +1769,10 @@ def create_user():
     if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
         return jsonify({"error": "user already exists"}), 409
 
-    # uid: WAS가 지정하면 그대로, 없으면 자동 할당
-    if "uid" in data:
-        uid = int(data["uid"])
-        # 지정된 uid 중복 체크
-        dup = next((parse_passwd_line(l)["name"] for l in lines
-                    if (parse_passwd_line(l) or {}).get("uid") == uid), None)
-        if dup:
-            return jsonify({"error": f"uid {uid} is already used by {dup!r}"}), 409
-    else:
-        uid = _allocate_next_uid(lines)
-        app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} for user={name}")
-
-    # gid: WAS가 지정하면 그대로, 없으면 uid와 동일하게 할당 (1:1 primary group 관행)
-    if "gid" in data:
-        gid = int(data["gid"])
-    else:
-        gid = uid
-        app.logger.info(f"[ACCOUNTS] auto-assigned gid={gid} for user={name}")
+    # uid/gid는 인프라에서 단독 관리 — WAS 전달값 무시하고 항상 자동 할당
+    uid = _allocate_next_uid(lines)
+    gid = uid
+    app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
 
     entry = {
         "name": name,
