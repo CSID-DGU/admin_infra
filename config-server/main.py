@@ -28,7 +28,6 @@ from utils import (
     parse_shadow_line, format_shadow_entry,
     create_directory_with_permissions,
     delete_directory_if_exists,
-    get_group_members_home_volumes,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     load_user_image,
@@ -701,10 +700,6 @@ def build_pod_spec(
         volumes.extend(gpu_volumes)
     
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
-    
-        group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
-        volume_mounts.extend(group_mounts)
-        volumes.extend(group_vols)
     # 계정 파일 마운트 -> NFS 마운트 대체
         account_file_mounts = []
         # fallback 세팅
