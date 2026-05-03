@@ -1361,14 +1361,16 @@ def create_or_resize_pvc():
                         time.sleep(1)
                         wait_time += 1
 
-                    # NFS storage class automatically creates directory, but we need to set proper ownership and permissions
+                    # CSI creates user/<pvc> or group-volumes/<pvc>; align ownership on share mount (/kube_share).
                     if pv_name:
-                        app.logger.info(f"Creating directory with PV name: {pv_name}")
-                        create_directory_with_permissions(pv_name, pvc_type, username=name)
+                        app.logger.info(f"PVC bound PV={pv_name}; setting ownership for {pvc_name}")
+                        create_directory_with_permissions(pvc_name, pvc_type, name)
                     else:
-                        app.logger.warning(f"Failed to get PV name after {max_wait}s, using fallback: {name}")
-                        # Fallback to original behavior if PV name not found
-                        create_directory_with_permissions(name, pvc_type)
+                        app.logger.warning(
+                            "PVC %s not bound within %ss; skipping chown (directory may not exist yet)",
+                            pvc_name,
+                            max_wait,
+                        )
                     
                     results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
 
@@ -1498,8 +1500,7 @@ def delete_pvc():
                         results.append({"error": f"Failed to delete PVC {pvc_name}: {e.body}"})
                         continue
 
-                # Delete directory
-                delete_directory_if_exists(name, pvc_type)
+                delete_directory_if_exists(pvc_name, pvc_type)
                 
                 results.append({
                     "status": "deleted", 
