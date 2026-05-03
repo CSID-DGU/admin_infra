@@ -1,10 +1,10 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: pvc-{{ .Values.username }}-share
+  name: {{ .Values.name }}
   namespace: {{ .Values.config.namespace }}
   annotations:
-    nfs.io/username: "{{ .Values.username }}"
+    nfs.io/type: "{{ .Values.type }}"
 spec:
   accessModes:
     - ReadWriteMany
@@ -13,4 +13,3 @@ spec:
       storage: "{{ .Values.storageSize }}"
   storageClassName: "{{ .Values.storageClass }}"
   volumeMode: Filesystem
-

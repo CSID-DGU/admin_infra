@@ -1,11 +1,11 @@
 
-storageClass: nfs-nas-v3-expandable
+# type: user or group
+type: user
+storageClass: nfs-user-storage
 
-basePath: /volume1/share
-username: jy
+name: username-or-groupname
 nfsServer: 192.168.2.30
-storageSize: 20Gi
+storageSize: 50Gi
 
 config:
-  namespace: cssh
-
+  namespace: ailab-infra
