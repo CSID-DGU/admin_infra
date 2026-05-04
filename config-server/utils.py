@@ -676,8 +676,11 @@ def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:
         return float("inf")
 
 
+_rr_index: int = 0
+
 def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeout: float):
-    """Select the best node from a list based on Prometheus metrics
+    """Select the best node from a list based on Prometheus metrics.
+    Ties are broken by round robin across calls.
 
     Args:
         node_list: List of node names to evaluate
@@ -687,13 +690,12 @@ def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeou
     Returns:
         str: Name of the best node, or None if all queries fail
     """
+    global _rr_index
     import requests
-
-    best_node = None
-    best_score = float("inf")
 
     app.logger.debug(f"Starting Prometheus node selection for nodes: {node_list}")
 
+    scores: dict[str, float] = {}
     for node in node_list:
         query = f"""
         (
@@ -710,10 +712,17 @@ def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeou
         except Exception as e:
             app.logger.debug(f"Failed to query node {node}: {e}")
             value = float("inf")
+        scores[node] = value
 
-        if value < best_score:
-            best_score = value
-            best_node = node
+    if not scores:
+        return None
 
-    app.logger.debug(f"Best node selected: {best_node} with score: {best_score}")
-    return best_node
+    best_score = min(scores.values())
+    tied_nodes = [n for n, s in scores.items() if s == best_score]
+
+    # round robin으로 동점 노드 중 선택
+    chosen = tied_nodes[_rr_index % len(tied_nodes)]
+    _rr_index += 1
+
+    app.logger.debug(f"Best score: {best_score}, tied nodes: {tied_nodes}, chosen: {chosen} (rr_index={_rr_index})")
+    return chosen
