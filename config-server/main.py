@@ -404,10 +404,14 @@ def create_pod():
         was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
         app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
 
-        user_info = requests.get(
-            was_url,
-            timeout=app.config["HTTP_TIMEOUT_SEC"]
-        ).json()
+        was_resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
+        if was_resp.status_code == 404:
+            app.logger.warning(f"[CREATE POD] user '{username}' not found in WAS (404)")
+            return jsonify({"error": f"user '{username}' not found in WAS"}), 404
+        if was_resp.status_code != 200:
+            app.logger.error(f"[CREATE POD] WAS returned HTTP {was_resp.status_code} for user '{username}'")
+            return jsonify({"error": f"WAS error for user '{username}' (HTTP {was_resp.status_code})"}), 502
+        user_info = was_resp.json()
 
         app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
 
@@ -428,9 +432,27 @@ def create_pod():
         # Prometheus 기반 노드 선택
         node_list = [
             str(n["node_name"]).strip().lower()
-            for n in user_info["gpu_nodes"]
+            for n in user_info.get("gpu_nodes", [])
             if n.get("node_name")
         ]
+
+        # gpu_nodes 미제공 시 k8s worker 노드 자동 탐지 (control-plane taint 제외)
+        if not node_list:
+            app.logger.info("[CREATE POD] gpu_nodes not provided, falling back to k8s worker node discovery")
+            try:
+                all_nodes = v1.list_node().items
+                node_list = [
+                    n.metadata.name
+                    for n in all_nodes
+                    if not any(
+                        t.key == "node-role.kubernetes.io/control-plane"
+                        for t in (n.spec.taints or [])
+                    )
+                ]
+                app.logger.info(f"[CREATE POD] discovered worker nodes: {node_list}")
+            except Exception as e:
+                app.logger.warning(f"[CREATE POD] worker node discovery failed: {e}")
+
         app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
 
         best_node = select_best_node_from_prometheus(
@@ -1036,13 +1058,17 @@ def _migrate_internal(data):
 
     # 4. WAS에서 사용자 정보 조회
     was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
-    resp = requests.get(
-        was_url,
-        timeout=app.config["HTTP_TIMEOUT_SEC"]
-    )
+    resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
 
     app.logger.info(f"[MIGRATE] WAS status={resp.status_code}")
     app.logger.debug(f"[MIGRATE] WAS body={resp.text}")
+
+    if resp.status_code == 404:
+        app.logger.warning(f"[MIGRATE] user '{username}' not found in WAS (404)")
+        return jsonify({"error": f"user '{username}' not found in WAS"}), 404
+    if resp.status_code != 200:
+        app.logger.error(f"[MIGRATE] WAS returned HTTP {resp.status_code} for user '{username}'")
+        return jsonify({"error": f"WAS error for user '{username}' (HTTP {resp.status_code})"}), 502
 
     user_info = resp.json()
 
@@ -1722,22 +1748,12 @@ def create_user():
           type: object
           required:
             - name
-            - uid
-            - gid
             - passwd_sha512
           properties:
             name:
               type: string
               description: 사용자 이름
               example: user2100
-            uid:
-              type: integer
-              description: 사용자 UID
-              example: 2100
-            gid:
-              type: integer
-              description: 기본 그룹 GID
-              example: 2100
             passwd_sha512:
               type: string
               description: SHA-512 해시 패스워드
@@ -1752,7 +1768,7 @@ def create_user():
     responses:
 
       201:
-        description: 사용자 생성 성공
+        description: 사용자 생성 성공. 응답에 할당된 uid/gid 포함.
       400:
         description: 필수 필드 누락
       409:
@@ -1761,7 +1777,7 @@ def create_user():
         description: 서버 오류
     """
     data = request.get_json(force=True)
-    required = ["name", "uid", "gid", "passwd_sha512"]
+    required = ["name", "passwd_sha512"]
     missing = [k for k in required if k not in data]
     if missing:
         return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
@@ -1771,11 +1787,36 @@ def create_user():
     if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
         return jsonify({"error": "user already exists"}), 409
 
+    # UID/GID auto-assign: max(existing user UIDs in [10000, 60000)) + 1
+    MIN_UID = 10000
+    MAX_UID = 60000
+    existing_uids = []
+    for l in lines:
+        rec = parse_passwd_line(l)
+        if rec and MIN_UID <= rec["uid"] < MAX_UID:
+            existing_uids.append(rec["uid"])
+    assigned_uid = max(existing_uids) + 1 if existing_uids else MIN_UID
+
+    # GID conflict check across both passwd and group files
+    g_lines = read_group_lines()
+    occupied_gids = set()
+    for l in lines:
+        rec = parse_passwd_line(l)
+        if rec and MIN_UID <= rec["gid"] < MAX_UID:
+            occupied_gids.add(rec["gid"])
+    for gl in g_lines:
+        rec = parse_group_line(gl)
+        if rec and MIN_UID <= rec["gid"] < MAX_UID:
+            occupied_gids.add(rec["gid"])
+    assigned_gid = assigned_uid
+    while assigned_gid in occupied_gids:
+        assigned_gid += 1
+
     entry = {
         "name": name,
         "passwd": "x",  # shadow-based auth
-        "uid": int(data["uid"]),
-        "gid": int(data["gid"]),
+        "uid": assigned_uid,
+        "gid": assigned_gid,
         "gecos": data.get("gecos", ""),
         "home": f"/home/{name}",
         "shell": "/bin/bash",
@@ -1787,8 +1828,7 @@ def create_user():
 
     # 2) primary group ensure
     pg_name = data.get("primary_group_name", name)
-    g_lines = read_group_lines()
-    target_gid = int(data["gid"])
+    target_gid = assigned_gid
     existing = None
     for gl in g_lines:
         rec = parse_group_line(gl)
