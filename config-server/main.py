@@ -172,14 +172,14 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
 
     # ── 1. k8s에서 실제 살아있는 NodePort Service의 pod_name 집합 조회 ──
     #    label_selector로 config-server가 관리하는 Service만 필터링.
-    #    (app=containerssh-nodeport 라벨은 create_nodeport_services()에서 부여)
+    #    (app=ailab-nodeport 라벨은 create_nodeport_services()에서 부여)
     load_k8s()  # utils.load_k8s — main.py 상단 import에서 가져옴
     v1 = client.CoreV1Api()
 
     try:
         services = v1.list_namespaced_service(
             namespace=namespace,
-            label_selector="app=containerssh-nodeport"
+            label_selector="app=ailab-nodeport"
         )
     except Exception as e:
         # k8s API 실패 시 reconcile 스킵. 포트 할당은 계속하고 다음 주기에 재시도.
@@ -846,10 +846,10 @@ def build_pod_spec(
                                     "name": pod_name,
                                     "namespace": ns,
                                     "labels": {
-                                        "app": "containerssh-guest",
-                                        "managed-by": "containerssh",
-                                        "containerssh_username": username,
-                                        "containerssh_pod_name": pod_name
+                                        "app": "ailab-guest",
+                                        "managed-by": "ailab-infra",
+                                        "username": username,
+                                        "pod_name": pod_name
                                     }
                                 },
                                 "spec": {
@@ -977,11 +977,11 @@ def delete_pod():
     ns = app.config["NAMESPACE"]
 
     try:
-        if not pod_name.startswith("containerssh-"):
+        if not pod_name.startswith("ailab-"):
             app.logger.warning(f"[DELETE POD] invalid pod_name format: {pod_name}")
             return jsonify({"error": "invalid pod_name"}), 400
 
-        rest = pod_name[len("containerssh-"):]
+        rest = pod_name[len("ailab-"):]
         username = rest.rsplit("-", 1)[0]
 
         app.logger.info(f"[DELETE POD] parsed username={username}")
@@ -2336,7 +2336,7 @@ swagger_template = {
                 },
                 "pod_name": {
                     "type": "string",
-                    "example": "containerssh-user2100-1"
+                    "example": "ailab-user2100-1"
                 },
                 "ports": {
                     "type": "array",
@@ -2367,7 +2367,7 @@ swagger_template = {
             "properties": {
                 "pod_name": {
                     "type": "string",
-                    "example": "containerssh-user2100-1"
+                    "example": "ailab-user2100-1"
                 }
             }
         },
