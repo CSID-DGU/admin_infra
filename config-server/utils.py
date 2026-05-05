@@ -89,7 +89,7 @@ def get_existing_pod(namespace, username):
     core_v1 = client.CoreV1Api()
     pods = core_v1.list_namespaced_pod(
         namespace=namespace,
-        label_selector=f"containerssh_username={username}"
+        label_selector=f"username={username}"
     )
     for pod in pods.items:
         app.logger.debug(
@@ -104,7 +104,7 @@ def get_existing_pod(namespace, username):
 
 def generate_pod_name(username: str) -> str:
     suffix = uuid.uuid4().hex[:8]
-    pod_name = f"containerssh-{username}-{suffix}"
+    pod_name = f"ailab-{username}-{suffix}"
 
     app.logger.debug(f"Generated pod name: {pod_name}")
 
@@ -153,7 +153,7 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
         external_port = port_info["external_port"]  # NodePort (10000-15000)
         purpose = port_info.get("usage_purpose", "custom")
 
-        service_name = f"containerssh-{username}-{purpose}-{external_port}"
+        service_name = f"ailab-{username}-{purpose}-{external_port}"
 
         app.logger.debug(
             f"[SERVICE CREATE] service={service_name} "
@@ -165,7 +165,7 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
                 name=service_name,
                 namespace=namespace,
                 labels={
-                    "app": "containerssh-nodeport",
+                    "app": "ailab-nodeport",
                     "username": username,
                     "pod_name": pod_name,
                     "purpose": purpose
@@ -173,7 +173,7 @@ def create_nodeport_services(username: str, namespace: str, pod_name: str, extra
             ),
             spec=client.V1ServiceSpec(
                 type="NodePort",
-                selector={"containerssh_pod_name": pod_name},
+                selector={"pod_name": pod_name},
                 ports=[client.V1ServicePort(
                     name=purpose,
                     protocol="TCP",
@@ -213,7 +213,7 @@ def delete_nodeport_services(pod_name: str, namespace: str):
         # username 라벨로 모든 관련 Service 조회
         services = v1.list_namespaced_service(
             namespace=namespace,
-            label_selector=f"pod_name={pod_name},app=containerssh-nodeport"
+            label_selector=f"pod_name={pod_name},app=ailab-nodeport"
         )
 
         app.logger.debug(
