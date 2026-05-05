@@ -1769,12 +1769,6 @@ def create_user():
               type: string
               description: 사용자 이름
               example: user2100
-            uid:
-              type: integer
-              description: (무시됨) uid/gid는 인프라에서 자동 할당
-            gid:
-              type: integer
-              description: (무시됨) gid는 uid와 동일하게 자동 할당
             passwd_sha512:
               type: string
               description: SHA-512 해시 패스워드
@@ -1785,6 +1779,18 @@ def create_user():
             primary_group_name:
               type: string
               example: user2100
+            supplementary_groups:
+              type: array
+              description: 추가 소속 그룹 목록 (없으면 생략 가능)
+              items:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    example: ailab
+                  gid:
+                    type: integer
+                    example: 2001
 
     responses:
 
@@ -1804,45 +1810,83 @@ def create_user():
         return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
 
     name = data["name"]
-    lines = read_passwd_lines()
-
-    # username 중복 체크
-    if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
-        return jsonify({"error": "user already exists"}), 409
-
-    # uid/gid는 인프라에서 단독 관리 — WAS 전달값 무시하고 항상 자동 할당
-    uid = _allocate_next_uid(lines)
-    gid = uid
-    app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
-
-    entry = {
-        "name": name,
-        "passwd": "x",  # shadow-based auth
-        "uid": uid,
-        "gid": gid,
-        "gecos": data.get("gecos", ""),
-        "home": f"/home/{name}",
-        "shell": "/bin/bash",
-    }
-
-    # 1) passwd
-    lines.append(format_passwd_entry(entry))
-    write_passwd_lines(lines)
-
-    # 2) primary group ensure
     pg_name = data.get("primary_group_name", name)
-    g_lines = read_group_lines()
-    target_gid = int(data["gid"])
-    existing = None
-    for gl in g_lines:
-        rec = parse_group_line(gl)
-        if rec and (rec["gid"] == target_gid or rec["name"] == pg_name):
-            existing = rec
-            break
-    if existing is None:
-        new_group = {"name": pg_name, "passwd": "x", "gid": target_gid, "members": []}
-        g_lines.append(format_group_entry(new_group))
-        write_group_lines(g_lines)
+    supp_groups = data.get("supplementary_groups", [])
+
+    for sg in supp_groups:
+        if not isinstance(sg, dict) or "name" not in sg or "gid" not in sg:
+            return jsonify({"error": "supplementary_groups must be list of {name, gid}"}), 400
+
+    ensure_etc_layout()
+
+    # 1) passwd — LOCK_EX를 read부터 write까지 유지해 uid 중복 배정 방지
+    uid = gid = None
+    entry = None
+    with LockedFile(app.config["PASSWD_PATH"], "r+") as f:
+        content = f.read()
+        lines = content.splitlines()
+
+        if any((parse_passwd_line(l) or {}).get("name") == name for l in lines):
+            return jsonify({"error": "user already exists"}), 409
+
+        uid = _allocate_next_uid(lines)
+        gid = uid
+        app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
+
+        entry = {
+            "name": name,
+            "passwd": "x",
+            "uid": uid,
+            "gid": gid,
+            "gecos": data.get("gecos", ""),
+            "home": f"/home/{name}",
+            "shell": "/bin/bash",
+        }
+        lines.append(format_passwd_entry(entry))
+        new_content = "\n".join(lines) + "\n"
+        f.seek(0)
+        f.write(new_content)
+        f.truncate()
+
+    # 2) group — primary 생성 + supplementary 멤버 추가
+    added_supp = []
+    with LockedFile(app.config["GROUP_PATH"], "r+") as f:
+        content = f.read()
+        g_lines = content.splitlines()
+
+        # primary group
+        primary_exists = any(
+            (parse_group_line(gl) or {}).get("gid") == gid or
+            (parse_group_line(gl) or {}).get("name") == pg_name
+            for gl in g_lines
+        )
+        if not primary_exists:
+            g_lines.append(format_group_entry({"name": pg_name, "passwd": "x", "gid": gid, "members": []}))
+
+        # supplementary groups
+        for sg in supp_groups:
+            sg_gid = int(sg["gid"])
+            sg_name = sg["name"]
+            found = False
+            updated = []
+            for gl in g_lines:
+                rec = parse_group_line(gl)
+                if rec and rec["gid"] == sg_gid:
+                    if name not in rec["members"]:
+                        rec["members"].append(name)
+                    updated.append(format_group_entry(rec))
+                    found = True
+                else:
+                    updated.append(gl)
+            g_lines = updated
+            if not found:
+                g_lines.append(format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
+            added_supp.append({"name": sg_name, "gid": sg_gid})
+
+        new_content = "\n".join(g_lines) + "\n"
+        f.seek(0)
+        f.write(new_content)
+        f.truncate()
 
     # 3) shadow
     today_days = int(time.time() // 86400)
@@ -1873,7 +1917,13 @@ def create_user():
         os.replace(tmp, s_path)
         os.chmod(s_path, 0o440)
 
-    return jsonify({"status": "created", "user": entry, "group": {"name": pg_name, "gid": target_gid}, "sudoers": s_path}), 201
+    return jsonify({
+        "status": "created",
+        "user": entry,
+        "group": {"name": pg_name, "gid": gid},
+        "supplementary_groups": added_supp,
+        "sudoers": s_path,
+    }), 201
 
 @accounts_bp.route("/users/<username>", methods=["DELETE"])
 def delete_user(username: str):
