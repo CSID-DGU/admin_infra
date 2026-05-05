@@ -494,43 +494,40 @@ def ensure_sudoers_dir():
     ensure_etc_layout()
 
 
-def create_directory_with_permissions(name_or_pv, pvc_type, username=None):
-    """Create directory in NFS mount and set proper ownership
+def nfs_share_root() -> str:
+    """Host path where Chart NFS export is mounted (must match deployment volume mountPath)."""
+    return os.environ.get("NFS_SHARE_ROOT", "/kube_share")
+
+
+def csi_pvc_directory_on_share(pvc_name: str, pvc_type: str) -> str:
+    """Directory created by nfs.csi.k8s.io for our StorageClasses (pvc-chart sc-nfs-*.yaml subdir)."""
+    root = nfs_share_root()
+    prefix = "group-volumes" if pvc_type == "group" else "user"
+    return os.path.join(root, prefix, pvc_name)
+
+
+def create_directory_with_permissions(pvc_name: str, pvc_type: str, lookup_name: str):
+    """Ensure CSI subdirectory exists on the share mount and set ownership (uid or root:gid).
 
     Args:
-        name_or_pv: Either username (legacy) or PV name (new behavior)
+        pvc_name: Kubernetes PVC metadata.name (e.g. pvc-alice-share).
         pvc_type: 'user' or 'group'
-        username: Original username for ownership lookup (when name_or_pv is PV name)
+        lookup_name: passwd/group lookup key (username or group name).
     """
     import subprocess
 
-    app.logger.info(f"create_directory_with_permissions called with: name_or_pv={name_or_pv}, pvc_type={pvc_type}, username={username}")
+    app.logger.info(
+        "create_directory_with_permissions pvc_name=%s type=%s lookup_name=%s share_root=%s",
+        pvc_name,
+        pvc_type,
+        lookup_name,
+        nfs_share_root(),
+    )
 
-    base_path = "/home/tako8/share"  # NFS storage class mount path
-
-    # Determine if this is a PV name (starts with 'pvc-' and has UUID format)
-    # PV names are typically 40+ characters and contain UUID-like patterns
-    is_pv_name = (name_or_pv.startswith('pvc-') and
-                  len(name_or_pv) >= 36 and  # UUID is 36 chars, plus 'pvc-' prefix
-                  '-' in name_or_pv[4:])  # Has dashes like UUID format
-    app.logger.info(f"Is PV name check: {is_pv_name} (length: {len(name_or_pv)}, starts with pvc-: {name_or_pv.startswith('pvc-')})")
-
-    if is_pv_name:
-        # Use PV name directly as directory name
-        dir_path = f"{base_path}/{name_or_pv}"
-        lookup_name = username if username else name_or_pv  # Fallback to name_or_pv if username not provided
-        app.logger.info(f"Using PV name as directory: {dir_path}, lookup user: {lookup_name}")
-    else:
-        # Legacy behavior: construct directory name from username
-        lookup_name = name_or_pv
-        if pvc_type == "group":
-            dir_path = f"{base_path}/pvc-{name_or_pv}-group-share"
-        else:
-            dir_path = f"{base_path}/pvc-{name_or_pv}-share"
-        app.logger.info(f"Using legacy naming: {dir_path}, lookup user: {lookup_name}")
+    dir_path = csi_pvc_directory_on_share(pvc_name, pvc_type)
 
     if pvc_type == "group":
-        app.logger.info(f"Processing group type PVC for lookup_name: {lookup_name}")
+        app.logger.info(f"Processing group type PVC for lookup_name: {lookup_name} path={dir_path}")
         # Verify group exists
         g_lines = read_group_lines()
         group_info = None
@@ -558,7 +555,7 @@ def create_directory_with_permissions(name_or_pv, pvc_type, username=None):
             app.logger.error(f"Failed to create group directory {dir_path}: {e}")
             raise RuntimeError(f"Failed to create group directory {dir_path}: {e}")
     else:
-        app.logger.info(f"Processing user type PVC for lookup_name: {lookup_name}")
+        app.logger.info(f"Processing user type PVC for lookup_name: {lookup_name} path={dir_path}")
         # Verify user exists
         lines = read_passwd_lines()
         user_info = None
@@ -577,11 +574,11 @@ def create_directory_with_permissions(name_or_pv, pvc_type, username=None):
         try:
             app.logger.info(f"Creating directory: {dir_path}")
 
-            # Check if base path exists and is writable
-            base_exists = os.path.exists("/home/tako8/share")
-            app.logger.info(f"Base path /home/tako8/share exists: {base_exists}")
+            root = nfs_share_root()
+            base_exists = os.path.exists(root)
+            app.logger.info("Base path %s exists: %s", root, base_exists)
             if base_exists:
-                app.logger.info(f"Base path permissions: {oct(os.stat('/home/tako8/share').st_mode)[-3:]}")
+                app.logger.info("Base path permissions: %s", oct(os.stat(root).st_mode)[-3:])
 
             # Create directory with detailed output capture
             mkdir_result = subprocess.run(["mkdir", "-p", dir_path], capture_output=True, text=True, check=False)
@@ -630,18 +627,11 @@ def create_directory_with_permissions(name_or_pv, pvc_type, username=None):
             raise RuntimeError(f"Unexpected error creating directory {dir_path}: {e}")
 
 
-def delete_directory_if_exists(name, pvc_type):
-    """Delete directory if it exists"""
-    import subprocess
+def delete_directory_if_exists(pvc_name: str, pvc_type: str):
+    """Remove CSI subdirectory for this PVC metadata.name (honours custom pvc_name)."""
     import shutil
-    import os
 
-    base_path = "/home/tako8/share"  # NFS storage class mount path
-
-    if pvc_type == "group":
-        dir_path = f"{base_path}/pvc-{name}-group-share"
-    else:
-        dir_path = f"{base_path}/pvc-{name}-share"
+    dir_path = csi_pvc_directory_on_share(pvc_name, pvc_type)
 
     try:
         if os.path.exists(dir_path):
@@ -727,70 +717,3 @@ def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeou
 
     app.logger.debug(f"Best node selected: {best_node} with score: {best_score}")
     return best_node
-
-
-def get_group_members_home_volumes(gid_list: List[int], current_username: str):
-    """Get volume mounts and volumes for all group members' home directories
-
-    Args:
-        gid_list: List of group IDs to process
-        current_username: Current user's username (to exclude their own home)
-
-    Returns:
-        tuple: (volume_mounts, volumes) - lists of volume mount and volume definitions
-    """
-    volume_mounts = []
-    volumes = []
-
-    if not gid_list:
-        return volume_mounts, volumes
-
-    try:
-        # Read group file to find all members
-        g_lines = read_group_lines()
-        all_members = set()
-
-        for gid in gid_list:
-            for line in g_lines:
-                grec = parse_group_line(line)
-                if grec and grec["gid"] == gid:
-                    # Add all members of this group
-                    all_members.update(grec.get("members", []))
-                    break
-
-        # Remove current user from the set
-        all_members.discard(current_username)
-
-        if not all_members:
-            return volume_mounts, volumes
-
-        # Read passwd file to get home directories
-        passwd_lines = read_passwd_lines()
-
-        for member in sorted(all_members):
-            # Find member's home directory
-            for line in passwd_lines:
-                urec = parse_passwd_line(line)
-                if urec and urec["name"] == member:
-                    pvc_name = f"pvc-{member}-share"
-
-                    volume_mounts.append({
-                        "name": f"group-member-{member}",
-                        "mountPath": f"/home/{member}",
-                        "readOnly": True
-                    })
-
-                    volumes.append({
-                        "name": f"group-member-{member}",
-                        "persistentVolumeClaim": {
-                            "claimName": pvc_name
-                        }
-                    })
-                    break
-
-        app.logger.info(f"Generated {len(volume_mounts)} group member home mounts for groups {gid_list}")
-        return volume_mounts, volumes
-
-    except Exception as e:
-        app.logger.error(f"Error generating group member volumes: {e}")
-        return [], []

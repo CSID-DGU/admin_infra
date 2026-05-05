@@ -28,7 +28,6 @@ from utils import (
     parse_shadow_line, format_shadow_entry,
     create_directory_with_permissions,
     delete_directory_if_exists,
-    get_group_members_home_volumes,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     load_user_image,
@@ -66,7 +65,8 @@ app.config.from_mapping({
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
     # PVC / storage policy
-    "STORAGE_CLASS_NAME": "nfs-nas-v3-expandable",
+    "USER_STORAGE_CLASS": "nfs-user-storage",
+    "GROUP_STORAGE_CLASS": "nfs-group-storage",
     "PVC_NAME_PATTERN": "pvc-{username}-share",
     "PVC_ACCESS_MODES": ["ReadWriteMany"],
     "PVC_SIZE_UNIT": "Gi",
@@ -566,6 +566,27 @@ def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str
     return primary_gid, primary_group_name
 
 
+def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]:
+    """Map supplementary GIDs to (group_name, gid) pairs.
+
+    Excludes the user's primary group (not shared) and any GID with no
+    matching entry in the local group file. Order follows gid_list.
+    """
+    result: List[tuple] = []
+    seen = set()
+    g_lines = read_group_lines()
+    for gid in gid_list:
+        if gid == primary_gid or gid in seen:
+            continue
+        seen.add(gid)
+        for line in g_lines:
+            rec = parse_group_line(line)
+            if rec and rec["gid"] == gid:
+                result.append((rec["name"], gid))
+                break
+    return result
+
+
 def _get_sudo_allowed_commands() -> List[str]:
     return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
 
@@ -729,12 +750,24 @@ def build_pod_spec(
     
         volume_mounts.extend(gpu_volume_mounts)
         volumes.extend(gpu_volumes)
-    
+
+        # 그룹 공유 볼륨 마운트: /shared/<groupname> -> pvc-<groupname>-group-share
+        shared_groups = _resolve_shared_groups(gid_list, primary_gid)
+        app.logger.info(f"[POD SPEC] shared groups: {shared_groups}")
+        for group_name, _gid in shared_groups:
+            volume_mounts.append({
+                "name": f"shared-{group_name}",
+                "mountPath": f"/shared/{group_name}",
+                "readOnly": False
+            })
+            volumes.append({
+                "name": f"shared-{group_name}",
+                "persistentVolumeClaim": {
+                    "claimName": f"pvc-{group_name}-group-share"
+                }
+            })
+
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
-    
-        group_mounts, group_vols = get_group_members_home_volumes(gid_list, username)
-        volume_mounts.extend(group_mounts)
-        volumes.extend(group_vols)
     # 계정 파일 마운트 -> NFS 마운트 대체
         account_file_mounts = []
         # fallback 세팅
@@ -844,7 +877,8 @@ def build_pod_spec(
                                                     {"name": "UID", "value": str(uid)},
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
-                                                    {"name": "SHELL", "value": "/bin/bash"}
+                                                    {"name": "SHELL", "value": "/bin/bash"},
+                                                    {"name": "SHARED_GROUPS", "value": ",".join(f"{n}:{g}" for n, g in shared_groups)}
                                                 ],
                                                 "resources": {
                                                     "requests": {
@@ -1286,7 +1320,13 @@ def create_or_resize_pvc():
             else:
                 pvc_name = f"pvc-{name}-share"
 
-            app.logger.info(f"PVC name determined: {pvc_name}")
+            storage_class = (
+                app.config["GROUP_STORAGE_CLASS"]
+                if pvc_type == "group"
+                else app.config["USER_STORAGE_CLASS"]
+            )
+
+            app.logger.info(f"PVC name determined: {pvc_name}, storage_class: {storage_class}")
 
             try:
                 # Check if PVC exists
@@ -1326,7 +1366,7 @@ def create_or_resize_pvc():
                             resources=client.V1ResourceRequirements(
                                 requests={"storage": storage}
                             ),
-                            storage_class_name="nfs-nas-v3-expandable"
+                            storage_class_name=storage_class
                         )
                     )
                     core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
@@ -1352,14 +1392,16 @@ def create_or_resize_pvc():
                         time.sleep(1)
                         wait_time += 1
 
-                    # NFS storage class automatically creates directory, but we need to set proper ownership and permissions
+                    # CSI creates user/<pvc> or group-volumes/<pvc>; align ownership on share mount (/kube_share).
                     if pv_name:
-                        app.logger.info(f"Creating directory with PV name: {pv_name}")
-                        create_directory_with_permissions(pv_name, pvc_type, username=name)
+                        app.logger.info(f"PVC bound PV={pv_name}; setting ownership for {pvc_name}")
+                        create_directory_with_permissions(pvc_name, pvc_type, name)
                     else:
-                        app.logger.warning(f"Failed to get PV name after {max_wait}s, using fallback: {name}")
-                        # Fallback to original behavior if PV name not found
-                        create_directory_with_permissions(name, pvc_type)
+                        app.logger.warning(
+                            "PVC %s not bound within %ss; skipping chown (directory may not exist yet)",
+                            pvc_name,
+                            max_wait,
+                        )
                     
                     results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
 
@@ -1489,8 +1531,7 @@ def delete_pvc():
                         results.append({"error": f"Failed to delete PVC {pvc_name}: {e.body}"})
                         continue
 
-                # Delete directory
-                delete_directory_if_exists(name, pvc_type)
+                delete_directory_if_exists(pvc_name, pvc_type)
                 
                 results.append({
                     "status": "deleted", 

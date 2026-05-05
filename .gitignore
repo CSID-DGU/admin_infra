@@ -3,6 +3,7 @@
 *.crt
 *.env
 CLAUDE.md
+.codex
 secrets.yaml
 
 rendered*.yaml
@@ -23,4 +24,3 @@ files/
 __pycache__/
 *.py[cod]
 *$py.class
-
