@@ -1722,13 +1722,20 @@ def get_user(username: str):
         return jsonify({"error": str(e)}), 500
 
 def _allocate_next_uid(lines, min_uid: int = 10000) -> int:
-    """passwd 라인 목록에서 min_uid 이상인 uid 중 최댓값 + 1을 반환."""
-    max_uid = min_uid - 1
-    for line in lines:
-        rec = parse_passwd_line(line)
-        if rec and rec["uid"] >= min_uid:
-            max_uid = max(max_uid, rec["uid"])
-    return max_uid + 1
+    """관리 유저(uid >= min_uid, home=/home/) 최댓값 + 1부터 시작해
+    passwd 전체에서 사용 중이지 않은 uid를 반환한다.
+    시스템 계정이 중간 번호를 점유해도 건너뛰므로 충돌이 없다."""
+    used_uids = {rec["uid"] for line in lines if (rec := parse_passwd_line(line))}
+    managed_uids = {
+        rec["uid"] for line in lines
+        if (rec := parse_passwd_line(line))
+        and rec["uid"] >= min_uid
+        and rec.get("home", "").startswith("/home/")
+    }
+    candidate = max(managed_uids, default=min_uid - 1) + 1
+    while candidate in used_uids:
+        candidate += 1
+    return candidate
 
 
 @accounts_bp.route("/users", methods=["PUT"])
