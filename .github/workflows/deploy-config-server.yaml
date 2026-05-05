@@ -70,6 +70,7 @@ jobs:
             --create-namespace \
             --set image.repository=${{ secrets.DOCKER_USERNAME }}/config-server \
             --set image.tag=$IMAGE_TAG \
-            --set image.pullPolicy=Always
+            --set image.pullPolicy=Always \
+            --force-conflicts
           
           echo "=== Deployment Finished ==="
