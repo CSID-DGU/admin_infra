@@ -431,11 +431,28 @@ def create_pod():
             app.logger.debug("[CREATE POD] pod does not exist yet")
 
         # Prometheus 기반 노드 선택
+        gpu_nodes = user_info.get("gpu_nodes", [])
         node_list = [
             str(n["node_name"]).strip().lower()
-            for n in user_info["gpu_nodes"]
+            for n in gpu_nodes
             if n.get("node_name")
         ]
+
+        # WAS가 gpu_nodes를 반환하지 않으면 k8s Ready 워커 노드 전체로 폴백
+        if not node_list:
+            app.logger.warning("[CREATE POD] gpu_nodes missing from WAS — falling back to all ready worker nodes")
+            load_k8s()
+            _all_nodes = client.CoreV1Api().list_node().items
+            node_list = [
+                n.metadata.name
+                for n in _all_nodes
+                if all(c.status == "True" for c in n.status.conditions if c.type == "Ready")
+                and not any(
+                    "control-plane" in (t.key or "") and t.effect == "NoSchedule"
+                    for t in (n.spec.taints or [])
+                )
+            ]
+
         app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
 
         best_node = select_best_node_from_prometheus(
