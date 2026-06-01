@@ -490,8 +490,30 @@ def format_shadow_entry(d: dict) -> str:
     )
 
 
+_VALID_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
 def ensure_sudoers_dir():
     ensure_etc_layout()
+
+
+def ensure_sudoers_file(sudoers_dir: str, username: str, policy: str) -> str:
+    if not _VALID_USERNAME_RE.match(username):
+        raise ValueError(f"invalid username for sudoers: {username!r}")
+
+    ensure_sudoers_dir()
+    target = os.path.join(sudoers_dir, username)
+
+    tmp = target + f".tmp.{os.getpid()}"
+    with LockedFile(target, "a+") as f:
+        f.seek(0, os.SEEK_END)
+        if f.tell() > 0:
+            return target
+        with open(tmp, "w") as tf:
+            tf.write(policy)
+        os.chmod(tmp, 0o440)
+        os.replace(tmp, target)
+    return target
 
 
 def nfs_share_root() -> str:
