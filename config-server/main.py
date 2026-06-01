@@ -19,7 +19,7 @@ import logging, sys
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile,get_node_gpu_score,
-    ensure_etc_layout, ensure_sudoers_dir,
+    ensure_etc_layout, ensure_sudoers_dir, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
     read_shadow_lines, write_shadow_lines,
@@ -632,6 +632,10 @@ def build_pod_spec(
 
     # subPath mounts require the source files to already exist on the NFS share.
     ensure_etc_layout()
+
+    ensure_sudoers_file(
+        app.config["SUDOERS_DIR"], username, _build_sudoers_policy(username)
+    )
 
     canonical = resolve_k8s_node_name(target_node)
     if not canonical:
@@ -1929,16 +1933,9 @@ def create_user():
     write_shadow_lines(sh_lines)
 
     # 4) sudoers
-    s_path = None
-    sudoers_policy = _build_sudoers_policy(name)
-    if sudoers_policy:
-        ensure_sudoers_dir()
-        s_path = os.path.join(app.config["SUDOERS_DIR"], name)
-        tmp = s_path + ".tmp"
-        with LockedFile(tmp, "w") as f:
-            f.write(sudoers_policy)
-        os.replace(tmp, s_path)
-        os.chmod(s_path, 0o440)
+    s_path = ensure_sudoers_file(
+        app.config["SUDOERS_DIR"], name, _build_sudoers_policy(name)
+    )
 
     return jsonify({
         "status": "created",
