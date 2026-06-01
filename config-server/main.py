@@ -608,17 +608,16 @@ def _get_sudo_allowed_commands() -> List[str]:
     return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
 
 
-def _build_sudoers_policy(username: str) -> Optional[str]:
+def _build_sudoers_policy(username: str) -> str:
     allowed_commands = _get_sudo_allowed_commands()
-    if not allowed_commands:
-        return None
-    return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
+    if allowed_commands:
+        return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
+    return f"{username} ALL=(ALL) NOPASSWD:ALL\n"
 
 
 def _get_account_file_subpaths() -> List[str]:
     subpaths = list(app.config["ACCOUNT_FILE_SUBPATHS"])
-    if _get_sudo_allowed_commands():
-        subpaths.append("sudoers.d/{username}")
+    subpaths.append("sudoers.d/{username}")
     return subpaths
 
 def build_pod_spec(
@@ -1929,7 +1928,7 @@ def create_user():
     sh_lines.append(format_shadow_entry(shadow_entry))
     write_shadow_lines(sh_lines)
 
-    # 4) sudoers (optional, password-protected whitelist only)
+    # 4) sudoers
     s_path = None
     sudoers_policy = _build_sudoers_policy(name)
     if sudoers_policy:
