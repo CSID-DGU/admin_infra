@@ -14,6 +14,8 @@ from flasgger import Swagger
 from dotenv import load_dotenv
 load_dotenv()
 
+import base64
+import crypt
 import logging, sys
 
 from utils import (
@@ -1790,16 +1792,16 @@ def create_user():
           type: object
           required:
             - name
-            - passwd_sha512
+            - passwd_base64
           properties:
             name:
               type: string
               description: 사용자 이름
               example: user2100
-            passwd_sha512:
+            passwd_base64:
               type: string
-              description: SHA-512 해시 패스워드
-              example: "$6$hash..."
+              description: Base64 인코딩된 평문 패스워드
+              example: "cGFzc3dvcmQ="
             gecos:
               type: string
               example: "GPU User"
@@ -1831,7 +1833,7 @@ def create_user():
         description: 서버 오류
     """
     data = request.get_json(force=True)
-    required = ["name", "passwd_sha512"]
+    required = ["name", "passwd_base64"]
     missing = [k for k in required if k not in data]
     if missing:
         return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
@@ -1916,11 +1918,14 @@ def create_user():
         f.truncate()
 
     # 3) shadow
+    plaintext_pw = base64.b64decode(data["passwd_base64"]).decode("utf-8")
+    passwd_sha512 = crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512))
+
     today_days = int(time.time() // 86400)
     sh_lines = read_shadow_lines()
     shadow_entry = {
         "name": name,
-        "passwd": data["passwd_sha512"],
+        "passwd": passwd_sha512,
         "lastchg": today_days,
         "min": 0,
         "max": 99999,
