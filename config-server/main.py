@@ -14,12 +14,14 @@ from flasgger import Swagger
 from dotenv import load_dotenv
 load_dotenv()
 
+import base64
+import crypt
 import logging, sys
 
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile,get_node_gpu_score,
-    ensure_etc_layout, ensure_sudoers_dir,
+    ensure_etc_layout,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
     read_shadow_lines, write_shadow_lines,
@@ -88,13 +90,9 @@ app.config.from_mapping({
     "BASE_ETC_DIR": BASE_ETC_DIR,
     "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
     "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
-    "SUDO_ALLOWED_COMMANDS": [
-        cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
-    ],
     "PASSWD_PATH": BASE_ETC_DIR + "/passwd",
     "GROUP_PATH": BASE_ETC_DIR + "/group",
     "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
-    "SUDOERS_DIR": BASE_ETC_DIR + "/sudoers.d",
     "BASH_LOGOUT_PATH": BASE_ETC_DIR + "/bash.bash_logout",
     "BASHRC_PATH": BASE_ETC_DIR + "/bashrc",
 })
@@ -604,22 +602,8 @@ def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]
     return result
 
 
-def _get_sudo_allowed_commands() -> List[str]:
-    return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
-
-
-def _build_sudoers_policy(username: str) -> Optional[str]:
-    allowed_commands = _get_sudo_allowed_commands()
-    if not allowed_commands:
-        return None
-    return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
-
-
 def _get_account_file_subpaths() -> List[str]:
-    subpaths = list(app.config["ACCOUNT_FILE_SUBPATHS"])
-    if _get_sudo_allowed_commands():
-        subpaths.append("sudoers.d/{username}")
-    return subpaths
+    return list(app.config["ACCOUNT_FILE_SUBPATHS"])
 
 def build_pod_spec(
     username: str,
@@ -790,9 +774,7 @@ def build_pod_spec(
         # fallback 세팅
         for sub in _get_account_file_subpaths():
             sub_fmt = sub.format(username=username)
-            if sub.startswith("sudoers.d/"):
-                mount_path = f"/etc/sudoers.d/{username}"
-            elif sub == "bash.bash_logout":
+            if sub == "bash.bash_logout":
                 mount_path = f"/home/{username}/.bash_logout"
             elif sub == "bashrc":
                 mount_path = f"/home/{username}/.bashrc"
@@ -824,10 +806,7 @@ def build_pod_spec(
             legacy_etc_mounts = []
             for sub in _get_account_file_subpaths():
                 sub_fmt = sub.format(username=username)
-                if sub.startswith("sudoers.d/"):
-                    mount_path = f"/etc/sudoers.d/{username}"
-                    source_subpath = sub_fmt
-                elif sub == "bash.bash_logout":
+                if sub == "bash.bash_logout":
                     mount_path = f"/home/{username}/.bash_logout"
                     source_subpath = "bash.bash_logout"
                 elif sub == "bashrc":
@@ -1767,7 +1746,6 @@ def create_user():
     - /etc/passwd
     - /etc/shadow
     - /etc/group
-    - /etc/sudoers.d/
 
     ---
     tags:
@@ -1787,16 +1765,16 @@ def create_user():
           type: object
           required:
             - name
-            - passwd_sha512
+            - passwd_base64
           properties:
             name:
               type: string
               description: 사용자 이름
               example: user2100
-            passwd_sha512:
+            passwd_base64:
               type: string
-              description: SHA-512 해시 패스워드
-              example: "$6$hash..."
+              description: Base64 인코딩된 평문 패스워드
+              example: "cGFzc3dvcmQ="
             gecos:
               type: string
               example: "GPU User"
@@ -1828,7 +1806,7 @@ def create_user():
         description: 서버 오류
     """
     data = request.get_json(force=True)
-    required = ["name", "passwd_sha512"]
+    required = ["name", "passwd_base64"]
     missing = [k for k in required if k not in data]
     if missing:
         return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
@@ -1913,11 +1891,14 @@ def create_user():
         f.truncate()
 
     # 3) shadow
+    plaintext_pw = base64.b64decode(data["passwd_base64"]).decode("utf-8")
+    passwd_sha512 = crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512))
+
     today_days = int(time.time() // 86400)
     sh_lines = read_shadow_lines()
     shadow_entry = {
         "name": name,
-        "passwd": data["passwd_sha512"],
+        "passwd": passwd_sha512,
         "lastchg": today_days,
         "min": 0,
         "max": 99999,
@@ -1929,24 +1910,11 @@ def create_user():
     sh_lines.append(format_shadow_entry(shadow_entry))
     write_shadow_lines(sh_lines)
 
-    # 4) sudoers (optional, password-protected whitelist only)
-    s_path = None
-    sudoers_policy = _build_sudoers_policy(name)
-    if sudoers_policy:
-        ensure_sudoers_dir()
-        s_path = os.path.join(app.config["SUDOERS_DIR"], name)
-        tmp = s_path + ".tmp"
-        with LockedFile(tmp, "w") as f:
-            f.write(sudoers_policy)
-        os.replace(tmp, s_path)
-        os.chmod(s_path, 0o440)
-
     return jsonify({
         "status": "created",
         "user": entry,
         "group": {"name": pg_name, "gid": gid},
         "supplementary_groups": added_supp,
-        "sudoers": s_path,
     }), 201
 
 @accounts_bp.route("/users/<username>", methods=["DELETE"])
@@ -1959,7 +1927,6 @@ def delete_user(username: str):
     - /etc/passwd
     - /etc/shadow
     - /etc/group
-    - /etc/sudoers.d/
 
     ---
     tags:
@@ -2013,18 +1980,6 @@ def delete_user(username: str):
             continue
         sh_new.append(sl)
     write_shadow_lines(sh_new)
-
-    # Remove sudoers file if present
-    try:
-        ensure_sudoers_dir()
-        path = os.path.join(app.config["SUDOERS_DIR"], username)
-        if os.path.exists(path):
-            # lock-then-remove pattern
-            with LockedFile(path, "r+") as _:
-                pass
-            os.remove(path)
-    except Exception:
-        pass
 
     # Clean /etc/group: remove user from all member lists; delete any group that had this user
     # (either explicitly in members or implicitly as the primary GID group) if now empty.
