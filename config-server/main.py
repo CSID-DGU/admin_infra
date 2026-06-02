@@ -1833,6 +1833,11 @@ def create_user():
         if not isinstance(sg, dict) or "name" not in sg or "gid" not in sg:
             return jsonify({"error": "supplementary_groups must be list of {name, gid}"}), 400
 
+    try:
+        plaintext_pw = base64.b64decode(data["passwd_base64"], validate=True).decode("utf-8")
+    except Exception:
+        return jsonify({"error": "invalid passwd_base64"}), 400
+
     ensure_etc_layout()
 
     # 1) passwd — LOCK_EX를 read부터 write까지 유지해 uid 중복 배정 방지
@@ -1905,10 +1910,6 @@ def create_user():
         f.truncate()
 
     # 3) shadow
-    try:
-        plaintext_pw = base64.b64decode(data["passwd_base64"], validate=True).decode("utf-8")
-    except Exception:
-        return jsonify({"error": "invalid passwd_base64"}), 400
     passwd_sha512 = crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512))
 
     today_days = int(time.time() // 86400)
