@@ -16,12 +16,11 @@ load_dotenv()
 
 import base64
 import crypt
-import logging, sys
 
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile,get_node_gpu_score,
-    ensure_etc_layout,
+    ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
     read_shadow_lines, write_shadow_lines,
@@ -90,9 +89,13 @@ app.config.from_mapping({
     "BASE_ETC_DIR": BASE_ETC_DIR,
     "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
     "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
+    "SUDO_ALLOWED_COMMANDS": [
+        cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
+    ],
     "PASSWD_PATH": BASE_ETC_DIR + "/passwd",
     "GROUP_PATH": BASE_ETC_DIR + "/group",
     "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
+    "SUDOERS_DIR": BASE_ETC_DIR + "/sudoers.d",
     "BASH_LOGOUT_PATH": BASE_ETC_DIR + "/bash.bash_logout",
     "BASHRC_PATH": BASE_ETC_DIR + "/bashrc",
 })
@@ -600,6 +603,17 @@ def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]
                 result.append((rec["name"], gid))
                 break
     return result
+
+
+def _get_sudo_allowed_commands() -> List[str]:
+    return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
+
+
+def _build_sudoers_policy(username: str) -> Optional[str]:
+    allowed_commands = _get_sudo_allowed_commands()
+    if not allowed_commands:
+        return None
+    return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
 
 
 def _get_account_file_subpaths() -> List[str]:
@@ -1891,7 +1905,10 @@ def create_user():
         f.truncate()
 
     # 3) shadow
-    plaintext_pw = base64.b64decode(data["passwd_base64"]).decode("utf-8")
+    try:
+        plaintext_pw = base64.b64decode(data["passwd_base64"], validate=True).decode("utf-8")
+    except Exception:
+        return jsonify({"error": "invalid passwd_base64"}), 400
     passwd_sha512 = crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512))
 
     today_days = int(time.time() // 86400)
@@ -1910,11 +1927,18 @@ def create_user():
     sh_lines.append(format_shadow_entry(shadow_entry))
     write_shadow_lines(sh_lines)
 
+    # 4) sudoers (로컬 호스트 관리, password-protected whitelist)
+    s_path = None
+    sudoers_policy = _build_sudoers_policy(name)
+    if sudoers_policy:
+        s_path = ensure_sudoers_file(app.config["SUDOERS_DIR"], name, sudoers_policy)
+
     return jsonify({
         "status": "created",
         "user": entry,
         "group": {"name": pg_name, "gid": gid},
         "supplementary_groups": added_supp,
+        "sudoers": s_path,
     }), 201
 
 @accounts_bp.route("/users/<username>", methods=["DELETE"])
