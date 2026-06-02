@@ -14,12 +14,13 @@ from flasgger import Swagger
 from dotenv import load_dotenv
 load_dotenv()
 
-import logging, sys
+import base64
+import crypt
 
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile,get_node_gpu_score,
-    ensure_etc_layout, ensure_sudoers_dir,
+    ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
     read_shadow_lines, write_shadow_lines,
@@ -615,11 +616,30 @@ def _build_sudoers_policy(username: str) -> Optional[str]:
     return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
 
 
+def _rollback_user(name: str) -> None:
+    pw_lines = read_passwd_lines()
+    write_passwd_lines([l for l in pw_lines if (parse_passwd_line(l) or {}).get("name") != name])
+
+    sh_lines = read_shadow_lines()
+    write_shadow_lines([l for l in sh_lines if (parse_shadow_line(l) or {}).get("name") != name])
+
+    g_lines = read_group_lines()
+    cleaned = []
+    for gl in g_lines:
+        rec = parse_group_line(gl)
+        if not rec:
+            cleaned.append(gl)
+            continue
+        if name in rec["members"]:
+            rec["members"] = [m for m in rec["members"] if m != name]
+        if rec["name"] == name and not rec["members"]:
+            continue
+        cleaned.append(format_group_entry(rec))
+    write_group_lines(cleaned)
+
+
 def _get_account_file_subpaths() -> List[str]:
-    subpaths = list(app.config["ACCOUNT_FILE_SUBPATHS"])
-    if _get_sudo_allowed_commands():
-        subpaths.append("sudoers.d/{username}")
-    return subpaths
+    return list(app.config["ACCOUNT_FILE_SUBPATHS"])
 
 def build_pod_spec(
     username: str,
@@ -790,9 +810,7 @@ def build_pod_spec(
         # fallback 세팅
         for sub in _get_account_file_subpaths():
             sub_fmt = sub.format(username=username)
-            if sub.startswith("sudoers.d/"):
-                mount_path = f"/etc/sudoers.d/{username}"
-            elif sub == "bash.bash_logout":
+            if sub == "bash.bash_logout":
                 mount_path = f"/home/{username}/.bash_logout"
             elif sub == "bashrc":
                 mount_path = f"/home/{username}/.bashrc"
@@ -824,10 +842,7 @@ def build_pod_spec(
             legacy_etc_mounts = []
             for sub in _get_account_file_subpaths():
                 sub_fmt = sub.format(username=username)
-                if sub.startswith("sudoers.d/"):
-                    mount_path = f"/etc/sudoers.d/{username}"
-                    source_subpath = sub_fmt
-                elif sub == "bash.bash_logout":
+                if sub == "bash.bash_logout":
                     mount_path = f"/home/{username}/.bash_logout"
                     source_subpath = "bash.bash_logout"
                 elif sub == "bashrc":
@@ -1767,7 +1782,6 @@ def create_user():
     - /etc/passwd
     - /etc/shadow
     - /etc/group
-    - /etc/sudoers.d/
 
     ---
     tags:
@@ -1787,16 +1801,16 @@ def create_user():
           type: object
           required:
             - name
-            - passwd_sha512
+            - passwd_base64
           properties:
             name:
               type: string
               description: 사용자 이름
               example: user2100
-            passwd_sha512:
+            passwd_base64:
               type: string
-              description: SHA-512 해시 패스워드
-              example: "$6$hash..."
+              description: Base64 인코딩된 평문 패스워드
+              example: "cGFzc3dvcmQ="
             gecos:
               type: string
               example: "GPU User"
@@ -1828,7 +1842,7 @@ def create_user():
         description: 서버 오류
     """
     data = request.get_json(force=True)
-    required = ["name", "passwd_sha512"]
+    required = ["name", "passwd_base64"]
     missing = [k for k in required if k not in data]
     if missing:
         return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
@@ -1840,6 +1854,11 @@ def create_user():
     for sg in supp_groups:
         if not isinstance(sg, dict) or "name" not in sg or "gid" not in sg:
             return jsonify({"error": "supplementary_groups must be list of {name, gid}"}), 400
+
+    try:
+        plaintext_pw = base64.b64decode(data["passwd_base64"], validate=True).decode("utf-8")
+    except Exception:
+        return jsonify({"error": "invalid passwd_base64"}), 400
 
     ensure_etc_layout()
 
@@ -1874,72 +1893,83 @@ def create_user():
 
     # 2) group — primary 생성 + supplementary 멤버 추가
     added_supp = []
-    with LockedFile(app.config["GROUP_PATH"], "r+") as f:
-        content = f.read()
-        g_lines = content.splitlines()
+    try:
+        with LockedFile(app.config["GROUP_PATH"], "r+") as f:
+            content = f.read()
+            g_lines = content.splitlines()
 
-        # primary group
-        primary_exists = any(
-            (parse_group_line(gl) or {}).get("gid") == gid or
-            (parse_group_line(gl) or {}).get("name") == pg_name
-            for gl in g_lines
-        )
-        if not primary_exists:
-            g_lines.append(format_group_entry({"name": pg_name, "passwd": "x", "gid": gid, "members": []}))
+            # primary group
+            primary_exists = any(
+                (parse_group_line(gl) or {}).get("gid") == gid or
+                (parse_group_line(gl) or {}).get("name") == pg_name
+                for gl in g_lines
+            )
+            if not primary_exists:
+                g_lines.append(format_group_entry({"name": pg_name, "passwd": "x", "gid": gid, "members": []}))
 
-        # supplementary groups
-        for sg in supp_groups:
-            sg_gid = int(sg["gid"])
-            sg_name = sg["name"]
-            found = False
-            updated = []
-            for gl in g_lines:
-                rec = parse_group_line(gl)
-                if rec and rec["gid"] == sg_gid:
-                    if name not in rec["members"]:
-                        rec["members"].append(name)
-                    updated.append(format_group_entry(rec))
-                    found = True
-                else:
-                    updated.append(gl)
-            g_lines = updated
-            if not found:
-                g_lines.append(format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
-            added_supp.append({"name": sg_name, "gid": sg_gid})
+            # supplementary groups
+            for sg in supp_groups:
+                sg_gid = int(sg["gid"])
+                sg_name = sg["name"]
+                found = False
+                updated = []
+                for gl in g_lines:
+                    rec = parse_group_line(gl)
+                    if rec and rec["gid"] == sg_gid:
+                        if name not in rec["members"]:
+                            rec["members"].append(name)
+                        updated.append(format_group_entry(rec))
+                        found = True
+                    else:
+                        updated.append(gl)
+                g_lines = updated
+                if not found:
+                    g_lines.append(format_group_entry({"name": sg_name, "passwd": "x", "gid": sg_gid, "members": [name]}))
+                added_supp.append({"name": sg_name, "gid": sg_gid})
 
-        new_content = "\n".join(g_lines) + "\n"
-        f.seek(0)
-        f.write(new_content)
-        f.truncate()
+            new_content = "\n".join(g_lines) + "\n"
+            f.seek(0)
+            f.write(new_content)
+            f.truncate()
+    except Exception:
+        app.logger.exception("[ACCOUNTS] group write failed for user=%s, rolling back", name)
+        _rollback_user(name)
+        return jsonify({"error": "failed to write group"}), 500
 
     # 3) shadow
-    today_days = int(time.time() // 86400)
-    sh_lines = read_shadow_lines()
-    shadow_entry = {
-        "name": name,
-        "passwd": data["passwd_sha512"],
-        "lastchg": today_days,
-        "min": 0,
-        "max": 99999,
-        "warn": 7,
-        "inactive": "",
-        "expire": "",
-        "flag": "",
-    }
-    sh_lines.append(format_shadow_entry(shadow_entry))
-    write_shadow_lines(sh_lines)
+    try:
+        passwd_sha512 = crypt.crypt(plaintext_pw, crypt.mksalt(crypt.METHOD_SHA512))
 
-    # 4) sudoers (optional, password-protected whitelist only)
+        today_days = int(time.time() // 86400)
+        sh_lines = read_shadow_lines()
+        shadow_entry = {
+            "name": name,
+            "passwd": passwd_sha512,
+            "lastchg": today_days,
+            "min": 0,
+            "max": 99999,
+            "warn": 7,
+            "inactive": "",
+            "expire": "",
+            "flag": "",
+        }
+        sh_lines.append(format_shadow_entry(shadow_entry))
+        write_shadow_lines(sh_lines)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] shadow write failed for user=%s, rolling back", name)
+        _rollback_user(name)
+        return jsonify({"error": "failed to write shadow"}), 500
+
+    # 4) sudoers (로컬 호스트 관리, password-protected whitelist)
     s_path = None
     sudoers_policy = _build_sudoers_policy(name)
     if sudoers_policy:
-        ensure_sudoers_dir()
-        s_path = os.path.join(app.config["SUDOERS_DIR"], name)
-        tmp = s_path + ".tmp"
-        with LockedFile(tmp, "w") as f:
-            f.write(sudoers_policy)
-        os.replace(tmp, s_path)
-        os.chmod(s_path, 0o440)
+        try:
+            s_path = ensure_sudoers_file(app.config["SUDOERS_DIR"], name, sudoers_policy)
+        except Exception:
+            app.logger.exception("[ACCOUNTS] sudoers failed for user=%s, rolling back", name)
+            _rollback_user(name)
+            return jsonify({"error": "failed to create sudoers file"}), 500
 
     return jsonify({
         "status": "created",
@@ -1959,7 +1989,6 @@ def delete_user(username: str):
     - /etc/passwd
     - /etc/shadow
     - /etc/group
-    - /etc/sudoers.d/
 
     ---
     tags:
@@ -2013,18 +2042,6 @@ def delete_user(username: str):
             continue
         sh_new.append(sl)
     write_shadow_lines(sh_new)
-
-    # Remove sudoers file if present
-    try:
-        ensure_sudoers_dir()
-        path = os.path.join(app.config["SUDOERS_DIR"], username)
-        if os.path.exists(path):
-            # lock-then-remove pattern
-            with LockedFile(path, "r+") as _:
-                pass
-            os.remove(path)
-    except Exception:
-        pass
 
     # Clean /etc/group: remove user from all member lists; delete any group that had this user
     # (either explicitly in members or implicitly as the primary GID group) if now empty.
