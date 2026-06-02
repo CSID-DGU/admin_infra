@@ -21,7 +21,7 @@ import logging, sys
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile,get_node_gpu_score,
-    ensure_etc_layout, ensure_sudoers_dir, ensure_sudoers_file,
+    ensure_etc_layout,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
     read_shadow_lines, write_shadow_lines,
@@ -90,13 +90,9 @@ app.config.from_mapping({
     "BASE_ETC_DIR": BASE_ETC_DIR,
     "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
     "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
-    "SUDO_ALLOWED_COMMANDS": [
-        cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
-    ],
     "PASSWD_PATH": BASE_ETC_DIR + "/passwd",
     "GROUP_PATH": BASE_ETC_DIR + "/group",
     "SHADOW_PATH": BASE_ETC_DIR + "/shadow",
-    "SUDOERS_DIR": BASE_ETC_DIR + "/sudoers.d",
     "BASH_LOGOUT_PATH": BASE_ETC_DIR + "/bash.bash_logout",
     "BASHRC_PATH": BASE_ETC_DIR + "/bashrc",
 })
@@ -606,21 +602,8 @@ def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]
     return result
 
 
-def _get_sudo_allowed_commands() -> List[str]:
-    return [cmd for cmd in app.config.get("SUDO_ALLOWED_COMMANDS", []) if cmd]
-
-
-def _build_sudoers_policy(username: str) -> str:
-    allowed_commands = _get_sudo_allowed_commands()
-    if allowed_commands:
-        return f"{username} ALL=(ALL) PASSWD: {', '.join(allowed_commands)}\n"
-    return f"{username} ALL=(ALL) NOPASSWD:ALL\n"
-
-
 def _get_account_file_subpaths() -> List[str]:
-    subpaths = list(app.config["ACCOUNT_FILE_SUBPATHS"])
-    subpaths.append("sudoers.d/{username}")
-    return subpaths
+    return list(app.config["ACCOUNT_FILE_SUBPATHS"])
 
 def build_pod_spec(
     username: str,
@@ -634,10 +617,6 @@ def build_pod_spec(
 
     # subPath mounts require the source files to already exist on the NFS share.
     ensure_etc_layout()
-
-    ensure_sudoers_file(
-        app.config["SUDOERS_DIR"], username, _build_sudoers_policy(username)
-    )
 
     canonical = resolve_k8s_node_name(target_node)
     if not canonical:
@@ -795,9 +774,7 @@ def build_pod_spec(
         # fallback 세팅
         for sub in _get_account_file_subpaths():
             sub_fmt = sub.format(username=username)
-            if sub.startswith("sudoers.d/"):
-                mount_path = f"/etc/sudoers.d/{username}"
-            elif sub == "bash.bash_logout":
+            if sub == "bash.bash_logout":
                 mount_path = f"/home/{username}/.bash_logout"
             elif sub == "bashrc":
                 mount_path = f"/home/{username}/.bashrc"
@@ -829,10 +806,7 @@ def build_pod_spec(
             legacy_etc_mounts = []
             for sub in _get_account_file_subpaths():
                 sub_fmt = sub.format(username=username)
-                if sub.startswith("sudoers.d/"):
-                    mount_path = f"/etc/sudoers.d/{username}"
-                    source_subpath = sub_fmt
-                elif sub == "bash.bash_logout":
+                if sub == "bash.bash_logout":
                     mount_path = f"/home/{username}/.bash_logout"
                     source_subpath = "bash.bash_logout"
                 elif sub == "bashrc":
@@ -1772,7 +1746,6 @@ def create_user():
     - /etc/passwd
     - /etc/shadow
     - /etc/group
-    - /etc/sudoers.d/
 
     ---
     tags:
@@ -1937,17 +1910,11 @@ def create_user():
     sh_lines.append(format_shadow_entry(shadow_entry))
     write_shadow_lines(sh_lines)
 
-    # 4) sudoers
-    s_path = ensure_sudoers_file(
-        app.config["SUDOERS_DIR"], name, _build_sudoers_policy(name)
-    )
-
     return jsonify({
         "status": "created",
         "user": entry,
         "group": {"name": pg_name, "gid": gid},
         "supplementary_groups": added_supp,
-        "sudoers": s_path,
     }), 201
 
 @accounts_bp.route("/users/<username>", methods=["DELETE"])
@@ -1960,7 +1927,6 @@ def delete_user(username: str):
     - /etc/passwd
     - /etc/shadow
     - /etc/group
-    - /etc/sudoers.d/
 
     ---
     tags:
@@ -2014,18 +1980,6 @@ def delete_user(username: str):
             continue
         sh_new.append(sl)
     write_shadow_lines(sh_new)
-
-    # Remove sudoers file if present
-    try:
-        ensure_sudoers_dir()
-        path = os.path.join(app.config["SUDOERS_DIR"], username)
-        if os.path.exists(path):
-            # lock-then-remove pattern
-            with LockedFile(path, "r+") as _:
-                pass
-            os.remove(path)
-    except Exception:
-        pass
 
     # Clean /etc/group: remove user from all member lists; delete any group that had this user
     # (either explicitly in members or implicitly as the primary GID group) if now empty.
