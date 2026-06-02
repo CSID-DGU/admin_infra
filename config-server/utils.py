@@ -501,17 +501,17 @@ def ensure_sudoers_file(sudoers_dir: str, username: str, policy: str) -> str:
     if not _VALID_USERNAME_RE.match(username):
         raise ValueError(f"invalid username for sudoers: {username!r}")
 
-    ensure_sudoers_dir()
+    os.makedirs(sudoers_dir, exist_ok=True)
     target = os.path.join(sudoers_dir, username)
+    lockfile = target + ".lock"
 
     tmp = target + f".tmp.{os.getpid()}"
-    with LockedFile(target, "a+") as f:
-        f.seek(0, os.SEEK_END)
-        if f.tell() > 0:
+    with LockedFile(lockfile, "a+") as _:
+        if os.path.exists(target) and os.path.getsize(target) > 0:
             return target
-        with open(tmp, "w") as tf:
-            tf.write(policy)
-        os.chmod(tmp, 0o440)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o440)
+        with os.fdopen(fd, "w") as tf:
+            tf.write(policy if policy.endswith("\n") else policy + "\n")
         os.replace(tmp, target)
     return target
 
