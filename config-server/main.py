@@ -1932,10 +1932,7 @@ def create_user():
     s_path = None
     sudoers_policy = _build_sudoers_policy(name)
     if sudoers_policy:
-        try:
-            s_path = ensure_sudoers_file(app.config["SUDOERS_DIR"], name, sudoers_policy)
-        except Exception:
-            app.logger.exception("[ACCOUNTS] failed to ensure sudoers file for user=%s", name)
+        s_path = ensure_sudoers_file(app.config["SUDOERS_DIR"], name, sudoers_policy)
 
     return jsonify({
         "status": "created",
