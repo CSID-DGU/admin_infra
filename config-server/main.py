@@ -1770,6 +1770,24 @@ def _allocate_next_uid(lines, min_uid: int = 10000) -> int:
     return candidate
 
 
+def _allocate_next_gid(lines, min_gid: int = 10000) -> int:
+    """group 파일 기준으로 관리 그룹용 다음 GID를 반환한다."""
+    reserved_gids = {65534}
+    used_gids = {
+        rec["gid"]
+        for line in lines
+        if (rec := parse_group_line(line)) and isinstance(rec.get("gid"), int)
+    }
+    managed_gids = {
+        gid for gid in used_gids
+        if gid >= min_gid and gid not in reserved_gids
+    }
+    candidate = max(managed_gids, default=min_gid - 1) + 1
+    while candidate in used_gids or candidate in reserved_gids:
+        candidate += 1
+    return candidate
+
+
 @accounts_bp.route("/users", methods=["PUT"])
 def create_user():
     """
@@ -2167,13 +2185,13 @@ def add_group():
           type: object
           required:
             - name
-            - gid
           properties:
             name:
               type: string
               example: developers
             gid:
               type: integer
+              description: 생략 시 /kube_share/group 기준으로 자동 할당
               example: 3001
             members:
               type: array
@@ -2193,21 +2211,31 @@ def add_group():
         description: 그룹 이미 존재
     """
     data = request.get_json(force=True)
-    required = ["name", "gid"]
+    required = ["name"]
     missing = [k for k in required if k not in data]
     if missing:
         return jsonify({"error": f"missing fields: {', '.join(missing)}"}), 400
 
     name = data["name"]
-    gid = int(data["gid"])
     members = data.get("members", [])
 
-    # Check if group already exists
-    g_lines = read_group_lines()
-    for gl in g_lines:
-        rec = parse_group_line(gl)
-        if rec and (rec["name"] == name or rec["gid"] == gid):
-            return jsonify({"error": f"group already exists (name: {rec['name']}, gid: {rec['gid']})"}), 409
+    gid = None
+    gid_raw = data.get("gid")
+    if gid_raw not in (None, ""):
+        if isinstance(gid_raw, bool):
+            return jsonify({"error": "gid must be an integer"}), 400
+        if isinstance(gid_raw, int):
+            gid = gid_raw
+        elif isinstance(gid_raw, str):
+            try:
+                gid = int(gid_raw)
+            except ValueError:
+                return jsonify({"error": "gid must be an integer"}), 400
+        else:
+            return jsonify({"error": "gid must be an integer"}), 400
+
+    if not isinstance(members, list):
+        return jsonify({"error": "members must be a list"}), 400
 
     # Validate that all members exist as users
     if members:
@@ -2217,18 +2245,31 @@ def add_group():
         if invalid_members:
             return jsonify({"error": f"invalid members (users not found): {', '.join(invalid_members)}"}), 400
 
-    # Create new group
-    new_group = {
-        "name": name,
-        "passwd": "x",
-        "gid": gid,
-        "members": sorted(members)
-    }
-    
-    g_lines.append(format_group_entry(new_group))
-    write_group_lines(g_lines)
+    ensure_etc_layout()
+    with LockedFile(app.config["GROUP_PATH"], "r+") as f:
+        g_lines = f.read().splitlines()
 
-    return jsonify({"status": "created", "group": new_group}), 201
+        if any((parse_group_line(gl) or {}).get("name") == name for gl in g_lines):
+            return jsonify({"error": f"group already exists (name: {name})"}), 409
+
+        if gid is None:
+            gid = _allocate_next_gid(g_lines)
+        elif any((parse_group_line(gl) or {}).get("gid") == gid for gl in g_lines):
+            return jsonify({"error": f"group already exists (gid: {gid})"}), 409
+
+        new_group = {
+            "name": name,
+            "passwd": "x",
+            "gid": gid,
+            "members": sorted(members)
+        }
+
+        g_lines.append(format_group_entry(new_group))
+        f.seek(0)
+        f.write("\n".join(g_lines) + "\n")
+        f.truncate()
+
+    return jsonify({"group": {"name": name, "gid": gid}}), 201
 
 # ----------- Add user to supplementary groups -----------
 @accounts_bp.route("/users/<username>/groups", methods=["PUT"])
