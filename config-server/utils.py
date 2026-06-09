@@ -4,6 +4,7 @@ import re
 import fcntl
 import time
 import pymysql
+import threading
 from typing import List, Optional
 import uuid
 
@@ -304,6 +305,18 @@ def _local_lockfile_path(nfs_path: str) -> str:
     return f"/tmp/cssh_lock{safe}"
 
 
+_thread_locks_guard = threading.Lock()
+_thread_locks = {}
+
+
+def _thread_lock_for_path(path: str):
+    lock_path = _local_lockfile_path(path)
+    with _thread_locks_guard:
+        if lock_path not in _thread_locks:
+            _thread_locks[lock_path] = threading.RLock()
+        return _thread_locks[lock_path]
+
+
 class LockedFile:
     """Context manager for file locks using a local(/tmp) lock file.
     NFS 마운트 위의 파일을 안전하게 읽고 쓰기 위해 락은 로컬 파일로 관리한다."""
@@ -312,22 +325,40 @@ class LockedFile:
         self.mode = mode
         self.f = None
         self._lock_f = None
+        self._thread_lock = None
 
     def __enter__(self):
         lock_type = fcntl.LOCK_SH if "r" in self.mode and "+" not in self.mode and "w" not in self.mode and "a" not in self.mode else fcntl.LOCK_EX
-        self._lock_f = open(_local_lockfile_path(self.path), "a+")
-        fcntl.lockf(self._lock_f.fileno(), lock_type)
-        self.f = open(self.path, self.mode)
-        return self.f
+        self._thread_lock = _thread_lock_for_path(self.path)
+        self._thread_lock.acquire()
+        try:
+            self._lock_f = open(_local_lockfile_path(self.path), "a+")
+            fcntl.lockf(self._lock_f.fileno(), lock_type)
+            self.f = open(self.path, self.mode)
+            return self.f
+        except Exception:
+            if self._lock_f:
+                try:
+                    fcntl.lockf(self._lock_f.fileno(), fcntl.LOCK_UN)
+                finally:
+                    self._lock_f.close()
+                    self._lock_f = None
+            self._thread_lock.release()
+            self._thread_lock = None
+            raise
 
     def __exit__(self, exc_type, exc, tb):
         try:
             if self.f:
                 self.f.close()
         finally:
-            if self._lock_f:
-                fcntl.lockf(self._lock_f.fileno(), fcntl.LOCK_UN)
-                self._lock_f.close()
+            try:
+                if self._lock_f:
+                    fcntl.lockf(self._lock_f.fileno(), fcntl.LOCK_UN)
+                    self._lock_f.close()
+            finally:
+                if self._thread_lock:
+                    self._thread_lock.release()
 
 # ---- Ensure base etc layout ----
 
