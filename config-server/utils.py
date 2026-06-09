@@ -384,24 +384,29 @@ def ensure_seeded_file(path: str, template_name: str) -> None:
     template_dir = app.config.get("BASE_ETC_TEMPLATE_DIR", DEFAULT_BASE_ETC_TEMPLATE_DIR)
     template_path = os.path.join(template_dir, template_name)
 
-    with open(_local_lockfile_path(path), "a+") as lock_f:
-        fcntl.lockf(lock_f.fileno(), fcntl.LOCK_EX)
-        with open(path, "a+", encoding="utf-8") as f:
-            f.seek(0, os.SEEK_END)
-            if f.tell() > 0:
-                return
+    thread_lock = _thread_lock_for_path(path)
+    with thread_lock:
+        with open(_local_lockfile_path(path), "a+") as lock_f:
+            fcntl.lockf(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                with open(path, "a+", encoding="utf-8") as f:
+                    f.seek(0, os.SEEK_END)
+                    if f.tell() > 0:
+                        return
 
-            if not os.path.exists(template_path):
-                app.logger.warning("[ETC INIT] template missing for %s: %s", path, template_path)
-                return
+                    if not os.path.exists(template_path):
+                        app.logger.warning("[ETC INIT] template missing for %s: %s", path, template_path)
+                        return
 
-            with open(template_path, "r", encoding="utf-8") as tf:
-                content = tf.read()
+                    with open(template_path, "r", encoding="utf-8") as tf:
+                        content = tf.read()
 
-            f.seek(0)
-            f.write(content)
-            f.truncate()
-            app.logger.info("[ETC INIT] seeded %s from %s", path, template_path)
+                    f.seek(0)
+                    f.write(content)
+                    f.truncate()
+                    app.logger.info("[ETC INIT] seeded %s from %s", path, template_path)
+            finally:
+                fcntl.lockf(lock_f.fileno(), fcntl.LOCK_UN)
 
 def ensure_etc_layout() -> None:
     ensure_dir(app.config["BASE_ETC_DIR"])
