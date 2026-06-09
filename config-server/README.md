@@ -42,7 +42,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 | `create_user` | route `PUT /accounts/users` | passwd/group/shadow/sudoers 파일에 사용자를 추가한다. | JSON `name`, `uid`, `gid`, `passwd_sha512`, 선택 필드 | 201 JSON `{status,user,group,sudoers}` |
 | `delete_user` | route `DELETE /accounts/users/<username>` | 사용자와 shadow/sudoers/member group 정보를 삭제한다. | path username | JSON `{status,user}` |
 | `delete_group` | route `DELETE /accounts/groups/<groupname>` | primary group으로 쓰이지 않는 그룹을 삭제한다. | path groupname | JSON `{status,group,gid}` |
-| `add_group` | route `PUT /accounts/groups` | 새 Linux group row를 추가한다. | JSON `name`, `gid`, optional `members` | 201 JSON `{status,group}` |
+| `add_group` | route `PUT /accounts/groups` | 새 Linux group row를 추가한다. `gid` 생략 시 group 파일 기준으로 자동 할당한다. | JSON `name`, optional `gid`, optional `members` | 201 JSON `{group:{name,gid}}` |
 | `add_user_groups` | route `PUT /accounts/users/<username>/groups` | 사용자를 보조 그룹에 추가한다. | path username, JSON `groups` | JSON `{status,user,groups}` |
 
 ## `utils.py` 클래스와 함수
