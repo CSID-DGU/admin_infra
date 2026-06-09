@@ -2220,10 +2220,18 @@ def add_group():
     members = data.get("members", [])
 
     gid = None
-    if data.get("gid") not in (None, ""):
-        try:
-            gid = int(data["gid"])
-        except (TypeError, ValueError):
+    gid_raw = data.get("gid")
+    if gid_raw not in (None, ""):
+        if isinstance(gid_raw, bool):
+            return jsonify({"error": "gid must be an integer"}), 400
+        if isinstance(gid_raw, int):
+            gid = gid_raw
+        elif isinstance(gid_raw, str):
+            try:
+                gid = int(gid_raw)
+            except ValueError:
+                return jsonify({"error": "gid must be an integer"}), 400
+        else:
             return jsonify({"error": "gid must be an integer"}), 400
 
     if not isinstance(members, list):
