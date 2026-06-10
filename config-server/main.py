@@ -2185,6 +2185,11 @@ def add_group():
           type: object
           required:
             - name
+          example:
+            name: developers
+            members:
+              - user2100
+              - user2101
           properties:
             name:
               type: string
@@ -2192,7 +2197,6 @@ def add_group():
             gid:
               type: integer
               description: 생략 시 /kube_share/group 기준으로 자동 할당
-              example: 3001
             members:
               type: array
               items:
@@ -2205,6 +2209,23 @@ def add_group():
 
       201:
         description: 그룹 생성 성공
+        schema:
+          type: object
+          properties:
+            group:
+              type: object
+              properties:
+                name:
+                  type: string
+                  example: developers
+                gid:
+                  type: integer
+                  example: 10001
+        examples:
+          application/json:
+            group:
+              name: developers
+              gid: 10001
       400:
         description: 잘못된 요청
       409:
