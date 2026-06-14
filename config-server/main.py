@@ -1252,35 +1252,121 @@ def delete_pod():
 
     if not pod_name:
         app.logger.warning("[DELETE POD] pod_name missing")
-        return jsonify({"error": "pod_name required"}), 400
+        return jsonify(infra_error(
+            "VALIDATE_REQUEST",
+            "INVALID_DELETE_POD_REQUEST",
+            "pod_name required",
+        )), 400
 
     ns = app.config["NAMESPACE"]
+    rollback = {
+        "servicesDeleted": False,
+        "nodeportsReleased": False,
+        "podDeleted": False,
+    }
 
     try:
         if not pod_name.startswith("ailab-"):
             app.logger.warning(f"[DELETE POD] invalid pod_name format: {pod_name}")
-            return jsonify({"error": "invalid pod_name"}), 400
+            return jsonify(infra_error(
+                "VALIDATE_REQUEST",
+                "INVALID_POD_NAME",
+                "invalid pod_name",
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 400
 
         rest = pod_name[len("ailab-"):]
         username = rest.rsplit("-", 1)[0]
 
         app.logger.info(f"[DELETE POD] parsed username={username}")
         app.logger.info("[DELETE POD] deleting NodePort services")
-        delete_nodeport_services(pod_name, ns)
+        try:
+            delete_nodeport_services(pod_name, ns)
+            rollback["servicesDeleted"] = True
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[DELETE POD] service deletion failed")
+            return jsonify(infra_error(
+                "DELETE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_DELETE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[DELETE POD] service deletion failed")
+            return jsonify(infra_error(
+                "DELETE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_DELETE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
         app.logger.info("[DELETE POD] releasing NodePort allocations")
-        release_nodeports(pod_name)
+        try:
+            release_nodeports(pod_name)
+            rollback["nodeportsReleased"] = True
+        except Exception as e:
+            app.logger.exception("[DELETE POD] nodeport release failed")
+            return jsonify(infra_error(
+                "RELEASE_NODEPORT",
+                "NODEPORT_RELEASE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
 
         app.logger.info(f"[DELETE POD] deleting pod from namespace={ns}")
-        load_k8s()
-        v1 = client.CoreV1Api()
-        v1.delete_namespaced_pod(pod_name, ns)
+        try:
+            load_k8s()
+            v1 = client.CoreV1Api()
+        except Exception as e:
+            app.logger.exception("[DELETE POD] k8s client setup failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "K8S_CLIENT_SETUP_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        try:
+            v1.delete_namespaced_pod(pod_name, ns)
+            rollback["podDeleted"] = True
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[DELETE POD] pod deletion failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[DELETE POD] pod deletion failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
         app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
 
         return jsonify({"status": "deleted"})
 
     except Exception as e:
         app.logger.exception("[DELETE POD] deletion failed")
-        return jsonify({"error": str(e)}), 500
+        return jsonify(infra_error(
+            "DELETE_POD",
+            "DELETE_POD_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        )), 500
 
 def _migrate_internal(data):
 
