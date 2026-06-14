@@ -1728,23 +1728,6 @@ def create_or_resize_pvc():
     results = []
     namespace = app.config["NAMESPACE"]
 
-    def pvc_error(step, error, detail, name=None, pvc_type=None, k8s_status=None, k8s_reason=None):
-        result = {
-            "step": step,
-            "error": error,
-            "detail": detail,
-            "rollback": {},
-        }
-        if name is not None:
-            result["name"] = name
-        if pvc_type is not None:
-            result["type"] = pvc_type
-        if k8s_status is not None:
-            result["k8s_status"] = k8s_status
-        if k8s_reason is not None:
-            result["k8s_reason"] = k8s_reason
-        return result
-
     try:
         try:
             k8s_config.load_incluster_config()
@@ -1763,23 +1746,25 @@ def create_or_resize_pvc():
 
             if not name or not storage_raw:
                 app.logger.error(f"Missing required fields for {pvc_config}")
-                results.append(pvc_error(
+                results.append(infra_error(
                     "VALIDATE_REQUEST",
                     "INVALID_PVC_REQUEST",
                     f"name and storage required for {pvc_config}",
-                    name,
-                    pvc_type,
+                    name=name,
+                    type=pvc_type,
+                    rollback={},
                 ))
                 continue
 
             if pvc_type not in ["user", "group"]:
                 app.logger.error(f"Invalid PVC type '{pvc_type}' for {name}")
-                results.append(pvc_error(
+                results.append(infra_error(
                     "VALIDATE_REQUEST",
                     "INVALID_PVC_REQUEST",
                     f"type must be 'user' or 'group' for {name}",
-                    name,
-                    pvc_type,
+                    name=name,
+                    type=pvc_type,
+                    rollback={},
                 ))
                 continue
 
@@ -1825,14 +1810,14 @@ def create_or_resize_pvc():
                     results.append({"status": "resized", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
                 except client.exceptions.ApiException as e:
                     if e.status != 404:
-                        results.append(pvc_error(
+                        results.append(infra_error(
                             "RESIZE_PVC",
                             "PVC_RESIZE_FAILED",
                             f"Kubernetes API error for {name}: {e.body}",
-                            name,
-                            pvc_type,
-                            e.status,
-                            e.reason,
+                            name=name,
+                            type=pvc_type,
+                            rollback={},
+                            **k8s_error_fields(e),
                         ))
                         continue
 
@@ -1853,14 +1838,14 @@ def create_or_resize_pvc():
                     try:
                         core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
                     except client.exceptions.ApiException as e:
-                        results.append(pvc_error(
+                        results.append(infra_error(
                             "CREATE_PVC",
                             "PVC_CREATE_FAILED",
                             e.body,
-                            name,
-                            pvc_type,
-                            e.status,
-                            e.reason,
+                            name=name,
+                            type=pvc_type,
+                            rollback={},
+                            **k8s_error_fields(e),
                         ))
                         continue
                     app.logger.info(f"Created PVC: {pvc_name}")
@@ -1899,12 +1884,13 @@ def create_or_resize_pvc():
                     results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
 
             except Exception as e:
-                results.append(pvc_error(
+                results.append(infra_error(
                     "CREATE_PVC",
                     "PVC_CREATE_FAILED",
                     f"Failed to process {name}: {str(e)}",
-                    name,
-                    pvc_type,
+                    name=name,
+                    type=pvc_type,
+                    rollback={},
                 ))
 
         has_error = any("error" in result for result in results)
