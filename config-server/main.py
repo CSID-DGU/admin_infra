@@ -151,9 +151,9 @@ def wait_for_pod_deleted(v1, pod_name, namespace, timeout_sec=60):
 
 
 class PodSpecBuildError(Exception):
-    def __init__(self, message, rollback=None):
+    def __init__(self, message, progress=None):
         super().__init__(message)
-        self.rollback = rollback or {}
+        self.progress = progress or {}
 
 # ////////////////////// 포트 할당 //////////////////////
 
@@ -631,7 +631,7 @@ def create_pod():
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
                 str(e),
-                rollback=e.rollback,
+                progress=e.progress,
                 pod_name=pod_name,
             )), 500
         except ValueError as e:
@@ -1196,7 +1196,7 @@ def build_pod_spec(
                 pod_name,
                 exc_info=True,
             )
-        raise PodSpecBuildError(str(e), rollback=rollback) from e
+        raise PodSpecBuildError(str(e), progress=rollback) from e
 
 # //////////////////////// Pod 삭제 //////////////////////
 
@@ -1347,7 +1347,7 @@ def delete_pod():
                     "status": "deleted",
                     "pod_name": pod_name,
                     "already_absent": True,
-                    "rollback": rollback,
+                    "progress": rollback,
                 }), 200
             app.logger.exception("[DELETE POD] pod deletion failed")
             return jsonify(infra_error(
@@ -1407,7 +1407,7 @@ def delete_pod():
         return jsonify({
             "status": "deleted",
             "pod_name": pod_name,
-            "rollback": rollback,
+            "progress": rollback,
         }), 200
 
     except Exception as e:
@@ -1704,7 +1704,7 @@ def create_or_resize_pvc():
                 "step": "VALIDATE_REQUEST",
                 "error": "INVALID_PVC_REQUEST",
                 "detail": "pvcs list is required",
-                "rollback": {},
+                "progress": {},
             }],
         }), 400
 
@@ -1881,14 +1881,14 @@ def create_or_resize_pvc():
         return jsonify({"results": results}), status
 
     except Exception as e:
-        return jsonify({
+                return jsonify({
             "error": "PVC_OPERATION_FAILED",
             "detail": str(e),
             "results": [{
                 "step": "CREATE_PVC",
                 "error": "PVC_OPERATION_FAILED",
                 "detail": str(e),
-                "rollback": {},
+                "progress": {},
             }],
         }), 500
 

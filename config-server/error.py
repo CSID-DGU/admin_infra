@@ -1,9 +1,9 @@
-def infra_error(step, error, detail, rollback=None, **extra):
+def infra_error(step, error, detail, progress=None, rollback=None, **extra):
     body = {
         "step": step,
         "error": error,
         "detail": detail,
-        "rollback": rollback or {},
+        "progress": progress if progress is not None else (rollback or {}),
     }
     body.update({key: value for key, value in extra.items() if value is not None})
     return body
