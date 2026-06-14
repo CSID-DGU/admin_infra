@@ -330,9 +330,10 @@ def select_best_node_from_prometheus(node_list):
     for node in node_list:
         query = f"""
         (
-          (sum(k8s_namespace_pod_count_total{{hostname="{node}"}}) or vector(0)) +
-          (count(gpu_process_memory_used_bytes{{hostname="{node}"}}) or vector(0))
-        ) / (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
+          (avg(DCGM_FI_DEV_GPU_UTIL{{Hostname="{node}"}}) or vector(0)) +
+          ((avg(DCGM_FI_DEV_FB_USED{{Hostname="{node}"}}) or vector(0)) / 1024) +
+          ((avg(DCGM_FI_DEV_GPU_TEMP{{Hostname="{node}"}}) or vector(0)) / 100)
+        )
         """
         try:
             response = requests.get(f"{PROM_URL}/api/v1/query", params={"query": query}, timeout=2)
@@ -545,4 +546,3 @@ app.register_blueprint(accounts_bp, url_prefix="/accounts")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
-
