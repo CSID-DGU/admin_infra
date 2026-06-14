@@ -3,7 +3,7 @@ import fcntl
 import re
 import time
 from typing import List, Optional
-from kubernetes import client, config as k8s_config
+from kubernetes import client, config as k8s_config, watch
 import pymysql
 import os
 import requests
@@ -145,6 +145,26 @@ def k8s_error_fields(exc):
         "k8s_reason": exc.reason,
         "k8s_body": exc.body,
     }
+
+
+def wait_for_pod_deleted(v1, pod_name, namespace, timeout_sec=60):
+    """
+    delete_namespaced_pod() 이후 실제 파드 삭제 완료를 watch 이벤트로 확인한다.
+    """
+    w = watch.Watch()
+    field_selector = f"metadata.name={pod_name}"
+    try:
+        for event in w.stream(
+            v1.list_namespaced_pod,
+            namespace=namespace,
+            field_selector=field_selector,
+            timeout_seconds=timeout_sec,
+        ):
+            if event.get("type") == "DELETED":
+                return True
+        return False
+    finally:
+        w.stop()
 
 
 class PodSpecBuildError(Exception):
@@ -1262,6 +1282,7 @@ def delete_pod():
     rollback = {
         "servicesDeleted": False,
         "nodeportsReleased": False,
+        "podDeleteRequested": False,
         "podDeleted": False,
     }
 
@@ -1334,7 +1355,7 @@ def delete_pod():
 
         try:
             v1.delete_namespaced_pod(pod_name, ns)
-            rollback["podDeleted"] = True
+            rollback["podDeleteRequested"] = True
         except client.exceptions.ApiException as e:
             if e.status == 404:
                 rollback["podDeleted"] = True
@@ -1363,9 +1384,48 @@ def delete_pod():
                 rollback=rollback,
                 pod_name=pod_name,
             )), 500
+
+        app.logger.info("[DELETE POD] waiting for pod deletion to complete")
+        try:
+            deleted = wait_for_pod_deleted(v1, pod_name, ns, timeout_sec=60)
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[DELETE POD] deletion polling failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[DELETE POD] deletion polling failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        if not deleted:
+            app.logger.warning("[DELETE POD] pod deletion timed out: %s", pod_name)
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_TIMEOUT",
+                "pod deletion did not complete within timeout",
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        rollback["podDeleted"] = True
         app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
 
-        return jsonify({"status": "deleted"})
+        return jsonify({
+            "status": "deleted",
+            "pod_name": pod_name,
+            "rollback": rollback,
+        }), 200
 
     except Exception as e:
         app.logger.exception("[DELETE POD] deletion failed")
