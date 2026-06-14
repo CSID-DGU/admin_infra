@@ -164,6 +164,8 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 이미 PVC가 있으면 Kubernetes patch API로 storage request를 수정해 resize한다. 없으면 새 PVC를 만들고 최대 30초 동안 Bound 상태와 PV 이름을 기다린다. Bound 후 `create_directory_with_permissions(pvc_name, type, name)`로 `/kube_share` 마운트 아래 CSI 경로(`user/<pvc>` 또는 `group-volumes/<pvc>`)의 소유권을 맞춘다. 여러 PVC를 한 요청에서 처리하므로 응답은 항상 `results` 배열 중심이다.
 
+모든 항목이 성공하면 HTTP 200을 반환한다. 요청 자체가 비어 있으면 HTTP 400을 반환하고, batch 처리 결과 중 `error`가 하나라도 있으면 HTTP 500을 반환한다. 실패 항목은 BE가 매핑할 수 있도록 `step`, `error`, `detail`, `rollback`, `name`, `type` 필드를 포함한다. Kubernetes API 예외인 경우 `k8s_status`, `k8s_reason`도 함께 포함한다.
+
 ### `create_user`
 
 `PUT /accounts/users`는 Pod 안에 mount될 Linux 계정 파일을 갱신하는 API이다. 실제 OS의 `/etc/passwd`를 직접 수정하는 것이 아니라, config-server가 관리하는 NFS 계정 파일(`/kube_share/passwd`, `/kube_share/group`, `/kube_share/shadow`, 선택적으로 `/kube_share/sudoers.d/<user>`)을 수정한다.
