@@ -17,6 +17,8 @@ load_dotenv()
 import base64
 import crypt
 
+from error import infra_error, k8s_error_fields
+
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile,get_node_gpu_score,
@@ -126,25 +128,6 @@ def load_k8s():
         k8s_config.load_incluster_config()
     except:
         k8s_config.load_kube_config()
-
-
-def infra_error(step, error, detail, rollback=None, **extra):
-    body = {
-        "step": step,
-        "error": error,
-        "detail": detail,
-        "rollback": rollback or {},
-    }
-    body.update({key: value for key, value in extra.items() if value is not None})
-    return body
-
-
-def k8s_error_fields(exc):
-    return {
-        "k8s_status": exc.status,
-        "k8s_reason": exc.reason,
-        "k8s_body": exc.body,
-    }
 
 
 def wait_for_pod_deleted(v1, pod_name, namespace, timeout_sec=60):
