@@ -228,6 +228,7 @@ def delete_nodeport_services(pod_name: str, namespace: str):
             )
     except Exception as e:
         app.logger.exception(f"[SERVICE DELETE] failed for pod {pod_name}: {e}")
+        raise
 
 
 # ============================
