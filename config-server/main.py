@@ -1311,10 +1311,36 @@ def create_or_resize_pvc():
         }]
     
     if not pvcs:
-        return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
+        return jsonify({
+            "error": "INVALID_PVC_REQUEST",
+            "detail": "pvcs list is required",
+            "results": [{
+                "step": "VALIDATE_REQUEST",
+                "error": "INVALID_PVC_REQUEST",
+                "detail": "pvcs list is required",
+                "rollback": {},
+            }],
+        }), 400
 
     results = []
     namespace = app.config["NAMESPACE"]
+
+    def pvc_error(step, error, detail, name=None, pvc_type=None, k8s_status=None, k8s_reason=None):
+        result = {
+            "step": step,
+            "error": error,
+            "detail": detail,
+            "rollback": {},
+        }
+        if name is not None:
+            result["name"] = name
+        if pvc_type is not None:
+            result["type"] = pvc_type
+        if k8s_status is not None:
+            result["k8s_status"] = k8s_status
+        if k8s_reason is not None:
+            result["k8s_reason"] = k8s_reason
+        return result
 
     try:
         try:
@@ -1334,12 +1360,24 @@ def create_or_resize_pvc():
 
             if not name or not storage_raw:
                 app.logger.error(f"Missing required fields for {pvc_config}")
-                results.append({"error": f"name and storage required for {pvc_config}"})
+                results.append(pvc_error(
+                    "VALIDATE_REQUEST",
+                    "INVALID_PVC_REQUEST",
+                    f"name and storage required for {pvc_config}",
+                    name,
+                    pvc_type,
+                ))
                 continue
 
             if pvc_type not in ["user", "group"]:
                 app.logger.error(f"Invalid PVC type '{pvc_type}' for {name}")
-                results.append({"error": f"type must be 'user' or 'group' for {name}"})
+                results.append(pvc_error(
+                    "VALIDATE_REQUEST",
+                    "INVALID_PVC_REQUEST",
+                    f"type must be 'user' or 'group' for {name}",
+                    name,
+                    pvc_type,
+                ))
                 continue
 
             storage = f"{storage_raw}Gi"
@@ -1384,7 +1422,15 @@ def create_or_resize_pvc():
                     results.append({"status": "resized", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
                 except client.exceptions.ApiException as e:
                     if e.status != 404:
-                        results.append({"error": f"Kubernetes API error for {name}: {e.body}"})
+                        results.append(pvc_error(
+                            "RESIZE_PVC",
+                            "PVC_RESIZE_FAILED",
+                            f"Kubernetes API error for {name}: {e.body}",
+                            name,
+                            pvc_type,
+                            e.status,
+                            e.reason,
+                        ))
                         continue
 
                     # PVC doesn't exist → create
@@ -1401,7 +1447,19 @@ def create_or_resize_pvc():
                             storage_class_name=storage_class
                         )
                     )
-                    core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+                    try:
+                        core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
+                    except client.exceptions.ApiException as e:
+                        results.append(pvc_error(
+                            "CREATE_PVC",
+                            "PVC_CREATE_FAILED",
+                            e.body,
+                            name,
+                            pvc_type,
+                            e.status,
+                            e.reason,
+                        ))
+                        continue
                     app.logger.info(f"Created PVC: {pvc_name}")
 
                     # Wait for PVC to be bound and get the actual PV name
@@ -1438,12 +1496,29 @@ def create_or_resize_pvc():
                     results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
 
             except Exception as e:
-                results.append({"error": f"Failed to process {name}: {str(e)}"})
+                results.append(pvc_error(
+                    "CREATE_PVC",
+                    "PVC_CREATE_FAILED",
+                    f"Failed to process {name}: {str(e)}",
+                    name,
+                    pvc_type,
+                ))
 
-        return jsonify({"results": results})
+        has_error = any("error" in result for result in results)
+        status = 500 if has_error else 200
+        return jsonify({"results": results}), status
 
     except Exception as e:
-        return jsonify({"results": [{"error": str(e)}]}), 500
+        return jsonify({
+            "error": "PVC_OPERATION_FAILED",
+            "detail": str(e),
+            "results": [{
+                "step": "CREATE_PVC",
+                "error": "PVC_OPERATION_FAILED",
+                "detail": str(e),
+                "rollback": {},
+            }],
+        }), 500
 
 
 
