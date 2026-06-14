@@ -1336,6 +1336,15 @@ def delete_pod():
             v1.delete_namespaced_pod(pod_name, ns)
             rollback["podDeleted"] = True
         except client.exceptions.ApiException as e:
+            if e.status == 404:
+                rollback["podDeleted"] = True
+                app.logger.info("[DELETE POD] pod already absent: %s", pod_name)
+                return jsonify({
+                    "status": "deleted",
+                    "pod_name": pod_name,
+                    "already_absent": True,
+                    "rollback": rollback,
+                }), 200
             app.logger.exception("[DELETE POD] pod deletion failed")
             return jsonify(infra_error(
                 "DELETE_POD",
