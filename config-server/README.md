@@ -102,7 +102,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 8. Pod가 Ready가 되면 `create_nodeport_services()`로 SSH/Jupyter/추가 포트용 NodePort Service를 생성한다.
 9. 성공하면 `{status, node, pod_name, ports}`를 201로 반환한다.
 
-실패 처리도 중요하다. Pod 생성, Ready 대기, Service 생성 중 문제가 생기면 `release_nodeports()`로 DB에 잡아둔 포트를 해제하고, 생성된 Pod가 있으면 삭제를 시도한다. 즉, `create_pod()`는 Pod와 NodePort DB 상태가 어긋나지 않도록 rollback 성격의 정리를 포함한다.
+실패 처리도 중요하다. Pod 생성, Ready 대기, Service 생성 중 문제가 생기면 `release_nodeports()`로 DB에 잡아둔 포트를 해제하고, 생성된 Pod가 있으면 삭제를 시도한다. 즉, `create_pod()`는 Pod와 NodePort DB 상태가 어긋나지 않도록 `progress` 성격의 정리를 포함한다.
 
 ### `build_pod_spec`
 
@@ -144,6 +144,8 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 처리 순서는 NodePort Service 삭제, NodePort DB allocation 해제, Kubernetes Pod 삭제이다. Pod 이름은 `containerssh-`로 시작해야 하며, 이름 형식이 맞지 않으면 400을 반환한다. Pod 이름에서 username을 파싱하지만, 현재 삭제 동작의 핵심 key는 username이 아니라 pod_name이다.
 
+응답의 `progress`는 실제 rollback 수행 결과가 아니라 처리 단계 완료 여부를 담는다. `podDeleteRequested`는 삭제 요청이 K8s에 수락됐는지, `podDeleted`는 watch로 실제 삭제 완료를 확인했는지, `already_absent`는 대상이 원래 없던 경우인지 구분한다. timeout이면 `POD_DELETE_TIMEOUT`으로 응답하고 `podDeleted`는 `false`로 남긴다.
+
 이 함수는 `create_pod()`의 반대 방향 정리 함수이다. 운영 중 수동 삭제가 필요할 때는 Pod만 직접 삭제하기보다 이 API를 통해 Service와 DB allocation까지 같이 정리하는 것이 안전하다.
 
 ### `migrate`와 `_migrate_internal`
@@ -164,7 +166,7 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 이미 PVC가 있으면 Kubernetes patch API로 storage request를 수정해 resize한다. 없으면 새 PVC를 만들고 최대 30초 동안 Bound 상태와 PV 이름을 기다린다. Bound 후 `create_directory_with_permissions(pvc_name, type, name)`로 `/kube_share` 마운트 아래 CSI 경로(`user/<pvc>` 또는 `group-volumes/<pvc>`)의 소유권을 맞춘다. 여러 PVC를 한 요청에서 처리하므로 응답은 항상 `results` 배열 중심이다.
 
-모든 항목이 성공하면 HTTP 200을 반환한다. 요청 자체가 비어 있으면 HTTP 400을 반환하고, batch 처리 결과 중 `error`가 하나라도 있으면 HTTP 500을 반환한다. 실패 항목은 BE가 매핑할 수 있도록 `step`, `error`, `detail`, `rollback`, `name`, `type` 필드를 포함한다. Kubernetes API 예외인 경우 `k8s_status`, `k8s_reason`도 함께 포함한다.
+모든 항목이 성공하면 HTTP 200을 반환한다. 요청 자체가 비어 있으면 HTTP 400을 반환하고, batch 처리 결과 중 `error`가 하나라도 있으면 HTTP 500을 반환한다. 실패 항목은 BE가 매핑할 수 있도록 `step`, `error`, `detail`, `progress`, `name`, `type` 필드를 포함한다. Kubernetes API 예외인 경우 `k8s_status`, `k8s_reason`도 함께 포함한다.
 
 ### `create_user`
 
