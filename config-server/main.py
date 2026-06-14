@@ -146,6 +146,12 @@ def k8s_error_fields(exc):
         "k8s_body": exc.body,
     }
 
+
+class PodSpecBuildError(Exception):
+    def __init__(self, message, rollback=None):
+        super().__init__(message)
+        self.rollback = rollback or {}
+
 # ////////////////////// 포트 할당 //////////////////////
 
 # reconcile 쓰로틀: 마지막 실행 시각(Unix timestamp). 앱 시작 시 0으로 초기화.
@@ -415,24 +421,89 @@ def create_pod():
 
     if not username:
         app.logger.warning("[CREATE POD] username missing in request")
-        return jsonify({"error": "username required"}), 400
+        return jsonify(infra_error(
+            "VALIDATE_REQUEST",
+            "INVALID_CREATE_POD_REQUEST",
+            "username required",
+        )), 400
 
     ns = app.config["NAMESPACE"]
+
+    def cleanup_create_failure(pod_name, v1=None, delete_services=False):
+        rollback = {
+            "nodeportsReleased": False,
+            "podDeleted": False,
+            "servicesDeleted": False,
+        }
+
+        if delete_services:
+            try:
+                delete_nodeport_services(pod_name, ns)
+                rollback["servicesDeleted"] = True
+            except Exception:
+                app.logger.warning("[CREATE POD] cleanup service deletion failed", exc_info=True)
+
+        try:
+            release_nodeports(pod_name)
+            rollback["nodeportsReleased"] = True
+        except Exception:
+            app.logger.warning("[CREATE POD] cleanup nodeport release failed", exc_info=True)
+
+        if v1 is not None:
+            try:
+                v1.delete_namespaced_pod(pod_name, ns)
+                rollback["podDeleted"] = True
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    rollback["podDeleted"] = True
+                else:
+                    app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+            except Exception:
+                app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+
+        return rollback
 
     try:
         # WAS 조회
         was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
         app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
 
-        resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
-        user_info = resp.json()
+        try:
+            resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
+            user_info = resp.json()
+        except requests.RequestException as e:
+            app.logger.exception("[CREATE POD] WAS request failed")
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_FETCH_FAILED",
+                str(e),
+            )), 502
+        except ValueError as e:
+            app.logger.exception("[CREATE POD] invalid WAS response")
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_INVALID_RESPONSE",
+                str(e),
+                was_status=resp.status_code if "resp" in locals() else None,
+            )), 502
+
         # WAS가 HTTP 200 + body {"status": 404} 형태로 유저 없음을 알리는 경우 처리
         if user_info.get("status") == 404 or resp.status_code == 404:
             app.logger.warning(f"[CREATE POD] user {username!r} not found in WAS")
-            return jsonify({"error": f"user {username!r} not found in WAS"}), 404
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_NOT_FOUND",
+                f"user {username!r} not found in WAS",
+                was_status=resp.status_code,
+            )), 404
         if resp.status_code >= 400:
             app.logger.error(f"[CREATE POD] WAS returned {resp.status_code}")
-            return jsonify({"error": f"WAS returned {resp.status_code} for user {username!r}"}), 502
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_FETCH_FAILED",
+                f"WAS returned {resp.status_code} for user {username!r}",
+                was_status=resp.status_code,
+            )), 502
 
         app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
 
@@ -440,15 +511,46 @@ def create_pod():
         app.logger.info(f"[CREATE POD] generated pod_name={pod_name}")
 
         # pod_name 중복 확인
-        load_k8s()
-        v1 = client.CoreV1Api()
+        try:
+            load_k8s()
+            v1 = client.CoreV1Api()
+        except Exception as e:
+            app.logger.exception("[CREATE POD] k8s client setup failed")
+            return jsonify(infra_error(
+                "CHECK_EXISTING_POD",
+                "K8S_CLIENT_SETUP_FAILED",
+                str(e),
+                pod_name=pod_name,
+            )), 500
 
         try:
             v1.read_namespaced_pod(pod_name, ns)
             app.logger.warning(f"[CREATE POD] pod already exists: {pod_name}")
-            return jsonify({"error": "pod already exists"}), 409
-        except:
+            return jsonify(infra_error(
+                "CHECK_EXISTING_POD",
+                "POD_ALREADY_EXISTS",
+                "pod already exists",
+                pod_name=pod_name,
+            )), 409
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                app.logger.exception("[CREATE POD] pod existence check failed")
+                return jsonify(infra_error(
+                    "CHECK_EXISTING_POD",
+                    "POD_CHECK_FAILED",
+                    e.body,
+                    pod_name=pod_name,
+                    **k8s_error_fields(e),
+                )), 500
             app.logger.debug("[CREATE POD] pod does not exist yet")
+        except Exception as e:
+            app.logger.exception("[CREATE POD] pod existence check failed")
+            return jsonify(infra_error(
+                "CHECK_EXISTING_POD",
+                "POD_CHECK_FAILED",
+                str(e),
+                pod_name=pod_name,
+            )), 500
 
         # Prometheus 기반 노드 선택
         gpu_nodes = user_info.get("gpu_nodes", [])
@@ -461,8 +563,24 @@ def create_pod():
         # WAS가 gpu_nodes를 반환하지 않으면 k8s Ready 워커 노드 전체로 폴백
         if not node_list:
             app.logger.warning("[CREATE POD] gpu_nodes missing from WAS — falling back to all ready worker nodes")
-            load_k8s()
-            _all_nodes = client.CoreV1Api().list_node().items
+            try:
+                load_k8s()
+                _all_nodes = client.CoreV1Api().list_node().items
+            except client.exceptions.ApiException as e:
+                app.logger.exception("[CREATE POD] fallback node list failed")
+                return jsonify(infra_error(
+                    "LIST_NODES",
+                    "NODE_LIST_FAILED",
+                    e.body,
+                    **k8s_error_fields(e),
+                )), 500
+            except Exception as e:
+                app.logger.exception("[CREATE POD] fallback node list failed")
+                return jsonify(infra_error(
+                    "LIST_NODES",
+                    "NODE_LIST_FAILED",
+                    str(e),
+                )), 500
             node_list = [
                 n.metadata.name
                 for n in _all_nodes
@@ -475,11 +593,20 @@ def create_pod():
 
         app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
 
-        best_node = select_best_node_from_prometheus(
-            node_list,
-            app.config["PROM_URL"],
-            app.config["HTTP_TIMEOUT_SEC"]
-        )
+        try:
+            best_node = select_best_node_from_prometheus(
+                node_list,
+                app.config["PROM_URL"],
+                app.config["HTTP_TIMEOUT_SEC"]
+            )
+        except Exception as e:
+            app.logger.exception("[CREATE POD] node selection failed")
+            return jsonify(infra_error(
+                "SELECT_NODE",
+                "NODE_SELECTION_FAILED",
+                str(e),
+                pod_name=pod_name,
+            )), 500
         app.logger.info(f"[CREATE POD] selected best node: {best_node}")
 
         # Pod spec 생성
@@ -496,30 +623,82 @@ def create_pod():
                 best_node,
                 pod_name
             )
+        except PodSpecBuildError as e:
+            return jsonify(infra_error(
+                "BUILD_POD_SPEC",
+                "POD_SPEC_BUILD_FAILED",
+                str(e),
+                rollback=e.rollback,
+                pod_name=pod_name,
+            )), 500
         except ValueError as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify(infra_error(
+                "BUILD_POD_SPEC",
+                "POD_SPEC_BUILD_FAILED",
+                str(e),
+                rollback={"nodeportsReleased": False},
+                pod_name=pod_name,
+            )), 400
+        except Exception as e:
+            app.logger.exception("[CREATE POD] pod spec build failed")
+            return jsonify(infra_error(
+                "BUILD_POD_SPEC",
+                "POD_SPEC_BUILD_FAILED",
+                str(e),
+                rollback={"nodeportsReleased": False},
+                pod_name=pod_name,
+            )), 500
         app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
 
         pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
         app.logger.info("[CREATE POD] pod spec built")
 
-        load_k8s()
-        v1 = client.CoreV1Api()
-
-        # 실제 Pod 생성
         try:
-            app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+            load_k8s()
+            v1 = client.CoreV1Api()
+        except Exception as e:
+            app.logger.exception("[CREATE POD] k8s client setup failed")
+            rollback = cleanup_create_failure(pod_name)
+            return jsonify(infra_error(
+                "CREATE_POD",
+                "K8S_CLIENT_SETUP_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
 
-            # 1. Pod 생성
+        app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+        try:
             v1.create_namespaced_pod(
                 namespace=ns,
                 body=pod_spec
             )
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[CREATE POD] pod creation failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "CREATE_POD",
+                "POD_CREATE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[CREATE POD] pod creation failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "CREATE_POD",
+                "POD_CREATE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
 
-            app.logger.info("[CREATE POD] pod creation request sent")
+        app.logger.info("[CREATE POD] pod creation request sent")
 
-            # 2. Ready 대기
-            app.logger.info("[CREATE POD] waiting for pod to become Ready")
+        app.logger.info("[CREATE POD] waiting for pod to become Ready")
+        try:
             for i in range(60):
                 pod = v1.read_namespaced_pod(pod_name, ns)
                 if is_pod_ready(pod):
@@ -529,25 +708,62 @@ def create_pod():
             else:
                 app.logger.error("[CREATE POD] pod failed to become ready")
                 app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
-                release_nodeports(pod_name)
-                v1.delete_namespaced_pod(pod_name, ns)
-                return jsonify({"error": "pod failed to start"}), 500
-
-            # 3. Pod 성공 후 Service 생성
-            app.logger.info("[CREATE POD] creating NodePort services")
-            create_nodeport_services(username, ns, pod_name, allocated_ports)
-
-            app.logger.info("[CREATE POD] services created successfully")
-
+                rollback = cleanup_create_failure(pod_name, v1)
+                return jsonify(infra_error(
+                    "WAIT_POD_READY",
+                    "POD_READY_TIMEOUT",
+                    "pod failed to start",
+                    rollback=rollback,
+                    pod_name=pod_name,
+                )), 500
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[CREATE POD] pod ready check failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "WAIT_POD_READY",
+                "POD_READY_CHECK_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
         except Exception as e:
-            app.logger.error(f"[CREATE POD] pod creation failed: {str(e)}")
-            release_nodeports(pod_name)
-            try:
-                v1.delete_namespaced_pod(pod_name, ns)
-                app.logger.warning("[CREATE POD] failed pod deleted")
-            except:
-                app.logger.warning("[CREATE POD] cleanup pod deletion failed")
-            raise
+            app.logger.exception("[CREATE POD] pod ready check failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "WAIT_POD_READY",
+                "POD_READY_CHECK_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        app.logger.info("[CREATE POD] creating NodePort services")
+        try:
+            create_nodeport_services(username, ns, pod_name, allocated_ports)
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[CREATE POD] service creation failed")
+            rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
+            return jsonify(infra_error(
+                "CREATE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_CREATE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[CREATE POD] service creation failed")
+            rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
+            return jsonify(infra_error(
+                "CREATE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_CREATE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        app.logger.info("[CREATE POD] services created successfully")
 
         app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
 
@@ -560,7 +776,11 @@ def create_pod():
 
     except Exception as e:
         app.logger.exception("[CREATE POD] unexpected error")
-        return jsonify({"error": str(e)}), 500
+        return jsonify(infra_error(
+            "CREATE_POD",
+            "CREATE_POD_FAILED",
+            str(e),
+        )), 500
 
 
 def _normalize_gid_list(raw_gid) -> List[int]:
@@ -958,13 +1178,22 @@ def build_pod_spec(
                     }
         app.logger.info(f"[POD SPEC] complete pod_name={pod_name}")
         return spec, allocated_ports
-    except Exception:
+    except Exception as e:
         app.logger.warning(
             "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s",
             pod_name,
         )
-        release_nodeports(pod_name)
-        raise
+        rollback = {"nodeportsReleased": False}
+        try:
+            release_nodeports(pod_name)
+            rollback["nodeportsReleased"] = True
+        except Exception:
+            app.logger.warning(
+                "[POD SPEC] nodeport release failed during rollback pod=%s",
+                pod_name,
+                exc_info=True,
+            )
+        raise PodSpecBuildError(str(e), rollback=rollback) from e
 
 # //////////////////////// Pod 삭제 //////////////////////
 
