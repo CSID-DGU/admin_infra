@@ -127,6 +127,25 @@ def load_k8s():
     except:
         k8s_config.load_kube_config()
 
+
+def infra_error(step, error, detail, rollback=None, **extra):
+    body = {
+        "step": step,
+        "error": error,
+        "detail": detail,
+        "rollback": rollback or {},
+    }
+    body.update({key: value for key, value in extra.items() if value is not None})
+    return body
+
+
+def k8s_error_fields(exc):
+    return {
+        "k8s_status": exc.status,
+        "k8s_reason": exc.reason,
+        "k8s_body": exc.body,
+    }
+
 # ////////////////////// 포트 할당 //////////////////////
 
 # reconcile 쓰로틀: 마지막 실행 시각(Unix timestamp). 앱 시작 시 0으로 초기화.
