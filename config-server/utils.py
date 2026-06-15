@@ -228,6 +228,7 @@ def delete_nodeport_services(pod_name: str, namespace: str):
             )
     except Exception as e:
         app.logger.exception(f"[SERVICE DELETE] failed for pod {pod_name}: {e}")
+        raise
 
 
 # ============================
@@ -711,11 +712,10 @@ def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:
 
     query = f"""
     (
-      (sum(k8s_namespace_pod_count_total{{hostname="{node}"}}) or vector(0)) +
-      (count(gpu_process_memory_used_bytes{{hostname="{node}"}}) or vector(0))
+      (avg(DCGM_FI_DEV_GPU_UTIL{{Hostname="{node}"}}) or vector(0)) +
+      ((avg(DCGM_FI_DEV_FB_USED{{Hostname="{node}"}}) or vector(0)) / 1024) +
+      ((avg(DCGM_FI_DEV_GPU_TEMP{{Hostname="{node}"}}) or vector(0)) / 100)
     )
-    /
-    (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
     """
 
     try:
@@ -755,9 +755,10 @@ def select_best_node_from_prometheus(node_list: List[str], prom_url: str, timeou
     for node in node_list:
         query = f"""
         (
-          (sum(k8s_namespace_pod_count_total{{hostname="{node}"}}) or vector(0)) +
-          (count(gpu_process_memory_used_bytes{{hostname="{node}"}}) or vector(0))
-        ) / (count by (gpu_uuid) (gpu_temperature_celsius{{hostname="{node}"}}) > 0 or vector(1))
+          (avg(DCGM_FI_DEV_GPU_UTIL{{Hostname="{node}"}}) or vector(0)) +
+          ((avg(DCGM_FI_DEV_FB_USED{{Hostname="{node}"}}) or vector(0)) / 1024) +
+          ((avg(DCGM_FI_DEV_GPU_TEMP{{Hostname="{node}"}}) or vector(0)) / 100)
+        )
         """
         try:
             app.logger.debug(f"Querying Prometheus for node {node}")
