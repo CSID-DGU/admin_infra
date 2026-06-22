@@ -813,25 +813,23 @@ def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str
     return primary_gid, primary_group_name
 
 
-def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]:
-    """Map supplementary GIDs to (group_name, gid) pairs.
-
-    Excludes the user's primary group (not shared) and any GID with no
-    matching entry in the local group file. Order follows gid_list.
-    """
-    result: List[tuple] = []
-    seen = set()
+def _build_user_groups_env(
+    username: str, primary_group_name: str, primary_gid: int, gid_list: List[int]
+) -> str:
+    """USER_GROUPS env var 값 생성: 'primary:gid,supp1:gid1,...' 형태."""
+    entries = [f"{primary_group_name}:{primary_gid}"]
+    seen = {primary_gid}
     g_lines = read_group_lines()
     for gid in gid_list:
-        if gid == primary_gid or gid in seen:
+        if gid in seen:
             continue
         seen.add(gid)
         for line in g_lines:
             rec = parse_group_line(line)
             if rec and rec["gid"] == gid:
-                result.append((rec["name"], gid))
+                entries.append(f"{rec['name']}:{gid}")
                 break
-    return result
+    return ",".join(entries)
 
 
 def _get_sudo_allowed_commands() -> List[str]:
@@ -866,9 +864,6 @@ def _rollback_user(name: str) -> None:
         cleaned.append(format_group_entry(rec))
     write_group_lines(cleaned)
 
-
-def _get_account_file_subpaths() -> List[str]:
-    return list(app.config["ACCOUNT_FILE_SUBPATHS"])
 
 def build_pod_spec(
     username: str,
