@@ -67,21 +67,10 @@ app.config.from_mapping({
     "DEFAULT_CPU_LIMIT":  "1000m",
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
-    # PVC / storage policy
-    "USER_STORAGE_CLASS": "nfs-user-storage",
-    "GROUP_STORAGE_CLASS": "nfs-group-storage",
-    "PVC_NAME_PATTERN": "pvc-{username}-share",
-    "PVC_ACCESS_MODES": ["ReadWriteMany"],
-    "PVC_SIZE_UNIT": "Gi",
+    # NFS
+    "NFS_SERVER":          os.getenv("NFS_SERVER", ""),
+    "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
-    # Mounts & devices
-    "ACCOUNT_FILE_SUBPATHS": [
-        "passwd",
-        "group",
-        "shadow",
-        "bash.bash_logout",
-        "bashrc",
-    ],
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
 
@@ -89,8 +78,6 @@ app.config.from_mapping({
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
     "BASE_ETC_DIR": BASE_ETC_DIR,
-    "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
-    "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
     "SUDO_ALLOWED_COMMANDS": [
         cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
     ],
