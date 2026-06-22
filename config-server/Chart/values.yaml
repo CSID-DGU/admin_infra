@@ -24,7 +24,7 @@ nfs:
 nas:
   ssh:
     host: "192.168.2.30"
-    port: "22"
+    port: "6954"
     user: "admin"
     keyPath: "/etc/nas-ssh/id_rsa"
 
