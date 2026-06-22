@@ -1949,6 +1949,14 @@ def create_user():
             _rollback_user(name)
             return jsonify({"error": "failed to create sudoers file"}), 500
 
+    # 5) NAS SSH로 홈 디렉터리 생성
+    try:
+        create_user_home_directory(name, uid, gid)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
+        _rollback_user(name)
+        return jsonify(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}")), 500
+
     return jsonify({
         "status": "created",
         "user": entry,
@@ -2045,6 +2053,11 @@ def delete_user(username: str):
         g_new.append(format_group_entry(grec))
 
     write_group_lines(g_new)
+
+    try:
+        delete_user_home_directory(username)
+    except Exception:
+        app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
 
     return jsonify({"status": "deleted", "user": username})
 
