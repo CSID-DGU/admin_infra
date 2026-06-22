@@ -21,7 +21,7 @@ from error import infra_error, k8s_error_fields
 
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
-    LockedFile,get_node_gpu_score,
+    LockedFile, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
@@ -29,8 +29,8 @@ from utils import (
     parse_passwd_line, format_passwd_entry,
     parse_group_line, format_group_entry,
     parse_shadow_line, format_shadow_entry,
-    create_directory_with_permissions,
-    delete_directory_if_exists,
+    create_user_home_directory,
+    delete_user_home_directory,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     load_user_image,
