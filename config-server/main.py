@@ -952,12 +952,9 @@ def build_pod_spec(
     
         app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
     
-        pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
-        app.logger.debug(f"[POD SPEC] pvc_name={pvc_name}")
-    
         gpu_volume_mounts = []
         gpu_volumes = []
-    
+
         if num_gpu > 0:
             for i in range(num_gpu):
                 gpu_volume_mounts.append({
@@ -971,7 +968,7 @@ def build_pod_spec(
                         "type": "CharDevice"
                     }
                 })
-    
+
             for dev in app.config["NVIDIA_AUX_DEVICES"]:
                 mount_name = dev.replace("-", "")
                 gpu_volume_mounts.append({
@@ -985,108 +982,31 @@ def build_pod_spec(
                         "type": "CharDevice"
                     }
                 })
-                
-        volume_mounts = [{
-            "name": "user-home",
-            "mountPath": f"/home/{username}",
-            "readOnly": False
-        }]
-        volume_mounts.append({
-            "name": "image-store",
-            "mountPath": "/image-store",
-            "readOnly": False
-        })
-        volumes = [{
-            "name": "user-home",
-            "persistentVolumeClaim": {
-                "claimName": pvc_name
-            }
-        }]
-        volumes.append({
-            "name": "image-store",
-            "persistentVolumeClaim": {
-                "claimName": "pvc-image-store"
-            }
-        })
-    
+
+        # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
+        volume_mounts = [
+            {"name": "nfs-home",    "mountPath": "/home",        "readOnly": False},
+            {"name": "image-store", "mountPath": "/image-store", "readOnly": False},
+        ]
+        volumes = [
+            {
+                "name": "nfs-home",
+                "nfs": {
+                    "server":   app.config["NFS_SERVER"],
+                    "path":     app.config["NFS_USER_SHARE_PATH"],
+                    "readOnly": False,
+                }
+            },
+            {
+                "name": "image-store",
+                "persistentVolumeClaim": {"claimName": "pvc-image-store"}
+            },
+        ]
+
         volume_mounts.extend(gpu_volume_mounts)
         volumes.extend(gpu_volumes)
 
-        # 그룹 공유 볼륨 마운트: /shared/<groupname> -> pvc-<groupname>-group-share
-        shared_groups = _resolve_shared_groups(gid_list, primary_gid)
-        app.logger.info(f"[POD SPEC] shared groups: {shared_groups}")
-        for group_name, _gid in shared_groups:
-            volume_mounts.append({
-                "name": f"shared-{group_name}",
-                "mountPath": f"/shared/{group_name}",
-                "readOnly": False
-            })
-            volumes.append({
-                "name": f"shared-{group_name}",
-                "persistentVolumeClaim": {
-                    "claimName": f"pvc-{group_name}-group-share"
-                }
-            })
-
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
-    # 계정 파일 마운트 -> NFS 마운트 대체
-        account_file_mounts = []
-        # fallback 세팅
-        for sub in _get_account_file_subpaths():
-            sub_fmt = sub.format(username=username)
-            if sub == "bash.bash_logout":
-                mount_path = f"/home/{username}/.bash_logout"
-            elif sub == "bashrc":
-                mount_path = f"/home/{username}/.bashrc"
-            else:
-                mount_path = f"/etc/{sub_fmt}"
-            account_file_mounts.append({
-                "name": "account-files",
-                "mountPath": mount_path,
-                "subPath": sub_fmt,
-                "readOnly": True
-            })
-
-        account_nfs_server = app.config["ACCOUNT_NFS_SERVER"]
-        account_nfs_path = app.config["ACCOUNT_NFS_PATH"]
-        if account_nfs_server and account_nfs_path:
-            volume_mounts.extend(account_file_mounts)
-            volumes.append({
-                "name": "account-files",
-                "nfs": {
-                    "server": account_nfs_server,
-                    "path": account_nfs_path,
-                    "readOnly": True
-                }
-            })
-        else:
-            app.logger.warning(
-                "[POD SPEC] NFS_SERVER/NFS_PATH missing, falling back to legacy hostPath /etc mounts"
-            )
-            legacy_etc_mounts = []
-            for sub in _get_account_file_subpaths():
-                sub_fmt = sub.format(username=username)
-                if sub == "bash.bash_logout":
-                    mount_path = f"/home/{username}/.bash_logout"
-                    source_subpath = "bash.bash_logout"
-                elif sub == "bashrc":
-                    mount_path = f"/home/{username}/.bashrc"
-                    source_subpath = "bashrc"
-                else:
-                    mount_path = f"/etc/{sub_fmt}"
-                    source_subpath = sub_fmt
-                legacy_etc_mounts.append({
-                    "name": "host-etc",
-                    "mountPath": mount_path,
-                    "subPath": source_subpath,
-                    "readOnly": True
-                })
-
-            volume_mounts.extend(legacy_etc_mounts)
-            volumes.append({
-                "name": "host-etc",
-                "hostPath": {"path": "/etc", "type": "Directory"}
-            })
     
         spec = {
                     "config": {
