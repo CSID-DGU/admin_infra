@@ -1054,7 +1054,7 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"},
-                                                    {"name": "SHARED_GROUPS", "value": ",".join(f"{n}:{g}" for n, g in shared_groups)}
+                                                    {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)}
                                                 ],
                                                 "resources": {
                                                     "requests": {
