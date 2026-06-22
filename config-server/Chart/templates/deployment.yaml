@@ -31,18 +31,22 @@ spec:
           ports:
             - containerPort: 8000
           env:
-            - name: NFS_ADDRESS
-              value: "{{ .Values.env.nfsAddress }}"
             - name: NFS_SERVER
               value: "{{ .Values.nfs.server }}"
-            - name: NFS_PATH
-              value: "{{ .Values.nfs.path }}"
+            - name: NFS_USER_SHARE_PATH
+              value: "{{ .Values.nfs.userSharePath }}"
+            - name: NAS_SSH_HOST
+              value: "{{ .Values.nas.ssh.host }}"
+            - name: NAS_SSH_PORT
+              value: "{{ .Values.nas.ssh.port }}"
+            - name: NAS_SSH_USER
+              value: "{{ .Values.nas.ssh.user }}"
+            - name: NAS_SSH_KEY_PATH
+              value: "{{ .Values.nas.ssh.keyPath }}"
             - name: SUDO_ALLOWED_COMMANDS
               value: "{{ .Values.security.sudoAllowedCommands }}"
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
-            - name: NFS_SHARE_ROOT
-              value: "/kube_share"
           readinessProbe:
             httpGet:
               path: /health
@@ -57,16 +61,16 @@ spec:
               cpu: {{ .Values.resources.limits.cpu }}
               memory: {{ .Values.resources.limits.memory }}
           volumeMounts:
-            - name: nfs-kube-share
-              mountPath: /kube_share
+            - name: nas-ssh-key
+              mountPath: /etc/nas-ssh
+              readOnly: true
             - name: image-store
               mountPath: /image-store
       volumes:
-        - name: nfs-kube-share
-          nfs:
-            server: {{ .Values.nfs.server }}
-            path: {{ .Values.nfs.path }}
-            readOnly: false
+        - name: nas-ssh-key
+          secret:
+            secretName: nas-ssh-key
+            defaultMode: 0400
         - name: image-store
           persistentVolumeClaim:
-            claimName: pvc-image-store  
+            claimName: pvc-image-store
