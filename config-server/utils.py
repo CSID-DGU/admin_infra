@@ -553,155 +553,46 @@ def ensure_sudoers_file(sudoers_dir: str, username: str, policy: str) -> str:
     return target
 
 
-def nfs_share_root() -> str:
-    """Host path where Chart NFS export is mounted (must match deployment volume mountPath)."""
-    return os.environ.get("NFS_SHARE_ROOT", "/kube_share")
-
-
-def csi_pvc_directory_on_share(pvc_name: str, pvc_type: str) -> str:
-    """Directory created by nfs.csi.k8s.io for our StorageClasses (pvc-chart sc-nfs-*.yaml subdir)."""
-    root = nfs_share_root()
-    prefix = "group-volumes" if pvc_type == "group" else "user"
-    return os.path.join(root, prefix, pvc_name)
-
-
-def create_directory_with_permissions(pvc_name: str, pvc_type: str, lookup_name: str):
-    """Ensure CSI subdirectory exists on the share mount and set ownership (uid or root:gid).
-
-    Args:
-        pvc_name: Kubernetes PVC metadata.name (e.g. pvc-alice-share).
-        pvc_type: 'user' or 'group'
-        lookup_name: passwd/group lookup key (username or group name).
-    """
-    import subprocess
-
-    app.logger.info(
-        "create_directory_with_permissions pvc_name=%s type=%s lookup_name=%s share_root=%s",
-        pvc_name,
-        pvc_type,
-        lookup_name,
-        nfs_share_root(),
+def _nas_ssh_client():
+    import paramiko
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(
+        hostname=os.environ["NAS_SSH_HOST"],
+        port=int(os.environ.get("NAS_SSH_PORT", "22")),
+        username=os.environ["NAS_SSH_USER"],
+        key_filename=os.environ["NAS_SSH_KEY_PATH"],
     )
-
-    dir_path = csi_pvc_directory_on_share(pvc_name, pvc_type)
-
-    if pvc_type == "group":
-        app.logger.info(f"Processing group type PVC for lookup_name: {lookup_name} path={dir_path}")
-        # Verify group exists
-        g_lines = read_group_lines()
-        group_info = None
-        for line in g_lines:
-            rec = parse_group_line(line)
-            if rec and rec["name"] == lookup_name:
-                group_info = rec
-                break
-
-        if not group_info:
-            app.logger.error(f"Group '{lookup_name}' not found in group file")
-            raise ValueError(f"Group '{lookup_name}' not found in group file")
-
-        app.logger.info(f"Found group info: {group_info}")
-
-        try:
-            app.logger.info(f"Creating directory: {dir_path}")
-            subprocess.run(["mkdir", "-p", dir_path], check=True)
-            gid = group_info["gid"]
-            app.logger.info(f"Setting ownership to root:{gid}")
-            subprocess.run(["chown", f"root:{gid}", dir_path], check=True)
-            subprocess.run(["chmod", "775", dir_path], check=True)
-            app.logger.info(f"Successfully created group directory {dir_path} with ownership root:{gid}")
-        except subprocess.CalledProcessError as e:
-            app.logger.error(f"Failed to create group directory {dir_path}: {e}")
-            raise RuntimeError(f"Failed to create group directory {dir_path}: {e}")
-    else:
-        app.logger.info(f"Processing user type PVC for lookup_name: {lookup_name} path={dir_path}")
-        # Verify user exists
-        lines = read_passwd_lines()
-        user_info = None
-        for line in lines:
-            rec = parse_passwd_line(line)
-            if rec and rec["name"] == lookup_name:
-                user_info = rec
-                break
-
-        if not user_info:
-            app.logger.error(f"User '{lookup_name}' not found in passwd file")
-            raise ValueError(f"User '{lookup_name}' not found in passwd file")
-
-        app.logger.info(f"Found user info: {user_info}")
-
-        try:
-            app.logger.info(f"Creating directory: {dir_path}")
-
-            root = nfs_share_root()
-            base_exists = os.path.exists(root)
-            app.logger.info("Base path %s exists: %s", root, base_exists)
-            if base_exists:
-                app.logger.info("Base path permissions: %s", oct(os.stat(root).st_mode)[-3:])
-
-            # Create directory with detailed output capture
-            mkdir_result = subprocess.run(["mkdir", "-p", dir_path], capture_output=True, text=True, check=False)
-            app.logger.info(f"mkdir command exit code: {mkdir_result.returncode}")
-            if mkdir_result.stdout:
-                app.logger.info(f"mkdir stdout: {mkdir_result.stdout}")
-            if mkdir_result.stderr:
-                app.logger.info(f"mkdir stderr: {mkdir_result.stderr}")
-
-            # Check if directory was actually created
-            dir_created = os.path.exists(dir_path)
-            app.logger.info(f"Directory {dir_path} exists after mkdir: {dir_created}")
-
-            if mkdir_result.returncode != 0:
-                raise subprocess.CalledProcessError(mkdir_result.returncode, ["mkdir", "-p", dir_path], mkdir_result.stdout, mkdir_result.stderr)
-
-            uid = user_info["uid"]
-            app.logger.info(f"Setting ownership to {uid}:{uid}")
-
-            # Only proceed with chown/chmod if directory exists
-            if dir_created:
-                chown_result = subprocess.run(["chown", f"{uid}:{uid}", dir_path], capture_output=True, text=True, check=False)
-                app.logger.info(f"chown command exit code: {chown_result.returncode}")
-                if chown_result.stderr:
-                    app.logger.info(f"chown stderr: {chown_result.stderr}")
-
-                chmod_result = subprocess.run(["chmod", "755", dir_path], capture_output=True, text=True, check=False)
-                app.logger.info(f"chmod command exit code: {chmod_result.returncode}")
-                if chmod_result.stderr:
-                    app.logger.info(f"chmod stderr: {chmod_result.stderr}")
-
-                if chown_result.returncode != 0 or chmod_result.returncode != 0:
-                    app.logger.warning(f"chown/chmod failed but continuing")
-
-                app.logger.info(f"Successfully created user directory {dir_path} with ownership {uid}:{uid}")
-            else:
-                app.logger.error(f"Directory {dir_path} was not created despite mkdir success")
-                raise RuntimeError(f"Directory {dir_path} was not created")
-
-        except subprocess.CalledProcessError as e:
-            app.logger.error(f"Failed to create user directory {dir_path}: {e}")
-            app.logger.error(f"Command output: stdout={e.stdout}, stderr={e.stderr}")
-            raise RuntimeError(f"Failed to create user directory {dir_path}: {e}")
-        except Exception as e:
-            app.logger.error(f"Unexpected error creating directory {dir_path}: {e}")
-            raise RuntimeError(f"Unexpected error creating directory {dir_path}: {e}")
+    return ssh
 
 
-def delete_directory_if_exists(pvc_name: str, pvc_type: str):
-    """Remove CSI subdirectory for this PVC metadata.name (honours custom pvc_name)."""
-    import shutil
+def _ssh_run(ssh, cmd: str) -> None:
+    _, stdout, stderr = ssh.exec_command(cmd)
+    exit_code = stdout.channel.recv_exit_status()
+    if exit_code != 0:
+        raise RuntimeError(
+            f"NAS SSH command failed (exit {exit_code}): {cmd}\n"
+            f"{stderr.read().decode(errors='replace')}"
+        )
 
-    dir_path = csi_pvc_directory_on_share(pvc_name, pvc_type)
 
-    try:
-        if os.path.exists(dir_path):
-            # Use shutil.rmtree for recursive directory deletion
-            shutil.rmtree(dir_path)
-            app.logger.info(f"Deleted directory: {dir_path}")
-        else:
-            app.logger.info(f"Directory {dir_path} does not exist, skipping deletion")
-    except Exception as e:
-        app.logger.error(f"Failed to delete directory {dir_path}: {e}")
-        raise RuntimeError(f"Failed to delete directory {dir_path}: {e}")
+def create_user_home_directory(username: str, uid: int, gid: int) -> None:
+    share_path = os.environ["NFS_USER_SHARE_PATH"]
+    path = f"{share_path}/{username}"
+    app.logger.info(f"[NAS SSH] creating home dir {path} uid={uid} gid={gid}")
+    with _nas_ssh_client() as ssh:
+        _ssh_run(ssh, f"mkdir -p {path}")
+        _ssh_run(ssh, f"chown {uid}:{gid} {path}")
+        _ssh_run(ssh, f"chmod 700 {path}")
+
+
+def delete_user_home_directory(username: str) -> None:
+    share_path = os.environ["NFS_USER_SHARE_PATH"]
+    path = f"{share_path}/{username}"
+    app.logger.info(f"[NAS SSH] deleting home dir {path}")
+    with _nas_ssh_client() as ssh:
+        _ssh_run(ssh, f"rm -rf {path}")
+
 
 def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:
     """
