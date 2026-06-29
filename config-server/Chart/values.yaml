@@ -42,6 +42,11 @@ namespace: ailab-infra
 cleanup:
   image: config-server:latest
 
+db:
+  host: "infra-mysql"
+  name: "pod_port_db"
+  user: "pod_port_user"
+
 redis:
   host: redis-bg-master.ailab-infra.svc.cluster.local
   port: 6379
