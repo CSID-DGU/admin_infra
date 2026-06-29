@@ -32,6 +32,9 @@ nas:
 security:
   sudoAllowedCommands: ""
 
+krb5:
+  realm: ""
+
 
 config:
   namespace: ailab-infra

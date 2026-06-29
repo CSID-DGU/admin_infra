@@ -71,6 +71,9 @@ app.config.from_mapping({
     "NFS_SERVER":          os.getenv("NFS_SERVER", ""),
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
+    # Kerberos (비어있으면 비활성)
+    "KRB5_REALM": os.getenv("KRB5_REALM", ""),
+
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
 
@@ -1006,6 +1009,18 @@ def build_pod_spec(
         volume_mounts.extend(gpu_volume_mounts)
         volumes.extend(gpu_volumes)
 
+        if app.config["KRB5_REALM"]:
+            volume_mounts.append({
+                "name": "krb5-keytab",
+                "mountPath": "/etc/krb5.keytab",
+                "subPath": "krb5.keytab",
+                "readOnly": True,
+            })
+            volumes.append({
+                "name": "krb5-keytab",
+                "secret": {"secretName": f"krb5-keytab-{username}"},
+            })
+
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
     
         spec = {
@@ -1054,7 +1069,11 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"},
-                                                    {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)}
+                                                    {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)},
+                                                    *([
+                                                        {"name": "KRB5_REALM",          "value": app.config["KRB5_REALM"]},
+                                                        {"name": "DECS_KRB5_PRINCIPAL", "value": f"{username}@{app.config['KRB5_REALM']}"},
+                                                    ] if app.config["KRB5_REALM"] else []),
                                                 ],
                                                 "resources": {
                                                     "requests": {
