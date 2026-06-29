@@ -62,6 +62,8 @@ spec:
               value: "{{ .Values.redis.host }}"
             - name: REDIS_PORT
               value: "{{ .Values.redis.port }}"
+            - name: KRB5_REALM
+              value: "{{ .Values.krb5.realm }}"
           readinessProbe:
             httpGet:
               path: /health
