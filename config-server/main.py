@@ -21,7 +21,7 @@ from error import infra_error, k8s_error_fields
 
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
-    LockedFile,get_node_gpu_score,
+    LockedFile, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
@@ -29,8 +29,8 @@ from utils import (
     parse_passwd_line, format_passwd_entry,
     parse_group_line, format_group_entry,
     parse_shadow_line, format_shadow_entry,
-    create_directory_with_permissions,
-    delete_directory_if_exists,
+    create_user_home_directory,
+    delete_user_home_directory,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     load_user_image,
@@ -67,21 +67,10 @@ app.config.from_mapping({
     "DEFAULT_CPU_LIMIT":  "1000m",
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
-    # PVC / storage policy
-    "USER_STORAGE_CLASS": "nfs-user-storage",
-    "GROUP_STORAGE_CLASS": "nfs-group-storage",
-    "PVC_NAME_PATTERN": "pvc-{username}-share",
-    "PVC_ACCESS_MODES": ["ReadWriteMany"],
-    "PVC_SIZE_UNIT": "Gi",
+    # NFS
+    "NFS_SERVER":          os.getenv("NFS_SERVER", ""),
+    "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
-    # Mounts & devices
-    "ACCOUNT_FILE_SUBPATHS": [
-        "passwd",
-        "group",
-        "shadow",
-        "bash.bash_logout",
-        "bashrc",
-    ],
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
 
@@ -89,8 +78,6 @@ app.config.from_mapping({
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
     "BASE_ETC_DIR": BASE_ETC_DIR,
-    "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
-    "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
     "SUDO_ALLOWED_COMMANDS": [
         cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
     ],
@@ -826,25 +813,23 @@ def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str
     return primary_gid, primary_group_name
 
 
-def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]:
-    """Map supplementary GIDs to (group_name, gid) pairs.
-
-    Excludes the user's primary group (not shared) and any GID with no
-    matching entry in the local group file. Order follows gid_list.
-    """
-    result: List[tuple] = []
-    seen = set()
+def _build_user_groups_env(
+    username: str, primary_group_name: str, primary_gid: int, gid_list: List[int]
+) -> str:
+    """USER_GROUPS env var 값 생성: 'primary:gid,supp1:gid1,...' 형태."""
+    entries = [f"{primary_group_name}:{primary_gid}"]
+    seen = {primary_gid}
     g_lines = read_group_lines()
     for gid in gid_list:
-        if gid == primary_gid or gid in seen:
+        if gid in seen:
             continue
         seen.add(gid)
         for line in g_lines:
             rec = parse_group_line(line)
             if rec and rec["gid"] == gid:
-                result.append((rec["name"], gid))
+                entries.append(f"{rec['name']}:{gid}")
                 break
-    return result
+    return ",".join(entries)
 
 
 def _get_sudo_allowed_commands() -> List[str]:
@@ -879,9 +864,6 @@ def _rollback_user(name: str) -> None:
         cleaned.append(format_group_entry(rec))
     write_group_lines(cleaned)
 
-
-def _get_account_file_subpaths() -> List[str]:
-    return list(app.config["ACCOUNT_FILE_SUBPATHS"])
 
 def build_pod_spec(
     username: str,
@@ -970,12 +952,9 @@ def build_pod_spec(
     
         app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
     
-        pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
-        app.logger.debug(f"[POD SPEC] pvc_name={pvc_name}")
-    
         gpu_volume_mounts = []
         gpu_volumes = []
-    
+
         if num_gpu > 0:
             for i in range(num_gpu):
                 gpu_volume_mounts.append({
@@ -989,7 +968,7 @@ def build_pod_spec(
                         "type": "CharDevice"
                     }
                 })
-    
+
             for dev in app.config["NVIDIA_AUX_DEVICES"]:
                 mount_name = dev.replace("-", "")
                 gpu_volume_mounts.append({
@@ -1003,108 +982,31 @@ def build_pod_spec(
                         "type": "CharDevice"
                     }
                 })
-                
-        volume_mounts = [{
-            "name": "user-home",
-            "mountPath": f"/home/{username}",
-            "readOnly": False
-        }]
-        volume_mounts.append({
-            "name": "image-store",
-            "mountPath": "/image-store",
-            "readOnly": False
-        })
-        volumes = [{
-            "name": "user-home",
-            "persistentVolumeClaim": {
-                "claimName": pvc_name
-            }
-        }]
-        volumes.append({
-            "name": "image-store",
-            "persistentVolumeClaim": {
-                "claimName": "pvc-image-store"
-            }
-        })
-    
+
+        # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
+        volume_mounts = [
+            {"name": "nfs-home",    "mountPath": "/home",        "readOnly": False},
+            {"name": "image-store", "mountPath": "/image-store", "readOnly": False},
+        ]
+        volumes = [
+            {
+                "name": "nfs-home",
+                "nfs": {
+                    "server":   app.config["NFS_SERVER"],
+                    "path":     app.config["NFS_USER_SHARE_PATH"],
+                    "readOnly": False,
+                }
+            },
+            {
+                "name": "image-store",
+                "persistentVolumeClaim": {"claimName": "pvc-image-store"}
+            },
+        ]
+
         volume_mounts.extend(gpu_volume_mounts)
         volumes.extend(gpu_volumes)
 
-        # 그룹 공유 볼륨 마운트: /shared/<groupname> -> pvc-<groupname>-group-share
-        shared_groups = _resolve_shared_groups(gid_list, primary_gid)
-        app.logger.info(f"[POD SPEC] shared groups: {shared_groups}")
-        for group_name, _gid in shared_groups:
-            volume_mounts.append({
-                "name": f"shared-{group_name}",
-                "mountPath": f"/shared/{group_name}",
-                "readOnly": False
-            })
-            volumes.append({
-                "name": f"shared-{group_name}",
-                "persistentVolumeClaim": {
-                    "claimName": f"pvc-{group_name}-group-share"
-                }
-            })
-
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
-    # 계정 파일 마운트 -> NFS 마운트 대체
-        account_file_mounts = []
-        # fallback 세팅
-        for sub in _get_account_file_subpaths():
-            sub_fmt = sub.format(username=username)
-            if sub == "bash.bash_logout":
-                mount_path = f"/home/{username}/.bash_logout"
-            elif sub == "bashrc":
-                mount_path = f"/home/{username}/.bashrc"
-            else:
-                mount_path = f"/etc/{sub_fmt}"
-            account_file_mounts.append({
-                "name": "account-files",
-                "mountPath": mount_path,
-                "subPath": sub_fmt,
-                "readOnly": True
-            })
-
-        account_nfs_server = app.config["ACCOUNT_NFS_SERVER"]
-        account_nfs_path = app.config["ACCOUNT_NFS_PATH"]
-        if account_nfs_server and account_nfs_path:
-            volume_mounts.extend(account_file_mounts)
-            volumes.append({
-                "name": "account-files",
-                "nfs": {
-                    "server": account_nfs_server,
-                    "path": account_nfs_path,
-                    "readOnly": True
-                }
-            })
-        else:
-            app.logger.warning(
-                "[POD SPEC] NFS_SERVER/NFS_PATH missing, falling back to legacy hostPath /etc mounts"
-            )
-            legacy_etc_mounts = []
-            for sub in _get_account_file_subpaths():
-                sub_fmt = sub.format(username=username)
-                if sub == "bash.bash_logout":
-                    mount_path = f"/home/{username}/.bash_logout"
-                    source_subpath = "bash.bash_logout"
-                elif sub == "bashrc":
-                    mount_path = f"/home/{username}/.bashrc"
-                    source_subpath = "bashrc"
-                else:
-                    mount_path = f"/etc/{sub_fmt}"
-                    source_subpath = sub_fmt
-                legacy_etc_mounts.append({
-                    "name": "host-etc",
-                    "mountPath": mount_path,
-                    "subPath": source_subpath,
-                    "readOnly": True
-                })
-
-            volume_mounts.extend(legacy_etc_mounts)
-            volumes.append({
-                "name": "host-etc",
-                "hostPath": {"path": "/etc", "type": "Directory"}
-            })
     
         spec = {
                     "config": {
@@ -1152,7 +1054,7 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"},
-                                                    {"name": "SHARED_GROUPS", "value": ",".join(f"{n}:{g}" for n, g in shared_groups)}
+                                                    {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)}
                                                 ],
                                                 "resources": {
                                                     "requests": {
@@ -1641,395 +1543,6 @@ def migrate():
 
 
 
-@app.route("/pvc", methods=["POST"])
-def create_or_resize_pvc():
-    """
-    PVC 생성 또는 용량 확장 API
-
-    ---
-    tags:
-    - Storage
-
-    summary: PVC 생성 또는 확장
-
-    parameters:
-
-      - in: body
-        name: body
-        schema:
-          type: object
-          properties:
-            pvcs:
-              type: array
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: alice
-                  type:
-                    type: string
-                    enum:
-                      - user
-                      - group
-                  storage:
-                    type: integer
-                    example: 50
-
-    responses:
-
-      200:
-        description: PVC 처리 결과
-      400:
-        description: 잘못된 요청
-      500:
-        description: 서버 오류
-    """
-    data = request.get_json(force=True)
-    pvcs = data.get("pvcs", [])
-    
-    # Legacy support for old format
-    if not pvcs and data.get("username") and data.get("storage"):
-        pvcs = [{
-            "name": data["username"],
-            "type": "user",
-            "storage": data["storage"]
-        }]
-    
-    if not pvcs:
-        return jsonify({
-            "error": "INVALID_PVC_REQUEST",
-            "detail": "pvcs list is required",
-            "results": [{
-                "step": "VALIDATE_REQUEST",
-                "error": "INVALID_PVC_REQUEST",
-                "detail": "pvcs list is required",
-                "progress": {},
-            }],
-        }), 400
-
-    results = []
-    namespace = app.config["NAMESPACE"]
-
-    try:
-        try:
-            k8s_config.load_incluster_config()
-        except:
-            k8s_config.load_kube_config()
-
-        core_v1 = client.CoreV1Api()
-
-        for pvc_config in pvcs:
-            name = pvc_config.get("name")
-            pvc_type = pvc_config.get("type", "user")
-            storage_raw = pvc_config.get("storage")
-            custom_pvc_name = pvc_config.get("pvc_name")
-
-            app.logger.info(f"Processing PVC request: name={name}, type={pvc_type}, storage={storage_raw}")
-
-            if not name or not storage_raw:
-                app.logger.error(f"Missing required fields for {pvc_config}")
-                results.append(infra_error(
-                    "VALIDATE_REQUEST",
-                    "INVALID_PVC_REQUEST",
-                    f"name and storage required for {pvc_config}",
-                    name=name,
-                    type=pvc_type,
-                    rollback={},
-                ))
-                continue
-
-            if pvc_type not in ["user", "group"]:
-                app.logger.error(f"Invalid PVC type '{pvc_type}' for {name}")
-                results.append(infra_error(
-                    "VALIDATE_REQUEST",
-                    "INVALID_PVC_REQUEST",
-                    f"type must be 'user' or 'group' for {name}",
-                    name=name,
-                    type=pvc_type,
-                    rollback={},
-                ))
-                continue
-
-            storage = f"{storage_raw}Gi"
-
-            # PVC naming
-            if custom_pvc_name:
-                pvc_name = custom_pvc_name
-            elif pvc_type == "group":
-                pvc_name = f"pvc-{name}-group-share"
-            else:
-                pvc_name = f"pvc-{name}-share"
-
-            storage_class = (
-                app.config["GROUP_STORAGE_CLASS"]
-                if pvc_type == "group"
-                else app.config["USER_STORAGE_CLASS"]
-            )
-
-            app.logger.info(f"PVC name determined: {pvc_name}, storage_class: {storage_class}")
-
-            try:
-                # Check if PVC exists
-                app.logger.info(f"Checking if PVC {pvc_name} already exists...")
-                try:
-                    existing_pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-                    app.logger.info(f"PVC {pvc_name} already exists, performing resize operation")
-                    # Exists -> resize
-                    patch_body = {
-                        "spec": {
-                            "resources": {
-                                "requests": {
-                                    "storage": storage
-                                }
-                            }
-                        }
-                    }
-                    core_v1.patch_namespaced_persistent_volume_claim(
-                        name=pvc_name,
-                        namespace=namespace,
-                        body=patch_body
-                    )
-                    results.append({"status": "resized", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
-                except client.exceptions.ApiException as e:
-                    if e.status != 404:
-                        results.append(infra_error(
-                            "RESIZE_PVC",
-                            "PVC_RESIZE_FAILED",
-                            f"Kubernetes API error for {name}: {e.body}",
-                            name=name,
-                            type=pvc_type,
-                            rollback={},
-                            **k8s_error_fields(e),
-                        ))
-                        continue
-
-                    # PVC doesn't exist → create
-                    pvc_body = client.V1PersistentVolumeClaim(
-                        metadata=client.V1ObjectMeta(
-                            name=pvc_name,
-                            annotations={"nfs.io/username": name, "nfs.io/type": pvc_type}
-                        ),
-                        spec=client.V1PersistentVolumeClaimSpec(
-                            access_modes=["ReadWriteMany"],
-                            resources=client.V1ResourceRequirements(
-                                requests={"storage": storage}
-                            ),
-                            storage_class_name=storage_class
-                        )
-                    )
-                    try:
-                        core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-                    except client.exceptions.ApiException as e:
-                        results.append(infra_error(
-                            "CREATE_PVC",
-                            "PVC_CREATE_FAILED",
-                            e.body,
-                            name=name,
-                            type=pvc_type,
-                            rollback={},
-                            **k8s_error_fields(e),
-                        ))
-                        continue
-                    app.logger.info(f"Created PVC: {pvc_name}")
-
-                    # Wait for PVC to be bound and get the actual PV name
-                    import time
-                    max_wait = 30  # 30 seconds timeout
-                    wait_time = 0
-                    pv_name = None
-
-                    app.logger.info(f"Waiting for PVC {pvc_name} to be bound...")
-                    while wait_time < max_wait:
-                        try:
-                            pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-                            app.logger.debug(f"PVC status: {pvc.status.phase}, volume_name: {pvc.spec.volume_name}")
-                            if pvc.status.phase == "Bound" and pvc.spec.volume_name:
-                                pv_name = pvc.spec.volume_name
-                                app.logger.info(f"PVC bound to PV: {pv_name}")
-                                break
-                        except Exception as e:
-                            app.logger.debug(f"Error checking PVC status: {e}")
-                        time.sleep(1)
-                        wait_time += 1
-
-                    # CSI creates user/<pvc> or group-volumes/<pvc>; align ownership on share mount (/kube_share).
-                    if pv_name:
-                        app.logger.info(f"PVC bound PV={pv_name}; setting ownership for {pvc_name}")
-                        create_directory_with_permissions(pvc_name, pvc_type, name)
-                    else:
-                        app.logger.warning(
-                            "PVC %s not bound within %ss; skipping chown (directory may not exist yet)",
-                            pvc_name,
-                            max_wait,
-                        )
-                    
-                    results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
-
-            except Exception as e:
-                results.append(infra_error(
-                    "CREATE_PVC",
-                    "PVC_CREATE_FAILED",
-                    f"Failed to process {name}: {str(e)}",
-                    name=name,
-                    type=pvc_type,
-                    rollback={},
-                ))
-
-        has_error = any("error" in result for result in results)
-        status = 500 if has_error else 200
-        return jsonify({"results": results}), status
-
-    except Exception as e:
-                return jsonify({
-            "error": "PVC_OPERATION_FAILED",
-            "detail": str(e),
-            "results": [{
-                "step": "CREATE_PVC",
-                "error": "PVC_OPERATION_FAILED",
-                "detail": str(e),
-                "progress": {},
-            }],
-        }), 500
-
-
-
-@app.route("/pvc", methods=["DELETE"])
-def delete_pvc():
-    """
-    PVC 및 연결된 디렉터리 삭제 API
-
-    - 표준 요청 형식:
-      {
-        "pvcs": [
-          {"name": "testuser", "type": "user"},
-          {"name": "developers", "type": "group"}
-        ]
-      }
-
-    - Legacy 요청 형식:
-      {
-        "username": "testuser",
-        "type": "user"
-      }
-
-    ---
-    tags:
-      - Storage
-    consumes:
-      - application/json
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            pvcs:
-              type: array
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: testuser
-                  type:
-                    type: string
-                    example: user
-            username:
-              type: string
-              example: testuser
-            type:
-              type: string
-              example: user
-    responses:
-      200:
-        description: 삭제 결과
-      400:
-        description: 잘못된 요청
-      500:
-        description: 서버 오류
-    """
-    data = request.get_json(force=True)
-    pvcs = data.get("pvcs", [])
-    
-    # Legacy support for old format
-    if not pvcs and data.get("username"):
-        pvcs = [{
-            "name": data["username"],
-            "type": data.get("type", "user")
-        }]
-    
-    if not pvcs:
-        return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
-
-    results = []
-    namespace = app.config["NAMESPACE"]
-
-    try:
-        try:
-            k8s_config.load_incluster_config()
-        except:
-            k8s_config.load_kube_config()
-
-        core_v1 = client.CoreV1Api()
-
-        for pvc_config in pvcs:
-            name = pvc_config.get("name")
-            pvc_type = pvc_config.get("type", "user")
-            custom_pvc_name = pvc_config.get("pvc_name")
-
-            if not name:
-                results.append({"error": f"name is required for {pvc_config}"})
-                continue
-
-            if pvc_type not in ["user", "group"]:
-                results.append({"error": f"type must be 'user' or 'group' for {name}"})
-                continue
-
-            # PVC naming (same logic as create)
-            if custom_pvc_name:
-                pvc_name = custom_pvc_name
-            elif pvc_type == "group":
-                pvc_name = f"pvc-{name}-group-share"
-            else:
-                pvc_name = f"pvc-{name}-share"
-
-            try:
-                # Delete PVC (this also deletes the PV automatically due to reclaim policy)
-                try:
-                    core_v1.delete_namespaced_persistent_volume_claim(
-                        name=pvc_name,
-                        namespace=namespace
-                    )
-                    app.logger.info(f"Deleted PVC: {pvc_name}")
-                except client.exceptions.ApiException as e:
-                    if e.status == 404:
-                        app.logger.warning(f"PVC {pvc_name} not found, skipping PVC deletion")
-                    else:
-                        results.append({"error": f"Failed to delete PVC {pvc_name}: {e.body}"})
-                        continue
-
-                delete_directory_if_exists(pvc_name, pvc_type)
-                
-                results.append({
-                    "status": "deleted", 
-                    "name": name, 
-                    "type": pvc_type, 
-                    "pvc_name": pvc_name
-                })
-
-            except Exception as e:
-                results.append({"error": f"Failed to delete {name}: {str(e)}"})
-
-        return jsonify({"results": results})
-
-    except Exception as e:
-        return jsonify({"results": [{"error": str(e)}]}), 500
-
-
-
-
 
 accounts_bp = Blueprint("accounts", __name__)
 
@@ -2436,6 +1949,14 @@ def create_user():
             _rollback_user(name)
             return jsonify({"error": "failed to create sudoers file"}), 500
 
+    # 5) NAS SSH로 홈 디렉터리 생성
+    try:
+        create_user_home_directory(name, uid, gid)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
+        _rollback_user(name)
+        return jsonify(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}")), 500
+
     return jsonify({
         "status": "created",
         "user": entry,
@@ -2532,6 +2053,11 @@ def delete_user(username: str):
         g_new.append(format_group_entry(grec))
 
     write_group_lines(g_new)
+
+    try:
+        delete_user_home_directory(username)
+    except Exception:
+        app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
 
     return jsonify({"status": "deleted", "user": username})
 
