@@ -3,7 +3,7 @@ import fcntl
 import re
 import time
 from typing import List, Optional
-from kubernetes import client, config as k8s_config
+from kubernetes import client, config as k8s_config, watch
 import pymysql
 import os
 import requests
@@ -17,9 +17,11 @@ load_dotenv()
 import base64
 import crypt
 
+from error import infra_error, k8s_error_fields
+
 from utils import (
     get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
-    LockedFile,get_node_gpu_score,
+    LockedFile, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
     read_group_lines, write_group_lines,
@@ -27,8 +29,8 @@ from utils import (
     parse_passwd_line, format_passwd_entry,
     parse_group_line, format_group_entry,
     parse_shadow_line, format_shadow_entry,
-    create_directory_with_permissions,
-    delete_directory_if_exists,
+    create_user_home_directory,
+    delete_user_home_directory,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
     load_user_image,
@@ -65,21 +67,10 @@ app.config.from_mapping({
     "DEFAULT_CPU_LIMIT":  "1000m",
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
-    # PVC / storage policy
-    "USER_STORAGE_CLASS": "nfs-user-storage",
-    "GROUP_STORAGE_CLASS": "nfs-group-storage",
-    "PVC_NAME_PATTERN": "pvc-{username}-share",
-    "PVC_ACCESS_MODES": ["ReadWriteMany"],
-    "PVC_SIZE_UNIT": "Gi",
+    # NFS
+    "NFS_SERVER":          os.getenv("NFS_SERVER", ""),
+    "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
-    # Mounts & devices
-    "ACCOUNT_FILE_SUBPATHS": [
-        "passwd",
-        "group",
-        "shadow",
-        "bash.bash_logout",
-        "bashrc",
-    ],
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
 
@@ -87,8 +78,6 @@ app.config.from_mapping({
         "nvidiactl", "nvidia-uvm", "nvidia-uvm-tools", "nvidia-modeset"
     ],
     "BASE_ETC_DIR": BASE_ETC_DIR,
-    "ACCOUNT_NFS_SERVER": os.getenv("NFS_SERVER", os.getenv("NFS_ADDRESS", "")),
-    "ACCOUNT_NFS_PATH": os.getenv("NFS_PATH", ""),
     "SUDO_ALLOWED_COMMANDS": [
         cmd.strip() for cmd in os.getenv("SUDO_ALLOWED_COMMANDS", "").split(",") if cmd.strip()
     ],
@@ -126,6 +115,32 @@ def load_k8s():
         k8s_config.load_incluster_config()
     except:
         k8s_config.load_kube_config()
+
+
+def wait_for_pod_deleted(v1, pod_name, namespace, timeout_sec=60):
+    """
+    delete_namespaced_pod() 이후 실제 파드 삭제 완료를 watch 이벤트로 확인한다.
+    """
+    w = watch.Watch()
+    field_selector = f"metadata.name={pod_name}"
+    try:
+        for event in w.stream(
+            v1.list_namespaced_pod,
+            namespace=namespace,
+            field_selector=field_selector,
+            timeout_seconds=timeout_sec,
+        ):
+            if event.get("type") == "DELETED":
+                return True
+        return False
+    finally:
+        w.stop()
+
+
+class PodSpecBuildError(Exception):
+    def __init__(self, message, progress=None):
+        super().__init__(message)
+        self.progress = progress or {}
 
 # ////////////////////// 포트 할당 //////////////////////
 
@@ -396,24 +411,89 @@ def create_pod():
 
     if not username:
         app.logger.warning("[CREATE POD] username missing in request")
-        return jsonify({"error": "username required"}), 400
+        return jsonify(infra_error(
+            "VALIDATE_REQUEST",
+            "INVALID_CREATE_POD_REQUEST",
+            "username required",
+        )), 400
 
     ns = app.config["NAMESPACE"]
+
+    def cleanup_create_failure(pod_name, v1=None, delete_services=False):
+        rollback = {
+            "nodeportsReleased": False,
+            "podDeleted": False,
+            "servicesDeleted": False,
+        }
+
+        if delete_services:
+            try:
+                delete_nodeport_services(pod_name, ns)
+                rollback["servicesDeleted"] = True
+            except Exception:
+                app.logger.warning("[CREATE POD] cleanup service deletion failed", exc_info=True)
+
+        try:
+            release_nodeports(pod_name)
+            rollback["nodeportsReleased"] = True
+        except Exception:
+            app.logger.warning("[CREATE POD] cleanup nodeport release failed", exc_info=True)
+
+        if v1 is not None:
+            try:
+                v1.delete_namespaced_pod(pod_name, ns)
+                rollback["podDeleted"] = True
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    rollback["podDeleted"] = True
+                else:
+                    app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+            except Exception:
+                app.logger.warning("[CREATE POD] cleanup pod deletion failed", exc_info=True)
+
+        return rollback
 
     try:
         # WAS 조회
         was_url = app.config["WAS_URL_TEMPLATE"].format(username=username)
         app.logger.info(f"[CREATE POD] requesting user config from WAS: {was_url}")
 
-        resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
-        user_info = resp.json()
+        try:
+            resp = requests.get(was_url, timeout=app.config["HTTP_TIMEOUT_SEC"])
+            user_info = resp.json()
+        except requests.RequestException as e:
+            app.logger.exception("[CREATE POD] WAS request failed")
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_FETCH_FAILED",
+                str(e),
+            )), 502
+        except ValueError as e:
+            app.logger.exception("[CREATE POD] invalid WAS response")
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_INVALID_RESPONSE",
+                str(e),
+                was_status=resp.status_code if "resp" in locals() else None,
+            )), 502
+
         # WAS가 HTTP 200 + body {"status": 404} 형태로 유저 없음을 알리는 경우 처리
         if user_info.get("status") == 404 or resp.status_code == 404:
             app.logger.warning(f"[CREATE POD] user {username!r} not found in WAS")
-            return jsonify({"error": f"user {username!r} not found in WAS"}), 404
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_NOT_FOUND",
+                f"user {username!r} not found in WAS",
+                was_status=resp.status_code,
+            )), 404
         if resp.status_code >= 400:
             app.logger.error(f"[CREATE POD] WAS returned {resp.status_code}")
-            return jsonify({"error": f"WAS returned {resp.status_code} for user {username!r}"}), 502
+            return jsonify(infra_error(
+                "FETCH_USER_CONFIG",
+                "USER_CONFIG_FETCH_FAILED",
+                f"WAS returned {resp.status_code} for user {username!r}",
+                was_status=resp.status_code,
+            )), 502
 
         app.logger.debug(f"[CREATE POD] user_info received: {user_info}")
 
@@ -421,15 +501,46 @@ def create_pod():
         app.logger.info(f"[CREATE POD] generated pod_name={pod_name}")
 
         # pod_name 중복 확인
-        load_k8s()
-        v1 = client.CoreV1Api()
+        try:
+            load_k8s()
+            v1 = client.CoreV1Api()
+        except Exception as e:
+            app.logger.exception("[CREATE POD] k8s client setup failed")
+            return jsonify(infra_error(
+                "CHECK_EXISTING_POD",
+                "K8S_CLIENT_SETUP_FAILED",
+                str(e),
+                pod_name=pod_name,
+            )), 500
 
         try:
             v1.read_namespaced_pod(pod_name, ns)
             app.logger.warning(f"[CREATE POD] pod already exists: {pod_name}")
-            return jsonify({"error": "pod already exists"}), 409
-        except:
+            return jsonify(infra_error(
+                "CHECK_EXISTING_POD",
+                "POD_ALREADY_EXISTS",
+                "pod already exists",
+                pod_name=pod_name,
+            )), 409
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                app.logger.exception("[CREATE POD] pod existence check failed")
+                return jsonify(infra_error(
+                    "CHECK_EXISTING_POD",
+                    "POD_CHECK_FAILED",
+                    e.body,
+                    pod_name=pod_name,
+                    **k8s_error_fields(e),
+                )), 500
             app.logger.debug("[CREATE POD] pod does not exist yet")
+        except Exception as e:
+            app.logger.exception("[CREATE POD] pod existence check failed")
+            return jsonify(infra_error(
+                "CHECK_EXISTING_POD",
+                "POD_CHECK_FAILED",
+                str(e),
+                pod_name=pod_name,
+            )), 500
 
         # Prometheus 기반 노드 선택
         gpu_nodes = user_info.get("gpu_nodes", [])
@@ -442,8 +553,24 @@ def create_pod():
         # WAS가 gpu_nodes를 반환하지 않으면 k8s Ready 워커 노드 전체로 폴백
         if not node_list:
             app.logger.warning("[CREATE POD] gpu_nodes missing from WAS — falling back to all ready worker nodes")
-            load_k8s()
-            _all_nodes = client.CoreV1Api().list_node().items
+            try:
+                load_k8s()
+                _all_nodes = client.CoreV1Api().list_node().items
+            except client.exceptions.ApiException as e:
+                app.logger.exception("[CREATE POD] fallback node list failed")
+                return jsonify(infra_error(
+                    "LIST_NODES",
+                    "NODE_LIST_FAILED",
+                    e.body,
+                    **k8s_error_fields(e),
+                )), 500
+            except Exception as e:
+                app.logger.exception("[CREATE POD] fallback node list failed")
+                return jsonify(infra_error(
+                    "LIST_NODES",
+                    "NODE_LIST_FAILED",
+                    str(e),
+                )), 500
             node_list = [
                 n.metadata.name
                 for n in _all_nodes
@@ -456,11 +583,20 @@ def create_pod():
 
         app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
 
-        best_node = select_best_node_from_prometheus(
-            node_list,
-            app.config["PROM_URL"],
-            app.config["HTTP_TIMEOUT_SEC"]
-        )
+        try:
+            best_node = select_best_node_from_prometheus(
+                node_list,
+                app.config["PROM_URL"],
+                app.config["HTTP_TIMEOUT_SEC"]
+            )
+        except Exception as e:
+            app.logger.exception("[CREATE POD] node selection failed")
+            return jsonify(infra_error(
+                "SELECT_NODE",
+                "NODE_SELECTION_FAILED",
+                str(e),
+                pod_name=pod_name,
+            )), 500
         app.logger.info(f"[CREATE POD] selected best node: {best_node}")
 
         # Pod spec 생성
@@ -477,30 +613,82 @@ def create_pod():
                 best_node,
                 pod_name
             )
+        except PodSpecBuildError as e:
+            return jsonify(infra_error(
+                "BUILD_POD_SPEC",
+                "POD_SPEC_BUILD_FAILED",
+                str(e),
+                progress=e.progress,
+                pod_name=pod_name,
+            )), 500
         except ValueError as e:
-            return jsonify({"error": str(e)}), 400
+            return jsonify(infra_error(
+                "BUILD_POD_SPEC",
+                "POD_SPEC_BUILD_FAILED",
+                str(e),
+                rollback={"nodeportsReleased": False},
+                pod_name=pod_name,
+            )), 400
+        except Exception as e:
+            app.logger.exception("[CREATE POD] pod spec build failed")
+            return jsonify(infra_error(
+                "BUILD_POD_SPEC",
+                "POD_SPEC_BUILD_FAILED",
+                str(e),
+                rollback={"nodeportsReleased": False},
+                pod_name=pod_name,
+            )), 500
         app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
 
         pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
         app.logger.info("[CREATE POD] pod spec built")
 
-        load_k8s()
-        v1 = client.CoreV1Api()
-
-        # 실제 Pod 생성
         try:
-            app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+            load_k8s()
+            v1 = client.CoreV1Api()
+        except Exception as e:
+            app.logger.exception("[CREATE POD] k8s client setup failed")
+            rollback = cleanup_create_failure(pod_name)
+            return jsonify(infra_error(
+                "CREATE_POD",
+                "K8S_CLIENT_SETUP_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
 
-            # 1. Pod 생성
+        app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+        try:
             v1.create_namespaced_pod(
                 namespace=ns,
                 body=pod_spec
             )
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[CREATE POD] pod creation failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "CREATE_POD",
+                "POD_CREATE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[CREATE POD] pod creation failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "CREATE_POD",
+                "POD_CREATE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
 
-            app.logger.info("[CREATE POD] pod creation request sent")
+        app.logger.info("[CREATE POD] pod creation request sent")
 
-            # 2. Ready 대기
-            app.logger.info("[CREATE POD] waiting for pod to become Ready")
+        app.logger.info("[CREATE POD] waiting for pod to become Ready")
+        try:
             for i in range(60):
                 pod = v1.read_namespaced_pod(pod_name, ns)
                 if is_pod_ready(pod):
@@ -510,25 +698,62 @@ def create_pod():
             else:
                 app.logger.error("[CREATE POD] pod failed to become ready")
                 app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
-                release_nodeports(pod_name)
-                v1.delete_namespaced_pod(pod_name, ns)
-                return jsonify({"error": "pod failed to start"}), 500
-
-            # 3. Pod 성공 후 Service 생성
-            app.logger.info("[CREATE POD] creating NodePort services")
-            create_nodeport_services(username, ns, pod_name, allocated_ports)
-
-            app.logger.info("[CREATE POD] services created successfully")
-
+                rollback = cleanup_create_failure(pod_name, v1)
+                return jsonify(infra_error(
+                    "WAIT_POD_READY",
+                    "POD_READY_TIMEOUT",
+                    "pod failed to start",
+                    rollback=rollback,
+                    pod_name=pod_name,
+                )), 500
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[CREATE POD] pod ready check failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "WAIT_POD_READY",
+                "POD_READY_CHECK_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
         except Exception as e:
-            app.logger.error(f"[CREATE POD] pod creation failed: {str(e)}")
-            release_nodeports(pod_name)
-            try:
-                v1.delete_namespaced_pod(pod_name, ns)
-                app.logger.warning("[CREATE POD] failed pod deleted")
-            except:
-                app.logger.warning("[CREATE POD] cleanup pod deletion failed")
-            raise
+            app.logger.exception("[CREATE POD] pod ready check failed")
+            rollback = cleanup_create_failure(pod_name, v1)
+            return jsonify(infra_error(
+                "WAIT_POD_READY",
+                "POD_READY_CHECK_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        app.logger.info("[CREATE POD] creating NodePort services")
+        try:
+            create_nodeport_services(username, ns, pod_name, allocated_ports)
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[CREATE POD] service creation failed")
+            rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
+            return jsonify(infra_error(
+                "CREATE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_CREATE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[CREATE POD] service creation failed")
+            rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
+            return jsonify(infra_error(
+                "CREATE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_CREATE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        app.logger.info("[CREATE POD] services created successfully")
 
         app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
 
@@ -541,7 +766,11 @@ def create_pod():
 
     except Exception as e:
         app.logger.exception("[CREATE POD] unexpected error")
-        return jsonify({"error": str(e)}), 500
+        return jsonify(infra_error(
+            "CREATE_POD",
+            "CREATE_POD_FAILED",
+            str(e),
+        )), 500
 
 
 def _normalize_gid_list(raw_gid) -> List[int]:
@@ -584,25 +813,23 @@ def _resolve_primary_group(username: str, gid_list: List[int]) -> tuple[int, str
     return primary_gid, primary_group_name
 
 
-def _resolve_shared_groups(gid_list: List[int], primary_gid: int) -> List[tuple]:
-    """Map supplementary GIDs to (group_name, gid) pairs.
-
-    Excludes the user's primary group (not shared) and any GID with no
-    matching entry in the local group file. Order follows gid_list.
-    """
-    result: List[tuple] = []
-    seen = set()
+def _build_user_groups_env(
+    username: str, primary_group_name: str, primary_gid: int, gid_list: List[int]
+) -> str:
+    """USER_GROUPS env var 값 생성: 'primary:gid,supp1:gid1,...' 형태."""
+    entries = [f"{primary_group_name}:{primary_gid}"]
+    seen = {primary_gid}
     g_lines = read_group_lines()
     for gid in gid_list:
-        if gid == primary_gid or gid in seen:
+        if gid in seen:
             continue
         seen.add(gid)
         for line in g_lines:
             rec = parse_group_line(line)
             if rec and rec["gid"] == gid:
-                result.append((rec["name"], gid))
+                entries.append(f"{rec['name']}:{gid}")
                 break
-    return result
+    return ",".join(entries)
 
 
 def _get_sudo_allowed_commands() -> List[str]:
@@ -637,9 +864,6 @@ def _rollback_user(name: str) -> None:
         cleaned.append(format_group_entry(rec))
     write_group_lines(cleaned)
 
-
-def _get_account_file_subpaths() -> List[str]:
-    return list(app.config["ACCOUNT_FILE_SUBPATHS"])
 
 def build_pod_spec(
     username: str,
@@ -728,12 +952,9 @@ def build_pod_spec(
     
         app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
     
-        pvc_name = app.config["PVC_NAME_PATTERN"].format(username=username)
-        app.logger.debug(f"[POD SPEC] pvc_name={pvc_name}")
-    
         gpu_volume_mounts = []
         gpu_volumes = []
-    
+
         if num_gpu > 0:
             for i in range(num_gpu):
                 gpu_volume_mounts.append({
@@ -747,7 +968,7 @@ def build_pod_spec(
                         "type": "CharDevice"
                     }
                 })
-    
+
             for dev in app.config["NVIDIA_AUX_DEVICES"]:
                 mount_name = dev.replace("-", "")
                 gpu_volume_mounts.append({
@@ -761,108 +982,31 @@ def build_pod_spec(
                         "type": "CharDevice"
                     }
                 })
-                
-        volume_mounts = [{
-            "name": "user-home",
-            "mountPath": f"/home/{username}",
-            "readOnly": False
-        }]
-        volume_mounts.append({
-            "name": "image-store",
-            "mountPath": "/image-store",
-            "readOnly": False
-        })
-        volumes = [{
-            "name": "user-home",
-            "persistentVolumeClaim": {
-                "claimName": pvc_name
-            }
-        }]
-        volumes.append({
-            "name": "image-store",
-            "persistentVolumeClaim": {
-                "claimName": "pvc-image-store"
-            }
-        })
-    
+
+        # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
+        volume_mounts = [
+            {"name": "nfs-home",    "mountPath": "/home",        "readOnly": False},
+            {"name": "image-store", "mountPath": "/image-store", "readOnly": False},
+        ]
+        volumes = [
+            {
+                "name": "nfs-home",
+                "nfs": {
+                    "server":   app.config["NFS_SERVER"],
+                    "path":     app.config["NFS_USER_SHARE_PATH"],
+                    "readOnly": False,
+                }
+            },
+            {
+                "name": "image-store",
+                "persistentVolumeClaim": {"claimName": "pvc-image-store"}
+            },
+        ]
+
         volume_mounts.extend(gpu_volume_mounts)
         volumes.extend(gpu_volumes)
 
-        # 그룹 공유 볼륨 마운트: /shared/<groupname> -> pvc-<groupname>-group-share
-        shared_groups = _resolve_shared_groups(gid_list, primary_gid)
-        app.logger.info(f"[POD SPEC] shared groups: {shared_groups}")
-        for group_name, _gid in shared_groups:
-            volume_mounts.append({
-                "name": f"shared-{group_name}",
-                "mountPath": f"/shared/{group_name}",
-                "readOnly": False
-            })
-            volumes.append({
-                "name": f"shared-{group_name}",
-                "persistentVolumeClaim": {
-                    "claimName": f"pvc-{group_name}-group-share"
-                }
-            })
-
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
-    # 계정 파일 마운트 -> NFS 마운트 대체
-        account_file_mounts = []
-        # fallback 세팅
-        for sub in _get_account_file_subpaths():
-            sub_fmt = sub.format(username=username)
-            if sub == "bash.bash_logout":
-                mount_path = f"/home/{username}/.bash_logout"
-            elif sub == "bashrc":
-                mount_path = f"/home/{username}/.bashrc"
-            else:
-                mount_path = f"/etc/{sub_fmt}"
-            account_file_mounts.append({
-                "name": "account-files",
-                "mountPath": mount_path,
-                "subPath": sub_fmt,
-                "readOnly": True
-            })
-
-        account_nfs_server = app.config["ACCOUNT_NFS_SERVER"]
-        account_nfs_path = app.config["ACCOUNT_NFS_PATH"]
-        if account_nfs_server and account_nfs_path:
-            volume_mounts.extend(account_file_mounts)
-            volumes.append({
-                "name": "account-files",
-                "nfs": {
-                    "server": account_nfs_server,
-                    "path": account_nfs_path,
-                    "readOnly": True
-                }
-            })
-        else:
-            app.logger.warning(
-                "[POD SPEC] NFS_SERVER/NFS_PATH missing, falling back to legacy hostPath /etc mounts"
-            )
-            legacy_etc_mounts = []
-            for sub in _get_account_file_subpaths():
-                sub_fmt = sub.format(username=username)
-                if sub == "bash.bash_logout":
-                    mount_path = f"/home/{username}/.bash_logout"
-                    source_subpath = "bash.bash_logout"
-                elif sub == "bashrc":
-                    mount_path = f"/home/{username}/.bashrc"
-                    source_subpath = "bashrc"
-                else:
-                    mount_path = f"/etc/{sub_fmt}"
-                    source_subpath = sub_fmt
-                legacy_etc_mounts.append({
-                    "name": "host-etc",
-                    "mountPath": mount_path,
-                    "subPath": source_subpath,
-                    "readOnly": True
-                })
-
-            volume_mounts.extend(legacy_etc_mounts)
-            volumes.append({
-                "name": "host-etc",
-                "hostPath": {"path": "/etc", "type": "Directory"}
-            })
     
         spec = {
                     "config": {
@@ -910,7 +1054,7 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"},
-                                                    {"name": "SHARED_GROUPS", "value": ",".join(f"{n}:{g}" for n, g in shared_groups)}
+                                                    {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)}
                                                 ],
                                                 "resources": {
                                                     "requests": {
@@ -939,13 +1083,22 @@ def build_pod_spec(
                     }
         app.logger.info(f"[POD SPEC] complete pod_name={pod_name}")
         return spec, allocated_ports
-    except Exception:
+    except Exception as e:
         app.logger.warning(
             "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s",
             pod_name,
         )
-        release_nodeports(pod_name)
-        raise
+        rollback = {"nodeportsReleased": False}
+        try:
+            release_nodeports(pod_name)
+            rollback["nodeportsReleased"] = True
+        except Exception:
+            app.logger.warning(
+                "[POD SPEC] nodeport release failed during rollback pod=%s",
+                pod_name,
+                exc_info=True,
+            )
+        raise PodSpecBuildError(str(e), progress=rollback) from e
 
 # //////////////////////// Pod 삭제 //////////////////////
 
@@ -1004,35 +1157,170 @@ def delete_pod():
 
     if not pod_name:
         app.logger.warning("[DELETE POD] pod_name missing")
-        return jsonify({"error": "pod_name required"}), 400
+        return jsonify(infra_error(
+            "VALIDATE_REQUEST",
+            "INVALID_DELETE_POD_REQUEST",
+            "pod_name required",
+        )), 400
 
     ns = app.config["NAMESPACE"]
+    rollback = {
+        "servicesDeleted": False,
+        "nodeportsReleased": False,
+        "podDeleteRequested": False,
+        "podDeleted": False,
+    }
 
     try:
         if not pod_name.startswith("ailab-"):
             app.logger.warning(f"[DELETE POD] invalid pod_name format: {pod_name}")
-            return jsonify({"error": "invalid pod_name"}), 400
+            return jsonify(infra_error(
+                "VALIDATE_REQUEST",
+                "INVALID_POD_NAME",
+                "invalid pod_name",
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 400
 
         rest = pod_name[len("ailab-"):]
         username = rest.rsplit("-", 1)[0]
 
         app.logger.info(f"[DELETE POD] parsed username={username}")
         app.logger.info("[DELETE POD] deleting NodePort services")
-        delete_nodeport_services(pod_name, ns)
+        try:
+            delete_nodeport_services(pod_name, ns)
+            rollback["servicesDeleted"] = True
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[DELETE POD] service deletion failed")
+            return jsonify(infra_error(
+                "DELETE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_DELETE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[DELETE POD] service deletion failed")
+            return jsonify(infra_error(
+                "DELETE_NODEPORT_SERVICE",
+                "NODEPORT_SERVICE_DELETE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
         app.logger.info("[DELETE POD] releasing NodePort allocations")
-        release_nodeports(pod_name)
+        try:
+            release_nodeports(pod_name)
+            rollback["nodeportsReleased"] = True
+        except Exception as e:
+            app.logger.exception("[DELETE POD] nodeport release failed")
+            return jsonify(infra_error(
+                "RELEASE_NODEPORT",
+                "NODEPORT_RELEASE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
 
         app.logger.info(f"[DELETE POD] deleting pod from namespace={ns}")
-        load_k8s()
-        v1 = client.CoreV1Api()
-        v1.delete_namespaced_pod(pod_name, ns)
+        try:
+            load_k8s()
+            v1 = client.CoreV1Api()
+        except Exception as e:
+            app.logger.exception("[DELETE POD] k8s client setup failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "K8S_CLIENT_SETUP_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        try:
+            v1.delete_namespaced_pod(pod_name, ns)
+            rollback["podDeleteRequested"] = True
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                rollback["podDeleted"] = True
+                app.logger.info("[DELETE POD] pod already absent: %s", pod_name)
+                return jsonify({
+                    "status": "deleted",
+                    "pod_name": pod_name,
+                    "already_absent": True,
+                    "progress": rollback,
+                }), 200
+            app.logger.exception("[DELETE POD] pod deletion failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[DELETE POD] pod deletion failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        app.logger.info("[DELETE POD] waiting for pod deletion to complete")
+        try:
+            deleted = wait_for_pod_deleted(v1, pod_name, ns, timeout_sec=60)
+        except client.exceptions.ApiException as e:
+            app.logger.exception("[DELETE POD] deletion polling failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                e.body,
+                rollback=rollback,
+                pod_name=pod_name,
+                **k8s_error_fields(e),
+            )), 500
+        except Exception as e:
+            app.logger.exception("[DELETE POD] deletion polling failed")
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_FAILED",
+                str(e),
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        if not deleted:
+            app.logger.warning("[DELETE POD] pod deletion timed out: %s", pod_name)
+            return jsonify(infra_error(
+                "DELETE_POD",
+                "POD_DELETE_TIMEOUT",
+                "pod deletion did not complete within timeout",
+                rollback=rollback,
+                pod_name=pod_name,
+            )), 500
+
+        rollback["podDeleted"] = True
         app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
 
-        return jsonify({"status": "deleted"})
+        return jsonify({
+            "status": "deleted",
+            "pod_name": pod_name,
+            "progress": rollback,
+        }), 200
 
     except Exception as e:
         app.logger.exception("[DELETE POD] deletion failed")
-        return jsonify({"error": str(e)}), 500
+        return jsonify(infra_error(
+            "DELETE_POD",
+            "DELETE_POD_FAILED",
+            str(e),
+            rollback=rollback,
+            pod_name=pod_name,
+        )), 500
 
 def _migrate_internal(data):
 
@@ -1252,334 +1540,6 @@ def migrate():
 
     with LockedFile(lock_path, "w"):
         return _migrate_internal(data)
-
-
-
-@app.route("/pvc", methods=["POST"])
-def create_or_resize_pvc():
-    """
-    PVC 생성 또는 용량 확장 API
-
-    ---
-    tags:
-    - Storage
-
-    summary: PVC 생성 또는 확장
-
-    parameters:
-
-      - in: body
-        name: body
-        schema:
-          type: object
-          properties:
-            pvcs:
-              type: array
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: alice
-                  type:
-                    type: string
-                    enum:
-                      - user
-                      - group
-                  storage:
-                    type: integer
-                    example: 50
-
-    responses:
-
-      200:
-        description: PVC 처리 결과
-      400:
-        description: 잘못된 요청
-      500:
-        description: 서버 오류
-    """
-    data = request.get_json(force=True)
-    pvcs = data.get("pvcs", [])
-    
-    # Legacy support for old format
-    if not pvcs and data.get("username") and data.get("storage"):
-        pvcs = [{
-            "name": data["username"],
-            "type": "user",
-            "storage": data["storage"]
-        }]
-    
-    if not pvcs:
-        return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
-
-    results = []
-    namespace = app.config["NAMESPACE"]
-
-    try:
-        try:
-            k8s_config.load_incluster_config()
-        except:
-            k8s_config.load_kube_config()
-
-        core_v1 = client.CoreV1Api()
-
-        for pvc_config in pvcs:
-            name = pvc_config.get("name")
-            pvc_type = pvc_config.get("type", "user")
-            storage_raw = pvc_config.get("storage")
-            custom_pvc_name = pvc_config.get("pvc_name")
-
-            app.logger.info(f"Processing PVC request: name={name}, type={pvc_type}, storage={storage_raw}")
-
-            if not name or not storage_raw:
-                app.logger.error(f"Missing required fields for {pvc_config}")
-                results.append({"error": f"name and storage required for {pvc_config}"})
-                continue
-
-            if pvc_type not in ["user", "group"]:
-                app.logger.error(f"Invalid PVC type '{pvc_type}' for {name}")
-                results.append({"error": f"type must be 'user' or 'group' for {name}"})
-                continue
-
-            storage = f"{storage_raw}Gi"
-
-            # PVC naming
-            if custom_pvc_name:
-                pvc_name = custom_pvc_name
-            elif pvc_type == "group":
-                pvc_name = f"pvc-{name}-group-share"
-            else:
-                pvc_name = f"pvc-{name}-share"
-
-            storage_class = (
-                app.config["GROUP_STORAGE_CLASS"]
-                if pvc_type == "group"
-                else app.config["USER_STORAGE_CLASS"]
-            )
-
-            app.logger.info(f"PVC name determined: {pvc_name}, storage_class: {storage_class}")
-
-            try:
-                # Check if PVC exists
-                app.logger.info(f"Checking if PVC {pvc_name} already exists...")
-                try:
-                    existing_pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-                    app.logger.info(f"PVC {pvc_name} already exists, performing resize operation")
-                    # Exists -> resize
-                    patch_body = {
-                        "spec": {
-                            "resources": {
-                                "requests": {
-                                    "storage": storage
-                                }
-                            }
-                        }
-                    }
-                    core_v1.patch_namespaced_persistent_volume_claim(
-                        name=pvc_name,
-                        namespace=namespace,
-                        body=patch_body
-                    )
-                    results.append({"status": "resized", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
-                except client.exceptions.ApiException as e:
-                    if e.status != 404:
-                        results.append({"error": f"Kubernetes API error for {name}: {e.body}"})
-                        continue
-
-                    # PVC doesn't exist → create
-                    pvc_body = client.V1PersistentVolumeClaim(
-                        metadata=client.V1ObjectMeta(
-                            name=pvc_name,
-                            annotations={"nfs.io/username": name, "nfs.io/type": pvc_type}
-                        ),
-                        spec=client.V1PersistentVolumeClaimSpec(
-                            access_modes=["ReadWriteMany"],
-                            resources=client.V1ResourceRequirements(
-                                requests={"storage": storage}
-                            ),
-                            storage_class_name=storage_class
-                        )
-                    )
-                    core_v1.create_namespaced_persistent_volume_claim(namespace, pvc_body)
-                    app.logger.info(f"Created PVC: {pvc_name}")
-
-                    # Wait for PVC to be bound and get the actual PV name
-                    import time
-                    max_wait = 30  # 30 seconds timeout
-                    wait_time = 0
-                    pv_name = None
-
-                    app.logger.info(f"Waiting for PVC {pvc_name} to be bound...")
-                    while wait_time < max_wait:
-                        try:
-                            pvc = core_v1.read_namespaced_persistent_volume_claim(pvc_name, namespace)
-                            app.logger.debug(f"PVC status: {pvc.status.phase}, volume_name: {pvc.spec.volume_name}")
-                            if pvc.status.phase == "Bound" and pvc.spec.volume_name:
-                                pv_name = pvc.spec.volume_name
-                                app.logger.info(f"PVC bound to PV: {pv_name}")
-                                break
-                        except Exception as e:
-                            app.logger.debug(f"Error checking PVC status: {e}")
-                        time.sleep(1)
-                        wait_time += 1
-
-                    # CSI creates user/<pvc> or group-volumes/<pvc>; align ownership on share mount (/kube_share).
-                    if pv_name:
-                        app.logger.info(f"PVC bound PV={pv_name}; setting ownership for {pvc_name}")
-                        create_directory_with_permissions(pvc_name, pvc_type, name)
-                    else:
-                        app.logger.warning(
-                            "PVC %s not bound within %ss; skipping chown (directory may not exist yet)",
-                            pvc_name,
-                            max_wait,
-                        )
-                    
-                    results.append({"status": "created", "name": name, "type": pvc_type, "pvc_name": pvc_name, "storage": storage})
-
-            except Exception as e:
-                results.append({"error": f"Failed to process {name}: {str(e)}"})
-
-        return jsonify({"results": results})
-
-    except Exception as e:
-        return jsonify({"results": [{"error": str(e)}]}), 500
-
-
-
-@app.route("/pvc", methods=["DELETE"])
-def delete_pvc():
-    """
-    PVC 및 연결된 디렉터리 삭제 API
-
-    - 표준 요청 형식:
-      {
-        "pvcs": [
-          {"name": "testuser", "type": "user"},
-          {"name": "developers", "type": "group"}
-        ]
-      }
-
-    - Legacy 요청 형식:
-      {
-        "username": "testuser",
-        "type": "user"
-      }
-
-    ---
-    tags:
-      - Storage
-    consumes:
-      - application/json
-    parameters:
-      - in: body
-        name: body
-        required: true
-        schema:
-          type: object
-          properties:
-            pvcs:
-              type: array
-              items:
-                type: object
-                properties:
-                  name:
-                    type: string
-                    example: testuser
-                  type:
-                    type: string
-                    example: user
-            username:
-              type: string
-              example: testuser
-            type:
-              type: string
-              example: user
-    responses:
-      200:
-        description: 삭제 결과
-      400:
-        description: 잘못된 요청
-      500:
-        description: 서버 오류
-    """
-    data = request.get_json(force=True)
-    pvcs = data.get("pvcs", [])
-    
-    # Legacy support for old format
-    if not pvcs and data.get("username"):
-        pvcs = [{
-            "name": data["username"],
-            "type": data.get("type", "user")
-        }]
-    
-    if not pvcs:
-        return jsonify({"results": [{"error": "pvcs list is required"}]}), 400
-
-    results = []
-    namespace = app.config["NAMESPACE"]
-
-    try:
-        try:
-            k8s_config.load_incluster_config()
-        except:
-            k8s_config.load_kube_config()
-
-        core_v1 = client.CoreV1Api()
-
-        for pvc_config in pvcs:
-            name = pvc_config.get("name")
-            pvc_type = pvc_config.get("type", "user")
-            custom_pvc_name = pvc_config.get("pvc_name")
-
-            if not name:
-                results.append({"error": f"name is required for {pvc_config}"})
-                continue
-
-            if pvc_type not in ["user", "group"]:
-                results.append({"error": f"type must be 'user' or 'group' for {name}"})
-                continue
-
-            # PVC naming (same logic as create)
-            if custom_pvc_name:
-                pvc_name = custom_pvc_name
-            elif pvc_type == "group":
-                pvc_name = f"pvc-{name}-group-share"
-            else:
-                pvc_name = f"pvc-{name}-share"
-
-            try:
-                # Delete PVC (this also deletes the PV automatically due to reclaim policy)
-                try:
-                    core_v1.delete_namespaced_persistent_volume_claim(
-                        name=pvc_name,
-                        namespace=namespace
-                    )
-                    app.logger.info(f"Deleted PVC: {pvc_name}")
-                except client.exceptions.ApiException as e:
-                    if e.status == 404:
-                        app.logger.warning(f"PVC {pvc_name} not found, skipping PVC deletion")
-                    else:
-                        results.append({"error": f"Failed to delete PVC {pvc_name}: {e.body}"})
-                        continue
-
-                delete_directory_if_exists(pvc_name, pvc_type)
-                
-                results.append({
-                    "status": "deleted", 
-                    "name": name, 
-                    "type": pvc_type, 
-                    "pvc_name": pvc_name
-                })
-
-            except Exception as e:
-                results.append({"error": f"Failed to delete {name}: {str(e)}"})
-
-        return jsonify({"results": results})
-
-    except Exception as e:
-        return jsonify({"results": [{"error": str(e)}]}), 500
-
 
 
 
@@ -1989,6 +1949,14 @@ def create_user():
             _rollback_user(name)
             return jsonify({"error": "failed to create sudoers file"}), 500
 
+    # 5) NAS SSH로 홈 디렉터리 생성
+    try:
+        create_user_home_directory(name, uid, gid)
+    except Exception:
+        app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
+        _rollback_user(name)
+        return jsonify(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}")), 500
+
     return jsonify({
         "status": "created",
         "user": entry,
@@ -2085,6 +2053,11 @@ def delete_user(username: str):
         g_new.append(format_group_entry(grec))
 
     write_group_lines(g_new)
+
+    try:
+        delete_user_home_directory(username)
+    except Exception:
+        app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
 
     return jsonify({"status": "deleted", "user": username})
 

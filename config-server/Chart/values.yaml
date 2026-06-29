@@ -17,12 +17,16 @@ resources:
     cpu: 200m
     memory: 256Mi
 
-env:
-  nfsAddress: "192.168.2.30"
-
 nfs:
   server: "192.168.2.30"
-  path: "/volume1/share"
+  userSharePath: "/volume1/share/user"
+
+nas:
+  ssh:
+    host: "192.168.2.30"
+    port: "6954"
+    user: "admin"
+    keyPath: "/etc/nas-ssh/id_rsa"
 
 security:
   sudoAllowedCommands: ""
