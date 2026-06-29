@@ -20,6 +20,7 @@ resources:
 nfs:
   server: "192.168.2.30"
   userSharePath: "/volume1/share/user"
+  kubeSharePath: "/volume1/share/kube_share"
 
 nas:
   ssh:
