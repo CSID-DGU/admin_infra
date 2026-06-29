@@ -581,9 +581,9 @@ def create_user_home_directory(username: str, uid: int, gid: int) -> None:
     path = f"{share_path}/{username}"
     app.logger.info(f"[NAS SSH] creating home dir {path} uid={uid} gid={gid}")
     with _nas_ssh_client() as ssh:
-        _ssh_run(ssh, f"mkdir -p {path}")
-        _ssh_run(ssh, f"chown {uid}:{gid} {path}")
-        _ssh_run(ssh, f"chmod 700 {path}")
+        _ssh_run(ssh, f"sudo mkdir -p {path}")
+        _ssh_run(ssh, f"sudo chown {uid}:{gid} {path}")
+        _ssh_run(ssh, f"sudo chmod 700 {path}")
 
 
 def delete_user_home_directory(username: str) -> None:
@@ -591,7 +591,7 @@ def delete_user_home_directory(username: str) -> None:
     path = f"{share_path}/{username}"
     app.logger.info(f"[NAS SSH] deleting home dir {path}")
     with _nas_ssh_client() as ssh:
-        _ssh_run(ssh, f"rm -rf {path}")
+        _ssh_run(ssh, f"sudo rm -rf {path}")
 
 
 def get_node_gpu_score(node: str, prom_url: str, timeout: float) -> float:
