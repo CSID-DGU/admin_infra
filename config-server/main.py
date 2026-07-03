@@ -16,6 +16,8 @@ load_dotenv()
 
 import base64
 import crypt
+import subprocess
+import tempfile
 
 from error import infra_error, k8s_error_fields
 
@@ -72,7 +74,10 @@ app.config.from_mapping({
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
     # Kerberos (비어있으면 비활성)
-    "KRB5_REALM": os.getenv("KRB5_REALM", ""),
+    "KRB5_REALM":           os.getenv("KRB5_REALM", ""),
+    "KRB5_KDC_HOST":        os.getenv("KRB5_KDC_HOST", ""),
+    "KRB5_ADMIN_PRINCIPAL": os.getenv("KRB5_ADMIN_PRINCIPAL", ""),
+    "KRB5_ADMIN_PASSWORD":  os.getenv("KRB5_ADMIN_PASSWORD", ""),
 
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -1020,6 +1025,18 @@ def build_pod_spec(
                 "name": "krb5-keytab",
                 "secret": {"secretName": f"krb5-keytab-{username}"},
             })
+            # rpc-gssd가 호스트에서 ccache를 읽을 수 있도록 Pod와 호스트가 /run/user/<uid> 공유
+            volume_mounts.append({
+                "name": "krb5-ccache",
+                "mountPath": f"/run/user/{uid}",
+            })
+            volumes.append({
+                "name": "krb5-ccache",
+                "hostPath": {
+                    "path": f"/run/user/{uid}",
+                    "type": "DirectoryOrCreate",
+                },
+            })
 
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
     
@@ -1563,6 +1580,61 @@ def migrate():
 
 
 
+# ---- Kerberos KDC helpers ----
+
+def _kadmin_run(cmd: str) -> None:
+    result = subprocess.run(
+        [
+            "kadmin",
+            "-p", app.config["KRB5_ADMIN_PRINCIPAL"],
+            "-w", app.config["KRB5_ADMIN_PASSWORD"],
+            "-s", app.config["KRB5_KDC_HOST"],
+            "-q", cmd,
+        ],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"kadmin 실패: {result.stderr.strip()}")
+
+def _create_krb5_principal_and_secret(username: str) -> None:
+    realm = app.config["KRB5_REALM"]
+    principal = f"{username}@{realm}"
+    _kadmin_run(f"addprinc -randkey {principal}")
+    with tempfile.NamedTemporaryFile(suffix=".keytab", delete=False) as f:
+        keytab_path = f.name
+    try:
+        _kadmin_run(f"ktadd -k {keytab_path} {principal}")
+        with open(keytab_path, "rb") as f:
+            keytab_bytes = f.read()
+    finally:
+        os.unlink(keytab_path)
+    v1 = client.CoreV1Api()
+    secret = client.V1Secret(
+        metadata=client.V1ObjectMeta(
+            name=f"krb5-keytab-{username}",
+            namespace=app.config["NAMESPACE"],
+        ),
+        data={"krb5.keytab": base64.b64encode(keytab_bytes).decode()},
+    )
+    v1.create_namespaced_secret(namespace=app.config["NAMESPACE"], body=secret)
+
+def _delete_krb5_principal_and_secret(username: str) -> None:
+    realm = app.config["KRB5_REALM"]
+    try:
+        _kadmin_run(f"delprinc -force {username}@{realm}")
+    except Exception as e:
+        app.logger.warning(f"[KRB5] principal 삭제 실패 (무시): {e}")
+    v1 = client.CoreV1Api()
+    try:
+        v1.delete_namespaced_secret(
+            name=f"krb5-keytab-{username}",
+            namespace=app.config["NAMESPACE"],
+        )
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+
 accounts_bp = Blueprint("accounts", __name__)
 
 # ---------- /etc/passwd CRUD ----------
@@ -1976,6 +2048,19 @@ def create_user():
         _rollback_user(name)
         return jsonify(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}")), 500
 
+    # 6) Kerberos principal 생성 + keytab k8s Secret 저장
+    if app.config.get("KRB5_REALM"):
+        try:
+            _create_krb5_principal_and_secret(name)
+        except Exception:
+            app.logger.exception("[ACCOUNTS] KRB5 principal creation failed for user=%s, rolling back", name)
+            try:
+                delete_user_home_directory(name)
+            except Exception:
+                pass
+            _rollback_user(name)
+            return jsonify(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}")), 500
+
     return jsonify({
         "status": "created",
         "user": entry,
@@ -2077,6 +2162,9 @@ def delete_user(username: str):
         delete_user_home_directory(username)
     except Exception:
         app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
+
+    if app.config.get("KRB5_REALM"):
+        _delete_krb5_principal_and_secret(username)
 
     return jsonify({"status": "deleted", "user": username})
 
