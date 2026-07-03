@@ -64,6 +64,18 @@ spec:
               value: "{{ .Values.redis.port }}"
             - name: KRB5_REALM
               value: "{{ .Values.krb5.realm }}"
+            - name: KRB5_KDC_HOST
+              value: "{{ .Values.krb5.kdcHost }}"
+            - name: KRB5_ADMIN_PRINCIPAL
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-krb5-secret
+                  key: principal
+            - name: KRB5_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-krb5-secret
+                  key: password
           readinessProbe:
             httpGet:
               path: /health
@@ -87,6 +99,10 @@ spec:
               mountPath: /image-store
             - name: kube-share
               mountPath: /kube_share
+            - name: krb5-conf
+              mountPath: /etc/krb5.conf
+              subPath: krb5.conf
+              readOnly: true
       volumes:
         - name: nas-ssh-key
           secret:
@@ -99,3 +115,6 @@ spec:
           nfs:
             server: "{{ .Values.nfs.server }}"
             path: "{{ .Values.nfs.kubeSharePath }}"
+        - name: krb5-conf
+          configMap:
+            name: krb5-conf
