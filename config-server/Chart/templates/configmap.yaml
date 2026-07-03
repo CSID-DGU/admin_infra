@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: krb5-conf
+  namespace: {{ .Values.namespace }}
+data:
+  krb5.conf: |
+    [libdefaults]
+        default_realm = {{ .Values.krb5.realm }}
+        dns_lookup_realm = false
+        dns_lookup_kdc = false
+
+    [realms]
+        {{ .Values.krb5.realm }} = {
+            kdc = {{ .Values.krb5.kdcHost }}
+            admin_server = {{ .Values.krb5.kdcHost }}
+        }
+
+    [domain_realm]
+        .ailab.dgu = {{ .Values.krb5.realm }}
+        ailab.dgu = {{ .Values.krb5.realm }}
