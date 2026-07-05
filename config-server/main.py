@@ -1804,7 +1804,7 @@ def get_user(username: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-def _allocate_next_uid(lines, min_uid: int = 10000) -> int:
+def _allocate_next_uid(lines, min_uid: int = 20000) -> int:
     """관리 유저(uid >= min_uid, home=/home/) 최댓값 + 1부터 시작해
     passwd 전체에서 사용 중이지 않은 uid를 반환한다.
     시스템 계정이 중간 번호를 점유해도 건너뛰므로 충돌이 없다."""
@@ -1821,7 +1821,7 @@ def _allocate_next_uid(lines, min_uid: int = 10000) -> int:
     return candidate
 
 
-def _allocate_next_gid(lines, min_gid: int = 10000) -> int:
+def _allocate_next_gid(lines, min_gid: int = 20000) -> int:
     """group 파일 기준으로 관리 그룹용 다음 GID를 반환한다."""
     reserved_gids = {65534}
     used_gids = {
