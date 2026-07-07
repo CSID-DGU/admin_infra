@@ -1625,12 +1625,19 @@ def _create_krb5_principal_and_secret(username: str) -> None:
     _kadmin_run(f"addprinc -randkey {principal}")
     with tempfile.NamedTemporaryFile(suffix=".keytab", delete=False) as f:
         keytab_path = f.name
+    # kadmin ktadd는 대상 경로가 이미 존재하는 0바이트 파일이면 keytab으로 열지 못해
+    # "Unsupported key table format" 로 실패한다(단 kadmin exit는 0이라 조용히 빈 keytab이 됨).
+    # 미리 지워 kadmin이 새 keytab을 생성하도록 한다.
+    os.unlink(keytab_path)
     try:
         _kadmin_run(f"ktadd -k {keytab_path} {principal}")
         with open(keytab_path, "rb") as f:
             keytab_bytes = f.read()
     finally:
-        os.unlink(keytab_path)
+        if os.path.exists(keytab_path):
+            os.unlink(keytab_path)
+    if not keytab_bytes:
+        raise RuntimeError(f"ktadd로 생성된 keytab이 비어 있음: {principal}")
     load_k8s()  # 계정 CRUD 경로는 load_k8s()를 안 거쳐 k8s 기본값 localhost:80으로 붙음 → in-cluster config 보장
     v1 = client.CoreV1Api()
     secret = client.V1Secret(
