@@ -16,6 +16,9 @@ load_dotenv()
 
 import base64
 import crypt
+import json
+import subprocess
+import tempfile
 
 from error import infra_error, k8s_error_fields
 
@@ -70,6 +73,17 @@ app.config.from_mapping({
     # NFS
     "NFS_SERVER":          os.getenv("NFS_SERVER", ""),
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
+
+    # Kerberos (비어있으면 비활성)
+    "KRB5_REALM":           os.getenv("KRB5_REALM", ""),
+    "KRB5_KDC_HOST":        os.getenv("KRB5_KDC_HOST", ""),
+    "KRB5_ADMIN_PRINCIPAL": os.getenv("KRB5_ADMIN_PRINCIPAL", ""),
+    "KRB5_ADMIN_PASSWORD":  os.getenv("KRB5_ADMIN_PASSWORD", ""),
+
+    # farm 노드 keytab/timer 자동 배포용 SSH (전용 서비스 계정)
+    "FARM_SSH_USER":     os.getenv("FARM_SSH_USER", ""),
+    "FARM_SSH_KEY_PATH": os.getenv("FARM_SSH_KEY_PATH", ""),
+    "FARM_NODES":        json.loads(os.getenv("FARM_NODES_JSON", "[]")),
 
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -927,8 +941,16 @@ def build_pod_spec(
     app.logger.debug(f"[POD SPEC] base ports={ports}")
 
     # WAS 추가 포트
-    ports.extend(user_info.get("additional_ports", []))
+    additional_ports = user_info.get("additional_ports", [])
+    ports.extend(additional_ports)
     app.logger.info(f"[POD SPEC] final ports={ports}")
+
+    # additional_ports에 novnc 포트가 포함돼 있으면 entrypoint.sh가 noVNC를 띄우도록 ENABLE_VNC 주입
+    enable_vnc = any(
+        p.get("usage_purpose") in ("novnc", "vnc") or p.get("internal_port") == 6080
+        for p in additional_ports
+    )
+    app.logger.info(f"[POD SPEC] enable_vnc={enable_vnc}")
     # 포트 할당
     allocated_ports = allocate_nodeports(
         username=username,
@@ -1006,6 +1028,24 @@ def build_pod_spec(
         volume_mounts.extend(gpu_volume_mounts)
         volumes.extend(gpu_volumes)
 
+        if app.config["KRB5_REALM"]:
+            # keytab은 컨테이너에 마운트하지 않는다 — farm 노드에만 배포하고 호스트가 갱신한 TGT만 공유한다.
+            # 이 배포가 실패하면 예외가 아래 except로 전달되어 nodeport 롤백 + Pod 미생성으로 처리된다.
+            _deploy_krb5_to_farm(username, uid, target_node)
+
+            # rpc-gssd가 호스트에서 ccache를 읽을 수 있도록 Pod와 호스트가 /run/user/<uid> 공유
+            volume_mounts.append({
+                "name": "krb5-ccache",
+                "mountPath": f"/run/user/{uid}",
+            })
+            volumes.append({
+                "name": "krb5-ccache",
+                "hostPath": {
+                    "path": f"/run/user/{uid}",
+                    "type": "DirectoryOrCreate",
+                },
+            })
+
         app.logger.debug(f"[POD SPEC] volume_mounts={len(volume_mounts)} volumes={len(volumes)}")
     
         spec = {
@@ -1054,7 +1094,12 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"},
-                                                    {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)}
+                                                    {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)},
+                                                    *([{"name": "ENABLE_VNC", "value": "true"}] if enable_vnc else []),
+                                                    *([
+                                                        {"name": "KRB5_REALM",          "value": app.config["KRB5_REALM"]},
+                                                        {"name": "DECS_KRB5_PRINCIPAL", "value": f"{username}@{app.config['KRB5_REALM']}"},
+                                                    ] if app.config["KRB5_REALM"] else []),
                                                 ],
                                                 "resources": {
                                                     "requests": {
@@ -1238,6 +1283,13 @@ def delete_pod():
                 pod_name=pod_name,
             )), 500
 
+        pod_node_name = None
+        if app.config.get("KRB5_REALM"):
+            try:
+                pod_node_name = v1.read_namespaced_pod(pod_name, ns).spec.node_name
+            except Exception:
+                app.logger.warning("[DELETE POD] pod node lookup failed, farm 정리 건너뜀: %s", pod_name, exc_info=True)
+
         try:
             v1.delete_namespaced_pod(pod_name, ns)
             rollback["podDeleteRequested"] = True
@@ -1305,6 +1357,12 @@ def delete_pod():
 
         rollback["podDeleted"] = True
         app.logger.info(f"[DELETE POD] pod deleted successfully: {pod_name}")
+
+        if app.config.get("KRB5_REALM") and pod_node_name:
+            try:
+                _remove_krb5_from_farm(username, pod_node_name)
+            except Exception as e:
+                app.logger.warning(f"[DELETE POD] farm 정리 실패 (무시): {username} ← {pod_node_name} — {e}")
 
         return jsonify({
             "status": "deleted",
@@ -1544,6 +1602,117 @@ def migrate():
 
 
 
+# ---- Kerberos KDC helpers ----
+
+def _kadmin_run(cmd: str) -> None:
+    result = subprocess.run(
+        [
+            "kadmin",
+            "-p", app.config["KRB5_ADMIN_PRINCIPAL"],
+            "-w", app.config["KRB5_ADMIN_PASSWORD"],
+            "-s", app.config["KRB5_KDC_HOST"],
+            "-q", cmd,
+        ],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"kadmin 실패: {result.stderr.strip()}")
+
+def _create_krb5_principal_and_secret(username: str) -> None:
+    realm = app.config["KRB5_REALM"]
+    principal = f"{username}@{realm}"
+    _kadmin_run(f"addprinc -randkey {principal}")
+    with tempfile.NamedTemporaryFile(suffix=".keytab", delete=False) as f:
+        keytab_path = f.name
+    try:
+        _kadmin_run(f"ktadd -k {keytab_path} {principal}")
+        with open(keytab_path, "rb") as f:
+            keytab_bytes = f.read()
+    finally:
+        os.unlink(keytab_path)
+    v1 = client.CoreV1Api()
+    secret = client.V1Secret(
+        metadata=client.V1ObjectMeta(
+            name=f"krb5-keytab-{username}",
+            namespace=app.config["NAMESPACE"],
+        ),
+        data={"krb5.keytab": base64.b64encode(keytab_bytes).decode()},
+    )
+    v1.create_namespaced_secret(namespace=app.config["NAMESPACE"], body=secret)
+
+def _delete_krb5_principal_and_secret(username: str) -> None:
+    realm = app.config["KRB5_REALM"]
+    try:
+        _kadmin_run(f"delprinc -force {username}@{realm}")
+    except Exception as e:
+        app.logger.warning(f"[KRB5] principal 삭제 실패 (무시): {e}")
+    v1 = client.CoreV1Api()
+    try:
+        v1.delete_namespaced_secret(
+            name=f"krb5-keytab-{username}",
+            namespace=app.config["NAMESPACE"],
+        )
+    except client.exceptions.ApiException as e:
+        if e.status != 404:
+            raise
+
+
+def _get_farm_node_info(node_name: str) -> dict:
+    for node in app.config["FARM_NODES"]:
+        if node["name"] == node_name:
+            return node
+    raise ValueError(f"unknown farm node: {node_name!r}")
+
+
+def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -> str:
+    """전용 서비스 계정으로 접속한다. 계정 쪽에 forced-command가 걸려 있어
+    remote_command는 그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다."""
+    result = subprocess.run(
+        ["ssh",
+         "-i", app.config["FARM_SSH_KEY_PATH"],
+         "-o", "StrictHostKeyChecking=no",
+         "-o", "BatchMode=yes",
+         "-p", str(port),
+         f"{app.config['FARM_SSH_USER']}@{host}",
+         remote_command],
+        input=stdin_data,
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"farm SSH 실패 ({host}:{port}): {result.stderr.strip()}")
+    return result.stdout
+
+
+def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
+    """k8s Secret에서 keytab을 꺼내 원격 관리 스크립트의 deploy 액션으로 전달한다.
+    keytab/env 작성, timer 기동, TGT 발급 확인까지 전부 원격에서 끝난다."""
+    node = _get_farm_node_info(node_name)
+
+    v1 = client.CoreV1Api()
+    secret = v1.read_namespaced_secret(
+        name=f"krb5-keytab-{username}",
+        namespace=app.config["NAMESPACE"],
+    )
+    keytab_b64 = secret.data["krb5.keytab"]
+
+    _farm_ssh(node["host"], node["port"], f"deploy {username} {uid}", stdin_data=keytab_b64)
+    app.logger.info(f"[KRB5] farm 배포 완료 + TGT 확인됨: {username} → {node_name}")
+
+
+def _remove_krb5_from_farm(username: str, node_name: str) -> None:
+    node = _get_farm_node_info(node_name)
+    _farm_ssh(node["host"], node["port"], f"remove {username}")
+    app.logger.info(f"[KRB5] farm 정리 완료: {username} ← {node_name}")
+
+
+def _remove_krb5_from_all_farms(username: str) -> None:
+    for node in app.config["FARM_NODES"]:
+        try:
+            _remove_krb5_from_farm(username, node["name"])
+        except Exception as e:
+            app.logger.warning(f"[KRB5] farm 정리 실패 (무시): {node['name']} — {e}")
+
+
 accounts_bp = Blueprint("accounts", __name__)
 
 # ---------- /etc/passwd CRUD ----------
@@ -1713,7 +1882,7 @@ def get_user(username: str):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-def _allocate_next_uid(lines, min_uid: int = 10000) -> int:
+def _allocate_next_uid(lines, min_uid: int = 20000) -> int:
     """관리 유저(uid >= min_uid, home=/home/) 최댓값 + 1부터 시작해
     passwd 전체에서 사용 중이지 않은 uid를 반환한다.
     시스템 계정이 중간 번호를 점유해도 건너뛰므로 충돌이 없다."""
@@ -1730,7 +1899,7 @@ def _allocate_next_uid(lines, min_uid: int = 10000) -> int:
     return candidate
 
 
-def _allocate_next_gid(lines, min_gid: int = 10000) -> int:
+def _allocate_next_gid(lines, min_gid: int = 20000) -> int:
     """group 파일 기준으로 관리 그룹용 다음 GID를 반환한다."""
     reserved_gids = {65534}
     used_gids = {
@@ -1957,6 +2126,19 @@ def create_user():
         _rollback_user(name)
         return jsonify(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}")), 500
 
+    # 6) Kerberos principal 생성 + keytab k8s Secret 저장
+    if app.config.get("KRB5_REALM"):
+        try:
+            _create_krb5_principal_and_secret(name)
+        except Exception:
+            app.logger.exception("[ACCOUNTS] KRB5 principal creation failed for user=%s, rolling back", name)
+            try:
+                delete_user_home_directory(name)
+            except Exception:
+                pass
+            _rollback_user(name)
+            return jsonify(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}")), 500
+
     return jsonify({
         "status": "created",
         "user": entry,
@@ -2058,6 +2240,10 @@ def delete_user(username: str):
         delete_user_home_directory(username)
     except Exception:
         app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
+
+    if app.config.get("KRB5_REALM"):
+        _delete_krb5_principal_and_secret(username)
+        _remove_krb5_from_all_farms(username)
 
     return jsonify({"status": "deleted", "user": username})
 

@@ -18,18 +18,29 @@ resources:
     memory: 256Mi
 
 nfs:
-  server: "192.168.2.30"
-  userSharePath: "/volume1/share/user"
+  server: ""
+  userSharePath: ""
+  kubeSharePath: ""
 
 nas:
   ssh:
-    host: "192.168.2.30"
-    port: "6954"
-    user: "admin"
-    keyPath: "/etc/nas-ssh/id_rsa"
+    host: ""
+    port: ""
+    user: ""
+    keyPath: ""
+
+farm:
+  ssh:
+    user: ""
+    keyPath: ""
+    nodes: []
 
 security:
   sudoAllowedCommands: ""
+
+krb5:
+  realm: ""
+  kdcHost: ""
 
 
 config:
@@ -40,6 +51,11 @@ namespace: ailab-infra
 
 cleanup:
   image: config-server:latest
+
+db:
+  host: "infra-mysql"
+  name: "pod_port_db"
+  user: "pod_port_user"
 
 redis:
   host: redis-bg-master.ailab-infra.svc.cluster.local
