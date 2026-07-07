@@ -1006,9 +1006,11 @@ def build_pod_spec(
                 })
 
         # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
+        # image-store PVC(pvc-image-store)는 제거 — 해당 PV의 NFS subdir가
+        # 미치환 템플릿(user-share/${pvc.annotations.nfs.io/username})이라 모든 유저 파드가
+        # mount access denied로 Ready 실패. MVP는 image-store 불필요.
         volume_mounts = [
             {"name": "nfs-home",    "mountPath": "/home",        "readOnly": False},
-            {"name": "image-store", "mountPath": "/image-store", "readOnly": False},
         ]
         volumes = [
             {
@@ -1018,10 +1020,6 @@ def build_pod_spec(
                     "path":     app.config["NFS_USER_SHARE_PATH"],
                     "readOnly": False,
                 }
-            },
-            {
-                "name": "image-store",
-                "persistentVolumeClaim": {"claimName": "pvc-image-store"}
             },
         ]
 
