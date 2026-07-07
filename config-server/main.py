@@ -1130,8 +1130,9 @@ def build_pod_spec(
         return spec, allocated_ports
     except Exception as e:
         app.logger.warning(
-            "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s",
-            pod_name,
+            "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s — %s",
+            pod_name, e,
+            exc_info=True,
         )
         rollback = {"nodeportsReleased": False}
         try:
