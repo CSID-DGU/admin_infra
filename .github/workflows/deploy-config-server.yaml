@@ -71,6 +71,18 @@ jobs:
             --set image.repository=${{ secrets.DOCKER_USERNAME }}/config-server \
             --set image.tag=$IMAGE_TAG \
             --set image.pullPolicy=Always \
+            --set nfs.server=${{ secrets.NFS_SERVER }} \
+            --set nfs.userSharePath=${{ secrets.NFS_USER_SHARE_PATH }} \
+            --set nfs.kubeSharePath=${{ secrets.NFS_KUBE_SHARE_PATH }} \
+            --set nas.ssh.host=${{ secrets.NAS_SSH_HOST }} \
+            --set nas.ssh.port=${{ secrets.NAS_SSH_PORT }} \
+            --set nas.ssh.user=${{ secrets.NAS_SSH_USER }} \
+            --set nas.ssh.keyPath=${{ secrets.NAS_SSH_KEY_PATH }} \
+            --set krb5.realm=${{ secrets.KRB5_REALM }} \
+            --set krb5.kdcHost=${{ secrets.KRB5_KDC_HOST }} \
+            --set farm.ssh.user=${{ secrets.FARM_SSH_USER }} \
+            --set farm.ssh.keyPath=${{ secrets.FARM_SSH_KEY_PATH }} \
+            --set-json farm.ssh.nodes='${{ secrets.FARM_NODES_JSON }}' \
             --force-conflicts
           
           echo "=== Deployment Finished ==="

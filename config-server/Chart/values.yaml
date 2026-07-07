@@ -18,16 +18,22 @@ resources:
     memory: 256Mi
 
 nfs:
-  server: "nas.ailab.dgu"
-  userSharePath: "/volume1/share/user"
-  kubeSharePath: "/volume1/share/kube_share"
+  server: ""
+  userSharePath: ""
+  kubeSharePath: ""
 
 nas:
   ssh:
-    host: "192.168.2.30"
-    port: "6954"
-    user: "admin"
-    keyPath: "/etc/nas-ssh/id_rsa"
+    host: ""
+    port: ""
+    user: ""
+    keyPath: ""
+
+farm:
+  ssh:
+    user: ""
+    keyPath: ""
+    nodes: []
 
 security:
   sudoAllowedCommands: ""
