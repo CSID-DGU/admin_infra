@@ -5,6 +5,7 @@ COPY . .
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     krb5-user \
+    openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir -r requirements.txt
