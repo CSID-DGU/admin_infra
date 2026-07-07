@@ -1630,6 +1630,7 @@ def _create_krb5_principal_and_secret(username: str) -> None:
             keytab_bytes = f.read()
     finally:
         os.unlink(keytab_path)
+    load_k8s()  # 계정 CRUD 경로는 load_k8s()를 안 거쳐 k8s 기본값 localhost:80으로 붙음 → in-cluster config 보장
     v1 = client.CoreV1Api()
     secret = client.V1Secret(
         metadata=client.V1ObjectMeta(
@@ -1646,6 +1647,7 @@ def _delete_krb5_principal_and_secret(username: str) -> None:
         _kadmin_run(f"delprinc -force {username}@{realm}")
     except Exception as e:
         app.logger.warning(f"[KRB5] principal 삭제 실패 (무시): {e}")
+    load_k8s()  # 계정 CRUD 경로 in-cluster config 보장 (create와 동일 구멍)
     v1 = client.CoreV1Api()
     try:
         v1.delete_namespaced_secret(
