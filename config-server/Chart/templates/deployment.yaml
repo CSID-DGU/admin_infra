@@ -47,12 +47,49 @@ spec:
               value: "{{ .Values.security.sudoAllowedCommands }}"
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
+            - name: DB_HOST
+              value: "{{ .Values.db.host }}"
+            - name: DB_NAME
+              value: "{{ .Values.db.name }}"
+            - name: DB_USER
+              value: "{{ .Values.db.user }}"
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-db-secret
+                  key: password
+            - name: REDIS_HOST
+              value: "{{ .Values.redis.host }}"
+            - name: REDIS_PORT
+              value: "{{ .Values.redis.port }}"
+            - name: KRB5_REALM
+              value: "{{ .Values.krb5.realm }}"
+            - name: KRB5_KDC_HOST
+              value: "{{ .Values.krb5.kdcHost }}"
+            - name: KRB5_ADMIN_PRINCIPAL
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-krb5-secret
+                  key: principal
+            - name: KRB5_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: config-server-krb5-secret
+                  key: password
+            - name: FARM_SSH_USER
+              value: "{{ .Values.farm.ssh.user }}"
+            - name: FARM_SSH_KEY_PATH
+              value: "{{ .Values.farm.ssh.keyPath }}"
+            - name: FARM_NODES_JSON
+              value: '{{ .Values.farm.ssh.nodes | toJson }}'
           readinessProbe:
             httpGet:
               path: /health
               port: 8000
-            initialDelaySeconds: 10
-            periodSeconds: 5
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             requests:
               cpu: {{ .Values.resources.requests.cpu }}
@@ -66,11 +103,31 @@ spec:
               readOnly: true
             - name: image-store
               mountPath: /image-store
+            - name: kube-share
+              mountPath: /kube_share
+            - name: krb5-conf
+              mountPath: /etc/krb5.conf
+              subPath: krb5.conf
+              readOnly: true
+            - name: farm-ssh-key
+              mountPath: /etc/farm-ssh
+              readOnly: true
       volumes:
         - name: nas-ssh-key
           secret:
             secretName: nas-ssh-key
             defaultMode: 0400
+        - name: farm-ssh-key
+          secret:
+            secretName: farm-ssh-key
+            defaultMode: 0400
         - name: image-store
           persistentVolumeClaim:
             claimName: pvc-image-store
+        - name: kube-share
+          nfs:
+            server: "{{ .Values.nfs.server }}"
+            path: "{{ .Values.nfs.kubeSharePath }}"
+        - name: krb5-conf
+          configMap:
+            name: krb5-conf
