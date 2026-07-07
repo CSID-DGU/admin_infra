@@ -12,6 +12,10 @@ rules:
 - apiGroups: [""]
   resources: ["persistentvolumeclaims"]
   verbs: ["get", "list", "create", "delete", "patch", "update"]
+# krb5 keytab Secret(krb5-keytab-<user>) 생성/조회/삭제 — #82 KRB5 계정 연동
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
