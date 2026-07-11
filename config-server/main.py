@@ -1390,7 +1390,8 @@ def delete_pod():
             try:
                 _remove_krb5_from_farm(username, pod_node_name)
             except Exception as e:
-                app.logger.warning(f"[DELETE POD] farm 정리 실패 (무시): {username} ← {pod_node_name} — {e}")
+                app.logger.warning(f"[DELETE POD] farm 정리 실패, 재조정 잡에 위임: {username} ← {pod_node_name} — {e}")
+                _record_krb5_cleanup_pending(username, pod_node_name)
 
         return jsonify({
             "status": "deleted",
@@ -1742,12 +1743,34 @@ def _remove_krb5_from_farm(username: str, node_name: str) -> None:
     app.logger.info(f"[KRB5] farm 정리 완료: {username} ← {node_name}")
 
 
+def _record_krb5_cleanup_pending(username: str, node_name: str) -> None:
+    """farm 노드에서 keytab/timer 정리가 실패했을 때 재조정 잡이 나중에 재시도할 수 있도록 기록한다."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO krb5_cleanup_pending (username, node_name, failed_at)
+                VALUES (%s, %s, NOW())
+                ON DUPLICATE KEY UPDATE failed_at = NOW()
+                """,
+                (username, node_name),
+            )
+        conn.commit()
+    except Exception:
+        app.logger.exception(f"[KRB5] cleanup_pending 기록 실패: {username} ← {node_name}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 def _remove_krb5_from_all_farms(username: str) -> None:
     for node in app.config["FARM_NODES"]:
         try:
             _remove_krb5_from_farm(username, node["name"])
         except Exception as e:
-            app.logger.warning(f"[KRB5] farm 정리 실패 (무시): {node['name']} — {e}")
+            app.logger.warning(f"[KRB5] farm 정리 실패, 재조정 잡에 위임: {node['name']} — {e}")
+            _record_krb5_cleanup_pending(username, node["name"])
 
 
 accounts_bp = Blueprint("accounts", __name__)
