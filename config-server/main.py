@@ -23,7 +23,7 @@ import tempfile
 from error import infra_error, k8s_error_fields
 
 from utils import (
-    get_db_connection, is_pod_ready, get_existing_pod, generate_pod_name, delete_pod_util,
+    get_db_connection, is_pod_ready, get_pod_failure_reason, get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
@@ -63,6 +63,7 @@ app.config.from_mapping({
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
     "WAS_URL_TEMPLATE": "http://admin-prod.default/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
+    "POD_READY_MAX_WAIT_SEC": 600,
 
     # Default resources
     "DEFAULT_CPU_REQUEST": "1000m",
@@ -731,20 +732,28 @@ def create_pod():
 
         app.logger.info("[CREATE POD] waiting for pod to become Ready")
         try:
-            for i in range(60):
+            failure_reason = None
+            max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
+            for i in range(max_wait):
                 pod = v1.read_namespaced_pod(pod_name, ns)
                 if is_pod_ready(pod):
                     app.logger.info(f"[CREATE POD] pod ready after {i+1} seconds")
                     break
+                failure_reason = get_pod_failure_reason(pod)
+                if failure_reason:
+                    app.logger.error(f"[CREATE POD] pod failed to start: {failure_reason}")
+                    break
                 time.sleep(1)
             else:
-                app.logger.error("[CREATE POD] pod failed to become ready")
+                failure_reason = failure_reason or f"pod not ready within {max_wait}s"
+
+            if failure_reason:
                 app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
                 rollback = cleanup_create_failure(pod_name, v1)
                 return jsonify(infra_error(
                     "WAIT_POD_READY",
                     "POD_READY_TIMEOUT",
-                    "pod failed to start",
+                    failure_reason,
                     rollback=rollback,
                     pod_name=pod_name,
                 )), 500

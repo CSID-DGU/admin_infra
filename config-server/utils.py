@@ -81,6 +81,23 @@ def is_pod_ready(pod):
     return False
 
 
+# 이미지 pull 진행 중(ContainerCreating 등)과 실제 실패(ImagePullBackOff 등)를 구분하기 위한 상태 목록
+POD_FAILURE_WAITING_REASONS = {
+    "ImagePullBackOff", "ErrImagePull", "ErrImageNeverPull", "InvalidImageName",
+    "CrashLoopBackOff", "CreateContainerConfigError", "CreateContainerError", "RunContainerError",
+}
+
+
+def get_pod_failure_reason(pod):
+    if pod.status.phase == "Failed":
+        return pod.status.reason or "PodFailed"
+    for cs in (pod.status.container_statuses or []):
+        waiting = cs.state.waiting
+        if waiting and waiting.reason in POD_FAILURE_WAITING_REASONS:
+            return f"{waiting.reason}: {waiting.message}"
+    return None
+
+
 # 기존 Pod가 있는지 확인 -> username당 Pod 1개만 유지
 def get_existing_pod(namespace, username):
     app.logger.info(f"[POD CHECK] searching existing pod for user={username}")
