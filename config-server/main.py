@@ -63,7 +63,7 @@ app.config.from_mapping({
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
     "WAS_URL_TEMPLATE": "http://admin-prod.default/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
-    "POD_READY_MAX_WAIT_SEC": 600,
+    "POD_READY_MAX_WAIT_SEC": 300,
 
     # Default resources
     "DEFAULT_CPU_REQUEST": "1000m",
