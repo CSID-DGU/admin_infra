@@ -638,7 +638,7 @@ def create_pod():
             )
         except Exception as e:
             app.logger.exception("[CREATE POD] node selection failed")
-            set_pod_creation_status(username, "failed", f"노드 선택 실패: {e}")
+            set_pod_creation_status(username, "failed", "노드 선택 실패")
             return jsonify(infra_error(
                 "SELECT_NODE",
                 "NODE_SELECTION_FAILED",
@@ -663,7 +663,7 @@ def create_pod():
                 pod_name
             )
         except PodSpecBuildError as e:
-            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod spec 생성 실패")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -672,7 +672,7 @@ def create_pod():
                 pod_name=pod_name,
             )), 500
         except ValueError as e:
-            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod spec 생성 실패")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -682,7 +682,7 @@ def create_pod():
             )), 400
         except Exception as e:
             app.logger.exception("[CREATE POD] pod spec build failed")
-            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod spec 생성 실패")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -718,7 +718,7 @@ def create_pod():
             )
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] pod creation failed")
-            set_pod_creation_status(username, "failed", f"pod 생성 실패: {e.body}")
+            set_pod_creation_status(username, "failed", "pod 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "CREATE_POD",
@@ -730,7 +730,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] pod creation failed")
-            set_pod_creation_status(username, "failed", f"pod 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "CREATE_POD",
@@ -762,7 +762,7 @@ def create_pod():
 
             if failure_reason:
                 app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
-                set_pod_creation_status(username, "failed", failure_reason)
+                set_pod_creation_status(username, "failed", failure_reason.split(":", 1)[0])
                 rollback = cleanup_create_failure(pod_name, v1)
                 return jsonify(infra_error(
                     "WAIT_POD_READY",
@@ -773,7 +773,7 @@ def create_pod():
                 )), 500
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] pod ready check failed")
-            set_pod_creation_status(username, "failed", f"pod ready 확인 실패: {e.body}")
+            set_pod_creation_status(username, "failed", "pod ready 확인 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "WAIT_POD_READY",
@@ -785,7 +785,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] pod ready check failed")
-            set_pod_creation_status(username, "failed", f"pod ready 확인 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod ready 확인 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "WAIT_POD_READY",
@@ -801,7 +801,7 @@ def create_pod():
             create_nodeport_services(username, ns, pod_name, allocated_ports)
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] service creation failed")
-            set_pod_creation_status(username, "failed", f"서비스 생성 실패: {e.body}")
+            set_pod_creation_status(username, "failed", "서비스 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
             return jsonify(infra_error(
                 "CREATE_NODEPORT_SERVICE",
@@ -813,7 +813,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] service creation failed")
-            set_pod_creation_status(username, "failed", f"서비스 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "서비스 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
             return jsonify(infra_error(
                 "CREATE_NODEPORT_SERVICE",
@@ -838,7 +838,7 @@ def create_pod():
     except Exception as e:
         app.logger.exception("[CREATE POD] unexpected error")
         if username:
-            set_pod_creation_status(username, "failed", f"예기치 않은 오류: {e}")
+            set_pod_creation_status(username, "failed", "예기치 않은 오류")
         return jsonify(infra_error(
             "CREATE_POD",
             "CREATE_POD_FAILED",
