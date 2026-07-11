@@ -10,5 +10,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-CMD ["gunicorn", "--workers=2", "--bind=0.0.0.0:8000", "--timeout", "120", "main:app"]
+CMD ["gunicorn", "--workers=4", "--bind=0.0.0.0:8000", "--timeout", "700", "main:app"]
 
