@@ -854,6 +854,19 @@ def get_pod_status(username):
     /create-pod는 이미지 pull 등으로 오래(최대 POD_READY_MAX_WAIT_SEC초) 걸릴 수 있는
     동기 API라서, 그 요청이 끝나기 전에 별도로 진행 상황만 가볍게 조회하기 위한 엔드포인트.
 
+    stage는 다음 순서로 진행되며, 최종 상태는 ready 또는 failed다:
+      - unknown            : 생성 이력 없음 (한 번도 /create-pod를 호출한 적 없음)
+      - started             : 요청 접수
+      - selecting_node      : GPU 노드 선택 중 (Prometheus 스코어링)
+      - building_pod_spec   : pod spec 생성 시작 (바로 아래 두 단계로 넘어가는 과도 상태)
+      - allocating_nodeport : NodePort 할당 중
+      - deploying_krb5      : farm 노드에 krb5 keytab 배포 중 (KRB5_REALM 설정 시에만 거침)
+      - creating_pod        : k8s에 pod 생성 요청 중
+      - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계)
+      - creating_services   : NodePort Service 생성 중
+      - ready               : 생성 완료 (성공, 최종 상태)
+      - failed              : 실패 (message 필드에 원인 포함, 최종 상태)
+
     ---
     tags:
     - Pod
@@ -868,7 +881,31 @@ def get_pod_status(username):
 
     responses:
       200:
-        description: 진행 상황 조회 성공 (아직 시작 안 했으면 stage=unknown)
+        description: 진행 상황 조회 성공
+        schema:
+          type: object
+          properties:
+            username:
+              type: string
+            stage:
+              type: string
+              enum:
+                - unknown
+                - started
+                - selecting_node
+                - building_pod_spec
+                - allocating_nodeport
+                - deploying_krb5
+                - creating_pod
+                - waiting_ready
+                - creating_services
+                - ready
+                - failed
+            message:
+              type: string
+            updated_at:
+              type: string
+              description: ISO8601 UTC (unknown일 때는 없음)
       500:
         description: 서버 내부 오류
     """
