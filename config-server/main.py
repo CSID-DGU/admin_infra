@@ -865,7 +865,8 @@ def get_pod_status(username):
       - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계)
       - creating_services   : NodePort Service 생성 중
       - ready               : 생성 완료 (성공, 최종 상태)
-      - failed              : 실패 (message 필드에 원인 포함, 최종 상태)
+      - failed              : 실패 (최종 상태. message에는 "krb5 배포 실패" 같은 카테고리만 담기며,
+                                    보안상 상세 예외/k8s 에러 원문은 노출하지 않는다 — 상세 원인은 서버 로그 참조)
 
     ---
     tags:
@@ -903,6 +904,7 @@ def get_pod_status(username):
                 - failed
             message:
               type: string
+              description: 사람이 읽는 짧은 요약. failed 상태여도 상세 예외/에러 원문은 담지 않음
             updated_at:
               type: string
               description: ISO8601 UTC (unknown일 때는 없음)
