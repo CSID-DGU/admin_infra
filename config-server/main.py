@@ -71,7 +71,6 @@ app.config.from_mapping({
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
     # NFS
-    "NFS_SERVER":          os.getenv("NFS_SERVER", ""),
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
     # Kerberos (비어있으면 비활성)
@@ -1044,11 +1043,7 @@ def build_pod_spec(
         volumes = [
             {
                 "name": "nfs-home",
-                "nfs": {
-                    "server":   app.config["NFS_SERVER"],
-                    "path":     app.config["NFS_USER_SHARE_PATH"],
-                    "readOnly": False,
-                }
+                "hostPath": {"path": "/mnt/ailab-share", "type": "Directory"},
             },
         ]
 
