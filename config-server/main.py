@@ -1096,7 +1096,7 @@ def build_pod_spec(
                                             {
                                                 "name": "shell",
                                                 "image": image,
-                                                "imagePullPolicy": "Never",
+                                                "imagePullPolicy": "IfNotPresent",
                                                 "stdin": True,
                                                 "tty": True,
                                                 "ports": [
