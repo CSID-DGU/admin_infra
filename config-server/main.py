@@ -638,7 +638,7 @@ def create_pod():
             )
         except Exception as e:
             app.logger.exception("[CREATE POD] node selection failed")
-            set_pod_creation_status(username, "failed", f"노드 선택 실패: {e}")
+            set_pod_creation_status(username, "failed", "노드 선택 실패")
             return jsonify(infra_error(
                 "SELECT_NODE",
                 "NODE_SELECTION_FAILED",
@@ -663,7 +663,7 @@ def create_pod():
                 pod_name
             )
         except PodSpecBuildError as e:
-            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod spec 생성 실패")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -672,7 +672,7 @@ def create_pod():
                 pod_name=pod_name,
             )), 500
         except ValueError as e:
-            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod spec 생성 실패")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -682,7 +682,7 @@ def create_pod():
             )), 400
         except Exception as e:
             app.logger.exception("[CREATE POD] pod spec build failed")
-            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod spec 생성 실패")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -718,7 +718,7 @@ def create_pod():
             )
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] pod creation failed")
-            set_pod_creation_status(username, "failed", f"pod 생성 실패: {e.body}")
+            set_pod_creation_status(username, "failed", "pod 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "CREATE_POD",
@@ -730,7 +730,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] pod creation failed")
-            set_pod_creation_status(username, "failed", f"pod 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "CREATE_POD",
@@ -762,7 +762,7 @@ def create_pod():
 
             if failure_reason:
                 app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
-                set_pod_creation_status(username, "failed", failure_reason)
+                set_pod_creation_status(username, "failed", failure_reason.split(":", 1)[0])
                 rollback = cleanup_create_failure(pod_name, v1)
                 return jsonify(infra_error(
                     "WAIT_POD_READY",
@@ -773,7 +773,7 @@ def create_pod():
                 )), 500
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] pod ready check failed")
-            set_pod_creation_status(username, "failed", f"pod ready 확인 실패: {e.body}")
+            set_pod_creation_status(username, "failed", "pod ready 확인 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "WAIT_POD_READY",
@@ -785,7 +785,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] pod ready check failed")
-            set_pod_creation_status(username, "failed", f"pod ready 확인 실패: {e}")
+            set_pod_creation_status(username, "failed", "pod ready 확인 실패")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "WAIT_POD_READY",
@@ -801,7 +801,7 @@ def create_pod():
             create_nodeport_services(username, ns, pod_name, allocated_ports)
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] service creation failed")
-            set_pod_creation_status(username, "failed", f"서비스 생성 실패: {e.body}")
+            set_pod_creation_status(username, "failed", "서비스 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
             return jsonify(infra_error(
                 "CREATE_NODEPORT_SERVICE",
@@ -813,7 +813,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] service creation failed")
-            set_pod_creation_status(username, "failed", f"서비스 생성 실패: {e}")
+            set_pod_creation_status(username, "failed", "서비스 생성 실패")
             rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
             return jsonify(infra_error(
                 "CREATE_NODEPORT_SERVICE",
@@ -838,7 +838,7 @@ def create_pod():
     except Exception as e:
         app.logger.exception("[CREATE POD] unexpected error")
         if username:
-            set_pod_creation_status(username, "failed", f"예기치 않은 오류: {e}")
+            set_pod_creation_status(username, "failed", "예기치 않은 오류")
         return jsonify(infra_error(
             "CREATE_POD",
             "CREATE_POD_FAILED",
@@ -865,7 +865,8 @@ def get_pod_status(username):
       - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계)
       - creating_services   : NodePort Service 생성 중
       - ready               : 생성 완료 (성공, 최종 상태)
-      - failed              : 실패 (message 필드에 원인 포함, 최종 상태)
+      - failed              : 실패 (최종 상태. message에는 "krb5 배포 실패" 같은 카테고리만 담기며,
+                                    보안상 상세 예외/k8s 에러 원문은 노출하지 않는다 — 상세 원인은 서버 로그 참조)
 
     ---
     tags:
@@ -903,6 +904,7 @@ def get_pod_status(username):
                 - failed
             message:
               type: string
+              description: 사람이 읽는 짧은 요약. failed 상태여도 상세 예외/에러 원문은 담지 않음
             updated_at:
               type: string
               description: ISO8601 UTC (unknown일 때는 없음)
