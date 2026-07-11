@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 
 from error import infra_error, k8s_error_fields
+from pod_status import set_pod_creation_status, get_pod_creation_status
 
 from utils import (
     get_db_connection, is_pod_ready, get_pod_failure_reason, get_existing_pod, generate_pod_name, delete_pod_util,
@@ -451,6 +452,8 @@ def create_pod():
     username = data.get("username")
 
     app.logger.info(f"[CREATE POD] request received - username={username}")
+    if username:
+        set_pod_creation_status(username, "started", "요청 접수")
 
     if not username:
         app.logger.warning("[CREATE POD] username missing in request")
@@ -625,6 +628,7 @@ def create_pod():
             ]
 
         app.logger.info(f"[CREATE POD] candidate nodes: {node_list}")
+        set_pod_creation_status(username, "selecting_node", "GPU 노드 선택 중")
 
         try:
             best_node = select_best_node_from_prometheus(
@@ -634,6 +638,7 @@ def create_pod():
             )
         except Exception as e:
             app.logger.exception("[CREATE POD] node selection failed")
+            set_pod_creation_status(username, "failed", f"노드 선택 실패: {e}")
             return jsonify(infra_error(
                 "SELECT_NODE",
                 "NODE_SELECTION_FAILED",
@@ -644,6 +649,7 @@ def create_pod():
 
         # Pod spec 생성
         app.logger.info("[CREATE POD] building pod spec")
+        set_pod_creation_status(username, "building_pod_spec", f"pod spec 생성 중 (node={best_node})")
 
         try:
             if not best_node:
@@ -657,6 +663,7 @@ def create_pod():
                 pod_name
             )
         except PodSpecBuildError as e:
+            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -665,6 +672,7 @@ def create_pod():
                 pod_name=pod_name,
             )), 500
         except ValueError as e:
+            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -674,6 +682,7 @@ def create_pod():
             )), 400
         except Exception as e:
             app.logger.exception("[CREATE POD] pod spec build failed")
+            set_pod_creation_status(username, "failed", f"pod spec 생성 실패: {e}")
             return jsonify(infra_error(
                 "BUILD_POD_SPEC",
                 "POD_SPEC_BUILD_FAILED",
@@ -701,6 +710,7 @@ def create_pod():
             )), 500
 
         app.logger.info(f"[CREATE POD] creating pod in namespace={ns}")
+        set_pod_creation_status(username, "creating_pod", f"k8s pod 생성 중 (node={best_node})")
         try:
             v1.create_namespaced_pod(
                 namespace=ns,
@@ -708,6 +718,7 @@ def create_pod():
             )
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] pod creation failed")
+            set_pod_creation_status(username, "failed", f"pod 생성 실패: {e.body}")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "CREATE_POD",
@@ -719,6 +730,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] pod creation failed")
+            set_pod_creation_status(username, "failed", f"pod 생성 실패: {e}")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "CREATE_POD",
@@ -731,6 +743,7 @@ def create_pod():
         app.logger.info("[CREATE POD] pod creation request sent")
 
         app.logger.info("[CREATE POD] waiting for pod to become Ready")
+        set_pod_creation_status(username, "waiting_ready", "이미지 pull / 컨테이너 기동 대기 중")
         try:
             failure_reason = None
             max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
@@ -749,6 +762,7 @@ def create_pod():
 
             if failure_reason:
                 app.logger.info(f"[CREATE POD] deleting failed pod: {pod_name}")
+                set_pod_creation_status(username, "failed", failure_reason)
                 rollback = cleanup_create_failure(pod_name, v1)
                 return jsonify(infra_error(
                     "WAIT_POD_READY",
@@ -759,6 +773,7 @@ def create_pod():
                 )), 500
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] pod ready check failed")
+            set_pod_creation_status(username, "failed", f"pod ready 확인 실패: {e.body}")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "WAIT_POD_READY",
@@ -770,6 +785,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] pod ready check failed")
+            set_pod_creation_status(username, "failed", f"pod ready 확인 실패: {e}")
             rollback = cleanup_create_failure(pod_name, v1)
             return jsonify(infra_error(
                 "WAIT_POD_READY",
@@ -780,10 +796,12 @@ def create_pod():
             )), 500
 
         app.logger.info("[CREATE POD] creating NodePort services")
+        set_pod_creation_status(username, "creating_services", "NodePort 서비스 생성 중")
         try:
             create_nodeport_services(username, ns, pod_name, allocated_ports)
         except client.exceptions.ApiException as e:
             app.logger.exception("[CREATE POD] service creation failed")
+            set_pod_creation_status(username, "failed", f"서비스 생성 실패: {e.body}")
             rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
             return jsonify(infra_error(
                 "CREATE_NODEPORT_SERVICE",
@@ -795,6 +813,7 @@ def create_pod():
             )), 500
         except Exception as e:
             app.logger.exception("[CREATE POD] service creation failed")
+            set_pod_creation_status(username, "failed", f"서비스 생성 실패: {e}")
             rollback = cleanup_create_failure(pod_name, v1, delete_services=True)
             return jsonify(infra_error(
                 "CREATE_NODEPORT_SERVICE",
@@ -807,6 +826,7 @@ def create_pod():
         app.logger.info("[CREATE POD] services created successfully")
 
         app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
+        set_pod_creation_status(username, "ready", f"생성 완료 (node={best_node})")
 
         return jsonify({
             "status": "created",
@@ -817,11 +837,92 @@ def create_pod():
 
     except Exception as e:
         app.logger.exception("[CREATE POD] unexpected error")
+        if username:
+            set_pod_creation_status(username, "failed", f"예기치 않은 오류: {e}")
         return jsonify(infra_error(
             "CREATE_POD",
             "CREATE_POD_FAILED",
             str(e),
         )), 500
+
+
+@app.route("/pods/<username>/status", methods=["GET"])
+def get_pod_status(username):
+    """
+    사용자 Pod 생성 진행 상황 조회
+
+    /create-pod는 이미지 pull 등으로 오래(최대 POD_READY_MAX_WAIT_SEC초) 걸릴 수 있는
+    동기 API라서, 그 요청이 끝나기 전에 별도로 진행 상황만 가볍게 조회하기 위한 엔드포인트.
+
+    stage는 다음 순서로 진행되며, 최종 상태는 ready 또는 failed다:
+      - unknown            : 생성 이력 없음 (한 번도 /create-pod를 호출한 적 없음)
+      - started             : 요청 접수
+      - selecting_node      : GPU 노드 선택 중 (Prometheus 스코어링)
+      - building_pod_spec   : pod spec 생성 시작 (바로 아래 두 단계로 넘어가는 과도 상태)
+      - allocating_nodeport : NodePort 할당 중
+      - deploying_krb5      : farm 노드에 krb5 keytab 배포 중 (KRB5_REALM 설정 시에만 거침)
+      - creating_pod        : k8s에 pod 생성 요청 중
+      - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계)
+      - creating_services   : NodePort Service 생성 중
+      - ready               : 생성 완료 (성공, 최종 상태)
+      - failed              : 실패 (message 필드에 원인 포함, 최종 상태)
+
+    ---
+    tags:
+    - Pod
+
+    summary: Pod 생성 진행 상황 조회
+
+    parameters:
+      - in: path
+        name: username
+        required: true
+        type: string
+
+    responses:
+      200:
+        description: 진행 상황 조회 성공
+        schema:
+          type: object
+          properties:
+            username:
+              type: string
+            stage:
+              type: string
+              enum:
+                - unknown
+                - started
+                - selecting_node
+                - building_pod_spec
+                - allocating_nodeport
+                - deploying_krb5
+                - creating_pod
+                - waiting_ready
+                - creating_services
+                - ready
+                - failed
+            message:
+              type: string
+            updated_at:
+              type: string
+              description: ISO8601 UTC (unknown일 때는 없음)
+      500:
+        description: 서버 내부 오류
+    """
+    try:
+        status = get_pod_creation_status(username)
+    except Exception as e:
+        app.logger.exception("[POD STATUS] lookup failed")
+        return jsonify(infra_error(
+            "GET_POD_STATUS",
+            "POD_STATUS_LOOKUP_FAILED",
+            str(e),
+        )), 500
+
+    if status is None:
+        return jsonify({"username": username, "stage": "unknown", "message": "생성 이력 없음"}), 200
+
+    return jsonify({"username": username, **status}), 200
 
 
 def _normalize_gid_list(raw_gid) -> List[int]:
@@ -989,6 +1090,7 @@ def build_pod_spec(
     )
     app.logger.info(f"[POD SPEC] enable_vnc={enable_vnc}")
     # 포트 할당
+    set_pod_creation_status(username, "allocating_nodeport", "NodePort 할당 중")
     allocated_ports = allocate_nodeports(
         username=username,
         pod_name=pod_name,
@@ -1062,6 +1164,7 @@ def build_pod_spec(
         if app.config["KRB5_REALM"]:
             # keytab은 컨테이너에 마운트하지 않는다 — farm 노드에만 배포하고 호스트가 갱신한 TGT만 공유한다.
             # 이 배포가 실패하면 예외가 아래 except로 전달되어 nodeport 롤백 + Pod 미생성으로 처리된다.
+            set_pod_creation_status(username, "deploying_krb5", f"krb5 배포 중 (node={target_node})")
             _deploy_krb5_to_farm(username, uid, target_node)
 
             # rpc-gssd가 호스트에서 ccache를 읽을 수 있도록 Pod와 호스트가 /run/user/<uid> 공유
