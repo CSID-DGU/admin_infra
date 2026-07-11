@@ -1708,18 +1708,30 @@ def _get_farm_node_info(node_name: str) -> dict:
 
 def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -> str:
     """전용 서비스 계정으로 접속한다. 계정 쪽에 forced-command가 걸려 있어
-    remote_command는 그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다."""
-    result = subprocess.run(
-        ["ssh",
-         "-i", app.config["FARM_SSH_KEY_PATH"],
-         "-o", "StrictHostKeyChecking=no",
-         "-o", "BatchMode=yes",
-         "-p", str(port),
-         f"{app.config['FARM_SSH_USER']}@{host}",
-         remote_command],
-        input=stdin_data,
-        capture_output=True, text=True, timeout=30,
-    )
+    remote_command는 그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
+    간헐적으로 최초 접속만 타임아웃되고 곧바로 재시도하면 성공하는 현상이 있어 타임아웃 시 1회 재시도한다."""
+    cmd = ["ssh",
+           "-i", app.config["FARM_SSH_KEY_PATH"],
+           "-o", "StrictHostKeyChecking=no",
+           "-o", "BatchMode=yes",
+           "-p", str(port),
+           f"{app.config['FARM_SSH_USER']}@{host}",
+           remote_command]
+
+    result = None
+    last_error = None
+    for attempt in range(2):
+        try:
+            result = subprocess.run(
+                cmd, input=stdin_data, capture_output=True, text=True, timeout=30,
+            )
+            break
+        except subprocess.TimeoutExpired as e:
+            last_error = e
+            app.logger.warning(f"[FARM SSH] {host}:{port} 타임아웃, 재시도 {attempt+1}/2")
+    if result is None:
+        raise last_error
+
     if result.returncode != 0:
         raise RuntimeError(f"farm SSH 실패 ({host}:{port}): {result.stderr.strip()}")
     return result.stdout
