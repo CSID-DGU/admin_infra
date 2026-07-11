@@ -71,7 +71,6 @@ app.config.from_mapping({
     "DEFAULT_MEM_LIMIT":  "1024Mi",
 
     # NFS
-    "NFS_SERVER":          os.getenv("NFS_SERVER", ""),
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
 
     # Kerberos (비어있으면 비활성)
@@ -265,6 +264,25 @@ def reconcile_nodeport_allocations(namespace: str) -> int:
         conn.close()
 
 
+def get_cluster_reserved_nodeports() -> set:
+    """
+    클러스터 전체(모든 네임스페이스)에서 이미 점유 중인 NodePort 집합 조회.
+
+    nodeport_allocations 테이블에는 이 서비스가 직접 할당한 포트만 기록되므로,
+    고정 NodePort로 배포된 자기 자신이나 수동으로 생성된 Service가 점유한
+    포트는 DB만 봐서는 알 수 없다. 그런 포트가 available로 잘못 계산되면
+    이후 Service 생성 단계에서 "already allocated"로 실패한다.
+    """
+    load_k8s()
+    v1 = client.CoreV1Api()
+    reserved = set()
+    for svc in v1.list_service_for_all_namespaces().items:
+        for port in svc.spec.ports or []:
+            if port.node_port:
+                reserved.add(port.node_port)
+    return reserved
+
+
 def allocate_nodeports(username, pod_name, node_name, ports):
     """
     ports:
@@ -289,6 +307,16 @@ def allocate_nodeports(username, pod_name, node_name, ports):
 
             cur.execute("SELECT node_port FROM nodeport_allocations FOR UPDATE")
             used = {row[0] for row in cur.fetchall()}
+
+            try:
+                used |= get_cluster_reserved_nodeports()
+            except Exception:
+                app.logger.warning(
+                    "[NODEPORT] failed to query live k8s nodeport usage, "
+                    "falling back to DB-only availability check",
+                    exc_info=True,
+                )
+
             app.logger.debug(f"[NODEPORT] used ports count={len(used)}")
             available = [
                 p for p in range(30000, 32768)
@@ -1006,22 +1034,16 @@ def build_pod_spec(
                 })
 
         # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
+        # image-store PVC(pvc-image-store)는 제거 — 해당 PV의 NFS subdir가
+        # 미치환 템플릿(user-share/${pvc.annotations.nfs.io/username})이라 모든 유저 파드가
+        # mount access denied로 Ready 실패. MVP는 image-store 불필요.
         volume_mounts = [
             {"name": "nfs-home",    "mountPath": "/home",        "readOnly": False},
-            {"name": "image-store", "mountPath": "/image-store", "readOnly": False},
         ]
         volumes = [
             {
                 "name": "nfs-home",
-                "nfs": {
-                    "server":   app.config["NFS_SERVER"],
-                    "path":     app.config["NFS_USER_SHARE_PATH"],
-                    "readOnly": False,
-                }
-            },
-            {
-                "name": "image-store",
-                "persistentVolumeClaim": {"claimName": "pvc-image-store"}
+                "hostPath": {"path": "/mnt/ailab-share", "type": "Directory"},
             },
         ]
 
@@ -1130,8 +1152,9 @@ def build_pod_spec(
         return spec, allocated_ports
     except Exception as e:
         app.logger.warning(
-            "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s",
-            pod_name,
+            "[POD SPEC] failed after nodeport allocation; releasing rows pod=%s — %s",
+            pod_name, e,
+            exc_info=True,
         )
         rollback = {"nodeportsReleased": False}
         try:
@@ -1362,7 +1385,8 @@ def delete_pod():
             try:
                 _remove_krb5_from_farm(username, pod_node_name)
             except Exception as e:
-                app.logger.warning(f"[DELETE POD] farm 정리 실패 (무시): {username} ← {pod_node_name} — {e}")
+                app.logger.warning(f"[DELETE POD] farm 정리 실패, 재조정 잡에 위임: {username} ← {pod_node_name} — {e}")
+                _record_krb5_cleanup_pending(username, pod_node_name)
 
         return jsonify({
             "status": "deleted",
@@ -1624,12 +1648,20 @@ def _create_krb5_principal_and_secret(username: str) -> None:
     _kadmin_run(f"addprinc -randkey {principal}")
     with tempfile.NamedTemporaryFile(suffix=".keytab", delete=False) as f:
         keytab_path = f.name
+    # kadmin ktadd는 대상 경로가 이미 존재하는 0바이트 파일이면 keytab으로 열지 못해
+    # "Unsupported key table format" 로 실패한다(단 kadmin exit는 0이라 조용히 빈 keytab이 됨).
+    # 미리 지워 kadmin이 새 keytab을 생성하도록 한다.
+    os.unlink(keytab_path)
     try:
         _kadmin_run(f"ktadd -k {keytab_path} {principal}")
         with open(keytab_path, "rb") as f:
             keytab_bytes = f.read()
     finally:
-        os.unlink(keytab_path)
+        if os.path.exists(keytab_path):
+            os.unlink(keytab_path)
+    if not keytab_bytes:
+        raise RuntimeError(f"ktadd로 생성된 keytab이 비어 있음: {principal}")
+    load_k8s()  # 계정 CRUD 경로는 load_k8s()를 안 거쳐 k8s 기본값 localhost:80으로 붙음 → in-cluster config 보장
     v1 = client.CoreV1Api()
     secret = client.V1Secret(
         metadata=client.V1ObjectMeta(
@@ -1646,6 +1678,7 @@ def _delete_krb5_principal_and_secret(username: str) -> None:
         _kadmin_run(f"delprinc -force {username}@{realm}")
     except Exception as e:
         app.logger.warning(f"[KRB5] principal 삭제 실패 (무시): {e}")
+    load_k8s()  # 계정 CRUD 경로 in-cluster config 보장 (create와 동일 구멍)
     v1 = client.CoreV1Api()
     try:
         v1.delete_namespaced_secret(
@@ -1705,12 +1738,34 @@ def _remove_krb5_from_farm(username: str, node_name: str) -> None:
     app.logger.info(f"[KRB5] farm 정리 완료: {username} ← {node_name}")
 
 
+def _record_krb5_cleanup_pending(username: str, node_name: str) -> None:
+    """farm 노드에서 keytab/timer 정리가 실패했을 때 재조정 잡이 나중에 재시도할 수 있도록 기록한다."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO krb5_cleanup_pending (username, node_name, failed_at)
+                VALUES (%s, %s, NOW())
+                ON DUPLICATE KEY UPDATE failed_at = NOW()
+                """,
+                (username, node_name),
+            )
+        conn.commit()
+    except Exception:
+        app.logger.exception(f"[KRB5] cleanup_pending 기록 실패: {username} ← {node_name}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
 def _remove_krb5_from_all_farms(username: str) -> None:
     for node in app.config["FARM_NODES"]:
         try:
             _remove_krb5_from_farm(username, node["name"])
         except Exception as e:
-            app.logger.warning(f"[KRB5] farm 정리 실패 (무시): {node['name']} — {e}")
+            app.logger.warning(f"[KRB5] farm 정리 실패, 재조정 잡에 위임: {node['name']} — {e}")
+            _record_krb5_cleanup_pending(username, node["name"])
 
 
 accounts_bp = Blueprint("accounts", __name__)
@@ -2344,6 +2399,11 @@ def add_group():
           type: object
           required:
             - name
+          example:
+            name: developers
+            members:
+              - user2100
+              - user2101
           properties:
             name:
               type: string
@@ -2351,7 +2411,6 @@ def add_group():
             gid:
               type: integer
               description: 생략 시 /kube_share/group 기준으로 자동 할당
-              example: 3001
             members:
               type: array
               items:
@@ -2364,6 +2423,23 @@ def add_group():
 
       201:
         description: 그룹 생성 성공
+        schema:
+          type: object
+          properties:
+            group:
+              type: object
+              properties:
+                name:
+                  type: string
+                  example: developers
+                gid:
+                  type: integer
+                  example: 10001
+        examples:
+          application/json:
+            group:
+              name: developers
+              gid: 10001
       400:
         description: 잘못된 요청
       409:
