@@ -18,7 +18,6 @@ import base64
 import crypt
 import json
 import subprocess
-import tempfile
 
 from error import infra_error, k8s_error_fields
 from pod_status import set_pod_creation_status, get_pod_creation_status
@@ -77,14 +76,19 @@ app.config.from_mapping({
 
     # Kerberos (비어있으면 비활성)
     "KRB5_REALM":           os.getenv("KRB5_REALM", ""),
-    "KRB5_KDC_HOST":        os.getenv("KRB5_KDC_HOST", ""),
-    "KRB5_ADMIN_PRINCIPAL": os.getenv("KRB5_ADMIN_PRINCIPAL", ""),
-    "KRB5_ADMIN_PASSWORD":  os.getenv("KRB5_ADMIN_PASSWORD", ""),
 
     # farm 노드 keytab/timer 자동 배포용 SSH (전용 서비스 계정)
     "FARM_SSH_USER":     os.getenv("FARM_SSH_USER", ""),
     "FARM_SSH_KEY_PATH": os.getenv("FARM_SSH_KEY_PATH", ""),
     "FARM_NODES":        json.loads(os.getenv("FARM_NODES_JSON", "[]")),
+
+    # AD 계정 생성/삭제용 SSH (전용 서비스 계정, 별도 DC 노드 세트에만 배포됨)
+    "FARM_AD_SSH_USER":     os.getenv("FARM_AD_SSH_USER", ""),
+    "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
+    "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
+
+    # pod의 /home 볼륨이 바라볼, k8s 노드에 이미 마운트돼 있는 NFS 홈 루트
+    "FARM_HOME_MOUNT_ROOT": os.getenv("FARM_HOME_MOUNT_ROOT", "/home/tako2/share/user"),
 
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -1156,7 +1160,7 @@ def build_pod_spec(
         volumes = [
             {
                 "name": "nfs-home",
-                "hostPath": {"path": "/mnt/ailab-share", "type": "Directory"},
+                "hostPath": {"path": app.config["FARM_HOME_MOUNT_ROOT"], "type": "Directory"},
             },
         ]
 
@@ -1740,41 +1744,43 @@ def migrate():
 
 
 
-# ---- Kerberos KDC helpers ----
+# ---- Kerberos AD helpers ----
 
-def _kadmin_run(cmd: str) -> None:
-    result = subprocess.run(
-        [
-            "kadmin",
-            "-p", app.config["KRB5_ADMIN_PRINCIPAL"],
-            "-w", app.config["KRB5_ADMIN_PASSWORD"],
-            "-s", app.config["KRB5_KDC_HOST"],
-            "-q", cmd,
-        ],
-        capture_output=True, text=True, timeout=15,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"kadmin 실패: {result.stderr.strip()}")
+def _farm_ad_ssh(remote_command: str, stdin_data: str = "") -> str:
+    """전용 서비스 계정으로 AD DC에 접속한다. forced-command가 걸려 있어 remote_command는
+    그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
+    DC 하나가 실패하면 다음 DC로 넘어간다."""
+    nodes = app.config["FARM_AD_DC_NODES"]
+    if not nodes:
+        raise RuntimeError("FARM_AD_DC_NODES가 설정되지 않음")
+    last_error: Exception | None = None
+    for node in nodes:
+        cmd = ["ssh",
+               "-i", app.config["FARM_AD_SSH_KEY_PATH"],
+               "-o", "StrictHostKeyChecking=no",
+               "-o", "BatchMode=yes",
+               "-o", "ConnectTimeout=10",
+               "-p", str(node["port"]),
+               f"{app.config['FARM_AD_SSH_USER']}@{node['host']}",
+               remote_command]
+        try:
+            result = subprocess.run(cmd, input=stdin_data, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired as e:
+            last_error = e
+            app.logger.warning(f"[FARM AD SSH] {node['name']} 타임아웃")
+            continue
+        if result.returncode != 0:
+            last_error = RuntimeError(f"AD DC SSH 실패 ({node['name']}): {result.stderr.strip()}")
+            app.logger.warning(f"[FARM AD SSH] {node['name']} 실패: {result.stderr.strip()}")
+            continue
+        return result.stdout
+    raise last_error or RuntimeError("모든 AD DC 접속 실패")
 
-def _create_krb5_principal_and_secret(username: str) -> None:
-    realm = app.config["KRB5_REALM"]
-    principal = f"{username}@{realm}"
-    _kadmin_run(f"addprinc -randkey {principal}")
-    with tempfile.NamedTemporaryFile(suffix=".keytab", delete=False) as f:
-        keytab_path = f.name
-    # kadmin ktadd는 대상 경로가 이미 존재하는 0바이트 파일이면 keytab으로 열지 못해
-    # "Unsupported key table format" 로 실패한다(단 kadmin exit는 0이라 조용히 빈 keytab이 됨).
-    # 미리 지워 kadmin이 새 keytab을 생성하도록 한다.
-    os.unlink(keytab_path)
-    try:
-        _kadmin_run(f"ktadd -k {keytab_path} {principal}")
-        with open(keytab_path, "rb") as f:
-            keytab_bytes = f.read()
-    finally:
-        if os.path.exists(keytab_path):
-            os.unlink(keytab_path)
-    if not keytab_bytes:
-        raise RuntimeError(f"ktadd로 생성된 keytab이 비어 있음: {principal}")
+
+def _create_krb5_principal_and_secret(username: str, uid: int, gid: int) -> None:
+    keytab_b64 = _farm_ad_ssh(f"create {username} {uid} {gid}").strip()
+    if not keytab_b64:
+        raise RuntimeError(f"AD 계정 생성 결과 keytab이 비어 있음: {username}")
     load_k8s()  # 계정 CRUD 경로는 load_k8s()를 안 거쳐 k8s 기본값 localhost:80으로 붙음 → in-cluster config 보장
     v1 = client.CoreV1Api()
     secret = client.V1Secret(
@@ -1782,16 +1788,15 @@ def _create_krb5_principal_and_secret(username: str) -> None:
             name=f"krb5-keytab-{username}",
             namespace=app.config["NAMESPACE"],
         ),
-        data={"krb5.keytab": base64.b64encode(keytab_bytes).decode()},
+        data={"krb5.keytab": keytab_b64},
     )
     v1.create_namespaced_secret(namespace=app.config["NAMESPACE"], body=secret)
 
 def _delete_krb5_principal_and_secret(username: str) -> None:
-    realm = app.config["KRB5_REALM"]
     try:
-        _kadmin_run(f"delprinc -force {username}@{realm}")
+        _farm_ad_ssh(f"delete {username}")
     except Exception as e:
-        app.logger.warning(f"[KRB5] principal 삭제 실패 (무시): {e}")
+        app.logger.warning(f"[KRB5] AD 계정 삭제 실패 (무시): {e}")
     load_k8s()  # 계정 CRUD 경로 in-cluster config 보장 (create와 동일 구멍)
     v1 = client.CoreV1Api()
     try:
@@ -2310,7 +2315,7 @@ def create_user():
     # 6) Kerberos principal 생성 + keytab k8s Secret 저장
     if app.config.get("KRB5_REALM"):
         try:
-            _create_krb5_principal_and_secret(name)
+            _create_krb5_principal_and_secret(name, uid, gid)
         except Exception:
             app.logger.exception("[ACCOUNTS] KRB5 principal creation failed for user=%s, rolling back", name)
             try:

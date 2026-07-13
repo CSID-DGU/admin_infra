@@ -34,13 +34,17 @@ farm:
     user: ""
     keyPath: ""
     nodes: []
+  adSsh:
+    user: ""
+    keyPath: ""
+    nodes: []
+  homeMountRoot: ""
 
 security:
   sudoAllowedCommands: ""
 
 krb5:
   realm: ""
-  kdcHost: ""
 
 
 config:
