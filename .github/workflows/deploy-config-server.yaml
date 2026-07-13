@@ -79,10 +79,13 @@ jobs:
             --set nas.ssh.user=${{ secrets.NAS_SSH_USER }} \
             --set nas.ssh.keyPath=${{ secrets.NAS_SSH_KEY_PATH }} \
             --set krb5.realm=${{ secrets.KRB5_REALM }} \
-            --set krb5.kdcHost=${{ secrets.KRB5_KDC_HOST }} \
             --set farm.ssh.user=${{ secrets.FARM_SSH_USER }} \
             --set farm.ssh.keyPath=${{ secrets.FARM_SSH_KEY_PATH }} \
             --set-json farm.ssh.nodes='${{ secrets.FARM_NODES_JSON }}' \
+            --set farm.adSsh.user=${{ secrets.FARM_AD_SSH_USER }} \
+            --set farm.adSsh.keyPath=${{ secrets.FARM_AD_SSH_KEY_PATH }} \
+            --set-json farm.adSsh.nodes='${{ secrets.FARM_AD_DC_NODES_JSON }}' \
+            --set farm.homeMountRoot=${{ secrets.FARM_HOME_MOUNT_ROOT }} \
             --force-conflicts
           
           echo "=== Deployment Finished ==="
