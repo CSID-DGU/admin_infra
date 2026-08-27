@@ -1620,25 +1620,32 @@ def _migrate_internal(data):
 
     pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
 
+    set_pod_creation_status(username, "creating_pod", f"마이그레이션: k8s pod 생성 중 (node={best_node})")
     try:
         v1.create_namespaced_pod(namespace=ns, body=pod_spec)
     except Exception:
+        set_pod_creation_status(username, "failed", "마이그레이션 실패: pod 생성 실패")
         release_nodeports(new_pod_name)
         raise
 
-    # 8. Ready 대기
-    for _ in range(60):
+    # 8. Ready 대기 — /create-pod와 동일한 이미지 pull/기동 과정이므로 동일한 최대 대기 시간을 준다
+    set_pod_creation_status(username, "waiting_ready", "마이그레이션: 이미지 pull / 컨테이너 기동 대기 중")
+    max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
+    for i in range(max_wait):
         pod = v1.read_namespaced_pod(new_pod_name, ns)
         if is_pod_ready(pod):
+            app.logger.info(f"[MIGRATE] new pod ready after {i+1} seconds")
             break
         time.sleep(1)
     else:
         # 새 Pod 실패 -> 정리 후 종료
+        set_pod_creation_status(username, "failed", "마이그레이션 실패: 새 pod 기동 실패")
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
         return jsonify({"error": "new pod failed to start"}), 500
 
     # 9. 새 Pod 성공 후 Service 생성
+    set_pod_creation_status(username, "creating_services", "마이그레이션: NodePort 서비스 생성 중")
     try:
         create_nodeport_services(
             username,
@@ -1647,22 +1654,35 @@ def _migrate_internal(data):
             allocated_ports
         )
     except Exception:
+        set_pod_creation_status(username, "failed", "마이그레이션 실패: 서비스 생성 실패")
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
         return jsonify({"error": "service creation failed"}), 500
 
-    # 10. 기존 Pod 정리
-    delete_nodeport_services(old_pod_name, ns)
-    release_nodeports(old_pod_name)
-    delete_pod_util(old_pod_name, ns)
+    # 10. 기존 Pod 정리 — 새 Pod는 이미 정상 기동되어 서비스 중이므로, 여기서 실패해도
+    # 마이그레이션 자체는 성공으로 응답한다 (호출자가 실패로 오인해 재시도하면 중복 Pod가 생길 수 있음).
+    # 다만 실패 사실은 응답에 남겨서 수동 정리가 필요함을 알 수 있게 한다.
+    old_pod_cleanup_failed = False
+    try:
+        delete_nodeport_services(old_pod_name, ns)
+        release_nodeports(old_pod_name)
+        delete_pod_util(old_pod_name, ns)
+    except Exception:
+        app.logger.exception(f"[MIGRATE] 기존 Pod({old_pod_name}) 정리 실패 — 새 Pod는 정상 기동됨, 수동 정리 필요")
+        old_pod_cleanup_failed = True
 
-    return jsonify({
+    set_pod_creation_status(username, "ready", f"마이그레이션 완료 (node={best_node})")
+
+    response = {
         "status": "migrated",
         "from": current_node,
         "to": best_node,
         "new_pod": new_pod_name,
         "ports": allocated_ports
-    }), 200
+    }
+    if old_pod_cleanup_failed:
+        response["old_pod_cleanup"] = "failed"
+    return jsonify(response), 200
 
 
 @app.route("/migrate", methods=["POST"])
@@ -1739,7 +1759,16 @@ def migrate():
     lock_path = f"/tmp/migrate-{username}.lock"
 
     with LockedFile(lock_path, "w"):
-        return _migrate_internal(data)
+        try:
+            return _migrate_internal(data)
+        except Exception as e:
+            app.logger.exception("[MIGRATE] unexpected error")
+            set_pod_creation_status(username, "failed", "마이그레이션 실패: 예기치 않은 오류")
+            return jsonify(infra_error(
+                "MIGRATE",
+                "MIGRATE_FAILED",
+                str(e),
+            )), 500
 
 
 
