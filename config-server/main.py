@@ -36,6 +36,7 @@ from utils import (
     delete_user_home_directory,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
+    resolve_farm_home_mount_root,
     load_user_image,
     commit_and_save_user_image,
     create_nodeport_services,
@@ -90,9 +91,6 @@ app.config.from_mapping({
     "FARM_AD_SSH_USER":     os.getenv("FARM_AD_SSH_USER", ""),
     "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
     "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
-
-    # pod의 /home 볼륨이 바라볼, k8s 노드에 이미 마운트돼 있는 NFS 홈 루트
-    "FARM_HOME_MOUNT_ROOT": os.getenv("FARM_HOME_MOUNT_ROOT", "/home/tako2/share/user"),
 
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -1164,7 +1162,10 @@ def build_pod_spec(
         volumes = [
             {
                 "name": "nfs-home",
-                "hostPath": {"path": app.config["FARM_HOME_MOUNT_ROOT"], "type": "Directory"},
+                # 노드마다 로컬 NFS 마운트 경로(/home/tako<N>/share/user)가 다르므로
+                # 항상 이 Pod가 뜰 target_node 기준으로 계산한다 (전 노드 공통 고정값이었던
+                # 예전 FARM_HOME_MOUNT_ROOT는 farm2 외 노드에서 FailedMount를 유발했다).
+                "hostPath": {"path": resolve_farm_home_mount_root(target_node), "type": "Directory"},
             },
         ]
 

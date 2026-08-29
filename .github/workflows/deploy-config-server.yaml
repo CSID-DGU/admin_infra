@@ -85,7 +85,6 @@ jobs:
             --set farm.adSsh.user=${{ secrets.FARM_AD_SSH_USER }} \
             --set farm.adSsh.keyPath=${{ secrets.FARM_AD_SSH_KEY_PATH }} \
             --set-json farm.adSsh.nodes='${{ secrets.FARM_AD_DC_NODES_JSON }}' \
-            --set farm.homeMountRoot=${{ secrets.FARM_HOME_MOUNT_ROOT }} \
             --force-conflicts
           
           echo "=== Deployment Finished ==="
