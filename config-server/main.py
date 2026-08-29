@@ -768,12 +768,13 @@ def create_pod():
                     break
 
                 # 5초에 한 번만 이벤트를 조회해 API 부담을 줄이고, 단계가 실제로 바뀔 때만
-                # Redis에 다시 쓴다. 이미지 pull 중인지 컨테이너 기동 중인지 구분해서 보여준다.
+                # Redis에 다시 쓴다. stage 필드 자체를 이미지 pull 중/컨테이너 기동 중으로
+                # 구분해서 저장한다 (메시지 텍스트만 바꾸면 프론트에서 두 단계를 구분할 수 없다).
                 if i % 5 == 0:
                     progress = get_pod_progress_stage(v1, ns, pod_name)
                     if progress and progress[0] != last_progress_stage:
                         last_progress_stage, progress_message = progress
-                        set_pod_creation_status(username, "waiting_ready", progress_message)
+                        set_pod_creation_status(username, last_progress_stage, progress_message)
 
                 time.sleep(1)
             else:
@@ -881,7 +882,11 @@ def get_pod_status(username):
       - allocating_nodeport : NodePort 할당 중
       - deploying_krb5      : farm 노드에 krb5 keytab 배포 중 (KRB5_REALM 설정 시에만 거침)
       - creating_pod        : k8s에 pod 생성 요청 중
-      - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계)
+      - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계).
+                                    k8s 이벤트를 참고할 수 있으면 아래 하위 단계로 대체된다:
+      - pulling_image       : 이미지 다운로드 중
+      - starting_container  : 이미지 준비 완료, 컨테이너 생성/시작 중
+      - mount_retrying      : 볼륨 마운트 재시도 중 (아직 최종 실패는 아님)
       - creating_services   : NodePort Service 생성 중
       - ready               : 생성 완료 (성공, 최종 상태)
       - failed              : 실패 (최종 상태. message에는 "krb5 배포 실패" 같은 카테고리만 담기며,
@@ -1662,7 +1667,7 @@ def _migrate_internal(data):
             progress = get_pod_progress_stage(v1, ns, new_pod_name)
             if progress and progress[0] != last_progress_stage:
                 last_progress_stage, progress_message = progress
-                set_pod_creation_status(username, "waiting_ready", progress_message)
+                set_pod_creation_status(username, last_progress_stage, progress_message)
         time.sleep(1)
     else:
         migrate_failure_reason = migrate_failure_reason or f"pod not ready within {max_wait}s"
