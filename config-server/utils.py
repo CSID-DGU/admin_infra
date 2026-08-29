@@ -106,6 +106,47 @@ POD_FAILURE_WAITING_REASONS = {
     "CrashLoopBackOff", "CreateContainerConfigError", "CreateContainerError", "RunContainerError",
 }
 
+# waiting_ready 단계 안에서 "이미지 pull 중"과 "컨테이너 기동 중"을 구분해서 보여주기 위한
+# k8s 이벤트 reason → (하위 단계, 한국어 메시지) 매핑. FailedMount처럼 재시도는 되지만
+# 아직 최종 실패로 확정되진 않은 상태도 여기서 바로 보여줘서, kubectl 없이도 원인을 알 수 있게 한다.
+POD_EVENT_STAGE_MAP = {
+    "Pulling":      ("pulling_image", "이미지 다운로드 중"),
+    "Pulled":       ("starting_container", "이미지 다운로드 완료, 컨테이너 시작 중"),
+    "Created":      ("starting_container", "컨테이너 생성됨, 시작 중"),
+    "Started":      ("starting_container", "컨테이너 시작됨, 준비 확인 중"),
+    "BackOff":      ("starting_container", "컨테이너 재시도 중"),
+    "FailedMount":  ("mount_retrying", "볼륨 마운트 재시도 중"),
+}
+
+
+def get_pod_progress_stage(v1, namespace: str, pod_name: str):
+    """Pod 이벤트에서 가장 최근의 의미 있는 단계를 (stage, message)로 반환한다.
+    이벤트 조회는 진행 상황 표시라는 부가 기능일 뿐이라, 실패하거나 매핑에 없는
+    reason이면 조용히 None을 반환하고 호출부는 기존 문구를 그대로 유지한다."""
+    try:
+        events = v1.list_namespaced_event(
+            namespace=namespace,
+            field_selector=f"involvedObject.name={pod_name}",
+        ).items
+    except Exception:
+        return None
+
+    if not events:
+        return None
+
+    def event_time(e):
+        return e.last_timestamp or e.event_time or e.metadata.creation_timestamp
+
+    latest = max(events, key=event_time)
+    mapped = POD_EVENT_STAGE_MAP.get(latest.reason)
+    if not mapped:
+        return None
+
+    stage, message = mapped
+    if latest.reason == "FailedMount" and latest.message:
+        message = f"{message}: {latest.message.split(':', 1)[0]}"
+    return stage, message
+
 
 def get_pod_failure_reason(pod):
     if pod.status.phase == "Failed":
