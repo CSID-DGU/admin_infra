@@ -38,7 +38,6 @@ farm:
     user: ""
     keyPath: ""
     nodes: []
-  homeMountRoot: ""
 
 security:
   sudoAllowedCommands: ""
