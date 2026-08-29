@@ -138,12 +138,16 @@ def get_pod_progress_stage(v1, namespace: str, pod_name: str):
     def event_time(e):
         return e.last_timestamp or e.event_time or e.metadata.creation_timestamp
 
-    latest = max(events, key=event_time)
-    mapped = POD_EVENT_STAGE_MAP.get(latest.reason)
-    if not mapped:
+    # 매핑에 없는 reason(Scheduled, SuccessfulMountVolume 등)이 시간상 더 최근이면
+    # 이미 지난 실제 진행 단계를 가려버린다 — 이미지가 노드에 캐시돼 있어 Pulling/Pulled
+    # 이벤트 없이 바로 Created/Started로 넘어가는 경우 특히 두드러진다. 매핑된 이벤트
+    # 중에서만 가장 최근 것을 고른다.
+    mapped_events = [e for e in events if e.reason in POD_EVENT_STAGE_MAP]
+    if not mapped_events:
         return None
 
-    stage, message = mapped
+    latest = max(mapped_events, key=event_time)
+    stage, message = POD_EVENT_STAGE_MAP[latest.reason]
     if latest.reason == "FailedMount" and latest.message:
         message = f"{message}: {latest.message.split(':', 1)[0]}"
     return stage, message
