@@ -23,7 +23,8 @@ from error import infra_error, k8s_error_fields
 from pod_status import set_pod_creation_status, get_pod_creation_status
 
 from utils import (
-    get_db_connection, is_pod_ready, get_pod_failure_reason, get_existing_pod, generate_pod_name, delete_pod_util,
+    get_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage,
+    get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
@@ -36,6 +37,7 @@ from utils import (
     delete_user_home_directory,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
+    resolve_farm_home_mount_root,
     load_user_image,
     commit_and_save_user_image,
     create_nodeport_services,
@@ -63,7 +65,13 @@ app.config.from_mapping({
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
     "WAS_URL_TEMPLATE": "http://admin-prod.default/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
-    "POD_READY_MAX_WAIT_SEC": 300,
+    # 타임아웃 체인은 안쪽 레이어가 바깥쪽보다 항상 짧아야 한다 (그래야 바깥쪽이
+    # 포기하기 전에 안쪽이 먼저 정상적으로 응답을 만들 기회를 가진다):
+    #   config-server(여기, 500s) < admin_be podWebClient(550s)
+    #     < nginx/ingress-nginx(570s) < 프론트(600s, "10분"으로 표시)
+    # 여기서 max_wait를 다 채운 뒤에도 실패 정리(Pod 삭제/nodeport 해제/krb5 정리)
+    # 시간이 추가로 필요해서, admin_be와의 버퍼(50s)를 남겨둔다.
+    "POD_READY_MAX_WAIT_SEC": 500,
 
     # Default resources
     "DEFAULT_CPU_REQUEST": "1000m",
@@ -86,9 +94,6 @@ app.config.from_mapping({
     "FARM_AD_SSH_USER":     os.getenv("FARM_AD_SSH_USER", ""),
     "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
     "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
-
-    # pod의 /home 볼륨이 바라볼, k8s 노드에 이미 마운트돼 있는 NFS 홈 루트
-    "FARM_HOME_MOUNT_ROOT": os.getenv("FARM_HOME_MOUNT_ROOT", "/home/tako2/share/user"),
 
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -751,6 +756,7 @@ def create_pod():
         try:
             failure_reason = None
             max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
+            last_progress_stage = None
             for i in range(max_wait):
                 pod = v1.read_namespaced_pod(pod_name, ns)
                 if is_pod_ready(pod):
@@ -760,6 +766,16 @@ def create_pod():
                 if failure_reason:
                     app.logger.error(f"[CREATE POD] pod failed to start: {failure_reason}")
                     break
+
+                # 5초에 한 번만 이벤트를 조회해 API 부담을 줄이고, 단계가 실제로 바뀔 때만
+                # Redis에 다시 쓴다. stage 필드 자체를 이미지 pull 중/컨테이너 기동 중으로
+                # 구분해서 저장한다 (메시지 텍스트만 바꾸면 프론트에서 두 단계를 구분할 수 없다).
+                if i % 5 == 0:
+                    progress = get_pod_progress_stage(v1, ns, pod_name)
+                    if progress and progress[0] != last_progress_stage:
+                        last_progress_stage, progress_message = progress
+                        set_pod_creation_status(username, last_progress_stage, progress_message)
+
                 time.sleep(1)
             else:
                 failure_reason = failure_reason or f"pod not ready within {max_wait}s"
@@ -866,7 +882,11 @@ def get_pod_status(username):
       - allocating_nodeport : NodePort 할당 중
       - deploying_krb5      : farm 노드에 krb5 keytab 배포 중 (KRB5_REALM 설정 시에만 거침)
       - creating_pod        : k8s에 pod 생성 요청 중
-      - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계)
+      - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계).
+                                    k8s 이벤트를 참고할 수 있으면 아래 하위 단계로 대체된다:
+      - pulling_image       : 이미지 다운로드 중
+      - starting_container  : 이미지 준비 완료, 컨테이너 생성/시작 중
+      - mount_retrying      : 볼륨 마운트 재시도 중 (아직 최종 실패는 아님)
       - creating_services   : NodePort Service 생성 중
       - ready               : 생성 완료 (성공, 최종 상태)
       - failed              : 실패 (최종 상태. message에는 "krb5 배포 실패" 같은 카테고리만 담기며,
@@ -1160,7 +1180,10 @@ def build_pod_spec(
         volumes = [
             {
                 "name": "nfs-home",
-                "hostPath": {"path": app.config["FARM_HOME_MOUNT_ROOT"], "type": "Directory"},
+                # 노드마다 로컬 NFS 마운트 경로(/home/tako<N>/share/user)가 다르므로
+                # 항상 이 Pod가 뜰 target_node 기준으로 계산한다 (전 노드 공통 고정값이었던
+                # 예전 FARM_HOME_MOUNT_ROOT는 farm2 외 노드에서 FailedMount를 유발했다).
+                "hostPath": {"path": resolve_farm_home_mount_root(target_node), "type": "Directory"},
             },
         ]
 
@@ -1626,17 +1649,36 @@ def _migrate_internal(data):
         release_nodeports(new_pod_name)
         raise
 
-    # 8. Ready 대기
-    for _ in range(60):
+    # 8. Ready 대기 (create-pod와 동일하게 POD_READY_MAX_WAIT_SEC를 쓴다 —
+    # 예전엔 60초로 하드코딩돼 있어서 이미지 pull이 오래 걸리는 이미지는
+    # create-pod보다 훨씬 먼저 실패 처리되는 불일치가 있었다.)
+    migrate_failure_reason = None
+    max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
+    last_progress_stage = None
+    for i in range(max_wait):
         pod = v1.read_namespaced_pod(new_pod_name, ns)
         if is_pod_ready(pod):
+            set_pod_creation_status(username, "ready", f"마이그레이션 완료 (node={best_node})")
             break
+        migrate_failure_reason = get_pod_failure_reason(pod)
+        if migrate_failure_reason:
+            break
+        if i % 5 == 0:
+            progress = get_pod_progress_stage(v1, ns, new_pod_name)
+            if progress and progress[0] != last_progress_stage:
+                last_progress_stage, progress_message = progress
+                set_pod_creation_status(username, last_progress_stage, progress_message)
         time.sleep(1)
     else:
+        migrate_failure_reason = migrate_failure_reason or f"pod not ready within {max_wait}s"
+
+    if migrate_failure_reason:
         # 새 Pod 실패 -> 정리 후 종료
+        app.logger.error(f"[MIGRATE] new pod failed to start: {migrate_failure_reason}")
+        set_pod_creation_status(username, "failed", "마이그레이션 실패")
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
-        return jsonify({"error": "new pod failed to start"}), 500
+        return jsonify({"error": "new pod failed to start", "detail": migrate_failure_reason}), 500
 
     # 9. 새 Pod 성공 후 Service 생성
     try:

@@ -76,8 +76,6 @@ spec:
               value: "{{ .Values.farm.adSsh.keyPath }}"
             - name: FARM_AD_DC_NODES_JSON
               value: '{{ .Values.farm.adSsh.nodes | toJson }}'
-            - name: FARM_HOME_MOUNT_ROOT
-              value: "{{ .Values.farm.homeMountRoot }}"
           readinessProbe:
             httpGet:
               path: /health

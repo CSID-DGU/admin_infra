@@ -72,6 +72,25 @@ def resolve_k8s_node_name(candidate: Optional[str]) -> Optional[str]:
     return None
 
 
+FARM_NODE_NAME_PATTERN = re.compile(r"^farm(\d+)$", re.IGNORECASE)
+
+
+def resolve_farm_home_mount_root(target_node: str) -> str:
+    """farm<N> 노드명에서 그 노드 로컬의 NFS 마운트 경로(/home/tako<N>/share/user)를 도출한다.
+
+    각 farm 노드는 처음부터 자기 hostname 번호에 맞는 /home/tako<N>/share에만
+    NFS를 마운트해왔다(admin_infra_server의 remount-farm-user-share-krb.sh 참고).
+    그런데 코드는 FARM_HOME_MOUNT_ROOT 하나(기본값 /home/tako2/share/user, 즉 farm2의
+    경로)를 모든 노드에 그대로 썼던 버그가 있어서, farm2가 아닌 다른 노드(farm1, farm8 등)에
+    뜬 Pod는 전부 hostPath가 로컬에 없는 디렉터리를 가리켜 FailedMount로 영원히 Ready가
+    안 됐다. 노드 번호를 그대로 따라가도록 고친다.
+    """
+    match = FARM_NODE_NAME_PATTERN.match(target_node or "")
+    if not match:
+        raise ValueError(f"cannot derive farm home mount path for node: {target_node!r}")
+    return f"/home/tako{match.group(1)}/share/user"
+
+
 def is_pod_ready(pod):
     if pod.status.phase != "Running":
         return False
@@ -86,6 +105,48 @@ POD_FAILURE_WAITING_REASONS = {
     "ImagePullBackOff", "ErrImagePull", "ErrImageNeverPull", "InvalidImageName",
     "CrashLoopBackOff", "CreateContainerConfigError", "CreateContainerError", "RunContainerError",
 }
+
+# waiting_ready 단계 안에서 "이미지 pull 중"과 "컨테이너 기동 중"을 구분해서 보여주기 위한
+# k8s 이벤트 reason → (하위 단계, 한국어 메시지) 매핑. FailedMount처럼 재시도는 되지만
+# 아직 최종 실패로 확정되진 않은 상태도 여기서 바로 보여줘서, kubectl 없이도 원인을 알 수 있게 한다.
+POD_EVENT_STAGE_MAP = {
+    "Pulling":      ("pulling_image", "이미지 다운로드 중"),
+    "Pulled":       ("starting_container", "이미지 다운로드 완료, 컨테이너 시작 중"),
+    "Created":      ("starting_container", "컨테이너 생성됨, 시작 중"),
+    "Started":      ("starting_container", "컨테이너 시작됨, 준비 확인 중"),
+    "BackOff":      ("starting_container", "컨테이너 재시도 중"),
+    "FailedMount":  ("mount_retrying", "볼륨 마운트 재시도 중"),
+}
+
+
+def get_pod_progress_stage(v1, namespace: str, pod_name: str):
+    """Pod 이벤트에서 가장 최근의 의미 있는 단계를 (stage, message)로 반환한다.
+    이벤트 조회는 진행 상황 표시라는 부가 기능일 뿐이라, 실패하거나 매핑에 없는
+    reason이면 조용히 None을 반환하고 호출부는 기존 문구를 그대로 유지한다."""
+    try:
+        events = v1.list_namespaced_event(
+            namespace=namespace,
+            field_selector=f"involvedObject.name={pod_name}",
+        ).items
+    except Exception as e:
+        app.logger.warning(f"[POD PROGRESS] failed to list events for {pod_name}, falling back to generic message: {e}")
+        return None
+
+    if not events:
+        return None
+
+    def event_time(e):
+        return e.last_timestamp or e.event_time or e.metadata.creation_timestamp
+
+    latest = max(events, key=event_time)
+    mapped = POD_EVENT_STAGE_MAP.get(latest.reason)
+    if not mapped:
+        return None
+
+    stage, message = mapped
+    if latest.reason == "FailedMount" and latest.message:
+        message = f"{message}: {latest.message.split(':', 1)[0]}"
+    return stage, message
 
 
 def get_pod_failure_reason(pod):
