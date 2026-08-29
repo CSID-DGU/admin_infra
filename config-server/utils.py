@@ -128,7 +128,8 @@ def get_pod_progress_stage(v1, namespace: str, pod_name: str):
             namespace=namespace,
             field_selector=f"involvedObject.name={pod_name}",
         ).items
-    except Exception:
+    except Exception as e:
+        app.logger.warning(f"[POD PROGRESS] failed to list events for {pod_name}, falling back to generic message: {e}")
         return None
 
     if not events:
