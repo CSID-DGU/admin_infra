@@ -752,11 +752,14 @@ def create_pod():
         app.logger.info("[CREATE POD] pod creation request sent")
 
         app.logger.info("[CREATE POD] waiting for pod to become Ready")
-        set_pod_creation_status(username, "waiting_ready", "이미지 pull / 컨테이너 기동 대기 중")
+        # "이미지 pull / 컨테이너 기동 대기 중"처럼 두 단계를 합친 문구를 초기값으로도
+        # 남기지 않는다 — 이벤트가 아직 안 잡힌 순간에도 이미 분리된 stage로 시작해서,
+        # pulling_image/starting_container 둘 중 하나로만 노출되게 한다.
+        set_pod_creation_status(username, "pulling_image", "이미지 다운로드 준비 중")
         try:
             failure_reason = None
             max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
-            last_progress_stage = None
+            last_progress_stage = "pulling_image"
             for i in range(max_wait):
                 pod = v1.read_namespaced_pod(pod_name, ns)
                 if is_pod_ready(pod):
@@ -882,9 +885,8 @@ def get_pod_status(username):
       - allocating_nodeport : NodePort 할당 중
       - deploying_krb5      : farm 노드에 krb5 keytab 배포 중 (KRB5_REALM 설정 시에만 거침)
       - creating_pod        : k8s에 pod 생성 요청 중
-      - waiting_ready       : 이미지 pull / 컨테이너 기동 대기 중 (보통 가장 오래 걸리는 단계).
-                                    k8s 이벤트를 참고할 수 있으면 아래 하위 단계로 대체된다:
-      - pulling_image       : 이미지 다운로드 중
+      - pulling_image       : 이미지 다운로드 중 (보통 가장 오래 걸리는 단계. 진입 시 기본값이며,
+                                    k8s 이벤트를 아직 못 받았을 때도 이 상태로 노출된다)
       - starting_container  : 이미지 준비 완료, 컨테이너 생성/시작 중
       - mount_retrying      : 볼륨 마운트 재시도 중 (아직 최종 실패는 아님)
       - creating_services   : NodePort Service 생성 중
