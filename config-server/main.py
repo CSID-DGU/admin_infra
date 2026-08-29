@@ -63,7 +63,11 @@ app.config.from_mapping({
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
     "WAS_URL_TEMPLATE": "http://admin-prod.default/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
-    "POD_READY_MAX_WAIT_SEC": 300,
+    # admin_be의 podWebClient 응답 타임아웃(600s)보다 짧게 잡아야 한다 — 여기서
+    # 다 채워 기다린 뒤 실패 정리(Pod 삭제/nodeport 해제/krb5 정리)까지 하면
+    # admin_be가 먼저 타임아웃돼 버려서, 뒤에서는 끝났는데 앞에서는 실패로 보이는
+    # 문제가 재현된다. 정리 작업 여유(약 50s)를 남겨둔다.
+    "POD_READY_MAX_WAIT_SEC": 550,
 
     # Default resources
     "DEFAULT_CPU_REQUEST": "1000m",
