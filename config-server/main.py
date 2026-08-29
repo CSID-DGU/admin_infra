@@ -23,7 +23,8 @@ from error import infra_error, k8s_error_fields
 from pod_status import set_pod_creation_status, get_pod_creation_status
 
 from utils import (
-    get_db_connection, is_pod_ready, get_pod_failure_reason, get_existing_pod, generate_pod_name, delete_pod_util,
+    get_db_connection, is_pod_ready, get_pod_failure_reason, get_pod_progress_stage,
+    get_existing_pod, generate_pod_name, delete_pod_util,
     LockedFile, get_node_gpu_score,
     ensure_etc_layout, ensure_sudoers_file,
     read_passwd_lines, write_passwd_lines,
@@ -755,6 +756,7 @@ def create_pod():
         try:
             failure_reason = None
             max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
+            last_progress_stage = None
             for i in range(max_wait):
                 pod = v1.read_namespaced_pod(pod_name, ns)
                 if is_pod_ready(pod):
@@ -764,6 +766,15 @@ def create_pod():
                 if failure_reason:
                     app.logger.error(f"[CREATE POD] pod failed to start: {failure_reason}")
                     break
+
+                # 5초에 한 번만 이벤트를 조회해 API 부담을 줄이고, 단계가 실제로 바뀔 때만
+                # Redis에 다시 쓴다. 이미지 pull 중인지 컨테이너 기동 중인지 구분해서 보여준다.
+                if i % 5 == 0:
+                    progress = get_pod_progress_stage(v1, ns, pod_name)
+                    if progress and progress[0] != last_progress_stage:
+                        last_progress_stage, progress_message = progress
+                        set_pod_creation_status(username, "waiting_ready", progress_message)
+
                 time.sleep(1)
             else:
                 failure_reason = failure_reason or f"pod not ready within {max_wait}s"
@@ -1633,17 +1644,36 @@ def _migrate_internal(data):
         release_nodeports(new_pod_name)
         raise
 
-    # 8. Ready 대기
-    for _ in range(60):
+    # 8. Ready 대기 (create-pod와 동일하게 POD_READY_MAX_WAIT_SEC를 쓴다 —
+    # 예전엔 60초로 하드코딩돼 있어서 이미지 pull이 오래 걸리는 이미지는
+    # create-pod보다 훨씬 먼저 실패 처리되는 불일치가 있었다.)
+    migrate_failure_reason = None
+    max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
+    last_progress_stage = None
+    for i in range(max_wait):
         pod = v1.read_namespaced_pod(new_pod_name, ns)
         if is_pod_ready(pod):
+            set_pod_creation_status(username, "ready", f"마이그레이션 완료 (node={best_node})")
             break
+        migrate_failure_reason = get_pod_failure_reason(pod)
+        if migrate_failure_reason:
+            break
+        if i % 5 == 0:
+            progress = get_pod_progress_stage(v1, ns, new_pod_name)
+            if progress and progress[0] != last_progress_stage:
+                last_progress_stage, progress_message = progress
+                set_pod_creation_status(username, "waiting_ready", progress_message)
         time.sleep(1)
     else:
+        migrate_failure_reason = migrate_failure_reason or f"pod not ready within {max_wait}s"
+
+    if migrate_failure_reason:
         # 새 Pod 실패 -> 정리 후 종료
+        app.logger.error(f"[MIGRATE] new pod failed to start: {migrate_failure_reason}")
+        set_pod_creation_status(username, "failed", "마이그레이션 실패")
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
-        return jsonify({"error": "new pod failed to start"}), 500
+        return jsonify({"error": "new pod failed to start", "detail": migrate_failure_reason}), 500
 
     # 9. 새 Pod 성공 후 Service 생성
     try:
