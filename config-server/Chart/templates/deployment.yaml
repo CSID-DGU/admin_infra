@@ -15,6 +15,11 @@ spec:
       labels:
         app: containerssh-config-server
     spec:
+      # 배포 롤링 업데이트가 진행 중인 요청(/create-pod 등, 최대 POD_READY_MAX_WAIT_SEC=500초
+      # + 전후 단계)을 SIGTERM으로 끊지 않도록 gunicorn --graceful-timeout보다 여유 있게 잡는다.
+      # 기본값 30초로는 롤링 업데이트 때마다 진행 중인 Pod 생성이 중간에 끊겨 계정만 삭제되고
+      # k8s Pod는 고아로 남는 문제가 있었다.
+      terminationGracePeriodSeconds: 630
       serviceAccountName: config-server
       {{- with .Values.nodeSelector }}{{/* nodeSelector 설정이 있으면 적용 */}}
       nodeSelector:
