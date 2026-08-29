@@ -36,6 +36,7 @@ from utils import (
     delete_user_home_directory,
     select_best_node_from_prometheus,
     resolve_k8s_node_name,
+    resolve_farm_home_mount_root,
     load_user_image,
     commit_and_save_user_image,
     create_nodeport_services,
@@ -63,11 +64,13 @@ app.config.from_mapping({
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
     "WAS_URL_TEMPLATE": "http://admin-prod.default/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
-    # admin_be의 podWebClient 응답 타임아웃(600s)보다 짧게 잡아야 한다 — 여기서
-    # 다 채워 기다린 뒤 실패 정리(Pod 삭제/nodeport 해제/krb5 정리)까지 하면
-    # admin_be가 먼저 타임아웃돼 버려서, 뒤에서는 끝났는데 앞에서는 실패로 보이는
-    # 문제가 재현된다. 정리 작업 여유(약 50s)를 남겨둔다.
-    "POD_READY_MAX_WAIT_SEC": 550,
+    # 타임아웃 체인은 안쪽 레이어가 바깥쪽보다 항상 짧아야 한다 (그래야 바깥쪽이
+    # 포기하기 전에 안쪽이 먼저 정상적으로 응답을 만들 기회를 가진다):
+    #   config-server(여기, 500s) < admin_be podWebClient(550s)
+    #     < nginx/ingress-nginx(570s) < 프론트(600s, "10분"으로 표시)
+    # 여기서 max_wait를 다 채운 뒤에도 실패 정리(Pod 삭제/nodeport 해제/krb5 정리)
+    # 시간이 추가로 필요해서, admin_be와의 버퍼(50s)를 남겨둔다.
+    "POD_READY_MAX_WAIT_SEC": 500,
 
     # Default resources
     "DEFAULT_CPU_REQUEST": "1000m",
@@ -90,9 +93,6 @@ app.config.from_mapping({
     "FARM_AD_SSH_USER":     os.getenv("FARM_AD_SSH_USER", ""),
     "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
     "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
-
-    # pod의 /home 볼륨이 바라볼, k8s 노드에 이미 마운트돼 있는 NFS 홈 루트
-    "FARM_HOME_MOUNT_ROOT": os.getenv("FARM_HOME_MOUNT_ROOT", "/home/tako2/share/user"),
 
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -1164,7 +1164,10 @@ def build_pod_spec(
         volumes = [
             {
                 "name": "nfs-home",
-                "hostPath": {"path": app.config["FARM_HOME_MOUNT_ROOT"], "type": "Directory"},
+                # 노드마다 로컬 NFS 마운트 경로(/home/tako<N>/share/user)가 다르므로
+                # 항상 이 Pod가 뜰 target_node 기준으로 계산한다 (전 노드 공통 고정값이었던
+                # 예전 FARM_HOME_MOUNT_ROOT는 farm2 외 노드에서 FailedMount를 유발했다).
+                "hostPath": {"path": resolve_farm_home_mount_root(target_node), "type": "Directory"},
             },
         ]
 

@@ -72,6 +72,25 @@ def resolve_k8s_node_name(candidate: Optional[str]) -> Optional[str]:
     return None
 
 
+FARM_NODE_NAME_PATTERN = re.compile(r"^farm(\d+)$", re.IGNORECASE)
+
+
+def resolve_farm_home_mount_root(target_node: str) -> str:
+    """farm<N> 노드명에서 그 노드 로컬의 NFS 마운트 경로(/home/tako<N>/share/user)를 도출한다.
+
+    각 farm 노드는 처음부터 자기 hostname 번호에 맞는 /home/tako<N>/share에만
+    NFS를 마운트해왔다(admin_infra_server의 remount-farm-user-share-krb.sh 참고).
+    그런데 코드는 FARM_HOME_MOUNT_ROOT 하나(기본값 /home/tako2/share/user, 즉 farm2의
+    경로)를 모든 노드에 그대로 썼던 버그가 있어서, farm2가 아닌 다른 노드(farm1, farm8 등)에
+    뜬 Pod는 전부 hostPath가 로컬에 없는 디렉터리를 가리켜 FailedMount로 영원히 Ready가
+    안 됐다. 노드 번호를 그대로 따라가도록 고친다.
+    """
+    match = FARM_NODE_NAME_PATTERN.match(target_node or "")
+    if not match:
+        raise ValueError(f"cannot derive farm home mount path for node: {target_node!r}")
+    return f"/home/tako{match.group(1)}/share/user"
+
+
 def is_pod_ready(pod):
     if pod.status.phase != "Running":
         return False
