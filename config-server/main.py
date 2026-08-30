@@ -1259,6 +1259,11 @@ def build_pod_spec(
                                                     {"name": "GID", "value": str(primary_gid)},
                                                     {"name": "HOME", "value": f"/home/{username}"},
                                                     {"name": "SHELL", "value": "/bin/bash"},
+                                                    # entrypoint.sh의 ensure_group_and_user()가 컨테이너 계정을 처음 만들 때
+                                                    # `echo "$USER_ID:$USER_PW" | chpasswd`로 로그인 비밀번호를 설정한다.
+                                                    # 이 값이 빠져 있으면 빈 비밀번호로 설정되어 이메일로 안내한 비밀번호로
+                                                    # 로그인이 되지 않는다.
+                                                    {"name": "USER_PW", "value": base64.b64decode(user_info["passwd_base64"], validate=True).decode("utf-8")},
                                                     {"name": "USER_GROUPS", "value": _build_user_groups_env(username, primary_group_name, primary_gid, gid_list)},
                                                     *([{"name": "ENABLE_VNC", "value": "true"}] if enable_vnc else []),
                                                     *([
