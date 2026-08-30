@@ -1271,6 +1271,17 @@ def build_pod_spec(
                                                         {"name": "DECS_KRB5_PRINCIPAL", "value": f"{username}@{app.config['KRB5_REALM']}"},
                                                     ] if app.config["KRB5_REALM"] else []),
                                                 ],
+                                                # readinessProbe가 없으면 k8s는 컨테이너 프로세스가 시작되기만 해도
+                                                # Ready로 본다. 실제로는 entrypoint.sh가 그 뒤에 계정 생성/비밀번호
+                                                # 설정/sshd 기동을 이어서 진행하므로, is_pod_ready()가 보는 Ready
+                                                # 조건이 실제 SSH 접속 가능 시점보다 먼저 참이 되는 문제가 있었다.
+                                                # sshd가 실제로 포트 22를 열 때까지 Ready를 미룬다.
+                                                "readinessProbe": {
+                                                    "tcpSocket": {"port": 22},
+                                                    "initialDelaySeconds": 2,
+                                                    "periodSeconds": 2,
+                                                    "failureThreshold": 30,
+                                                },
                                                 "resources": {
                                                     "requests": {
                                                         "cpu": app.config["DEFAULT_CPU_REQUEST"],
