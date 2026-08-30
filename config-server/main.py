@@ -755,7 +755,7 @@ def create_pod():
         # "이미지 pull / 컨테이너 기동 대기 중"처럼 두 단계를 합친 문구를 초기값으로도
         # 남기지 않는다 — 이벤트가 아직 안 잡힌 순간에도 이미 분리된 stage로 시작해서,
         # pulling_image/starting_container 둘 중 하나로만 노출되게 한다.
-        set_pod_creation_status(username, "pulling_image", "이미지 다운로드 준비 중")
+        set_pod_creation_status(username, "pulling_image", "이미지 다운로드 중")
         try:
             failure_reason = None
             max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
@@ -849,7 +849,7 @@ def create_pod():
         app.logger.info("[CREATE POD] services created successfully")
 
         app.logger.info(f"[CREATE POD] success - pod={pod_name}, node={best_node}")
-        set_pod_creation_status(username, "ready", f"생성 완료 (node={best_node})")
+        set_pod_creation_status(username, "ready", f"컨테이너 생성 완료 (node={best_node})")
 
         return jsonify({
             "status": "created",
@@ -890,7 +890,7 @@ def get_pod_status(username):
       - starting_container  : 이미지 준비 완료, 컨테이너 생성/시작 중
       - mount_retrying      : 볼륨 마운트 재시도 중 (아직 최종 실패는 아님)
       - creating_services   : NodePort Service 생성 중
-      - ready               : 생성 완료 (성공, 최종 상태)
+      - ready               : 컨테이너 생성 완료 (성공, 최종 상태)
       - failed              : 실패 (최종 상태. message에는 "krb5 배포 실패" 같은 카테고리만 담기며,
                                     보안상 상세 예외/k8s 에러 원문은 노출하지 않는다 — 상세 원인은 서버 로그 참조)
 
