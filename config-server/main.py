@@ -756,6 +756,7 @@ def create_pod():
         # 남기지 않는다 — 이벤트가 아직 안 잡힌 순간에도 이미 분리된 stage로 시작해서,
         # pulling_image/starting_container 둘 중 하나로만 노출되게 한다.
         set_pod_creation_status(username, "pulling_image", "이미지 다운로드 중")
+        app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage=pulling_image 이미지 다운로드 중")
         try:
             failure_reason = None
             max_wait = app.config["POD_READY_MAX_WAIT_SEC"]
@@ -778,6 +779,7 @@ def create_pod():
                     if progress and progress[0] != last_progress_stage:
                         last_progress_stage, progress_message = progress
                         set_pod_creation_status(username, last_progress_stage, progress_message)
+                        app.logger.info(f"[CREATE POD] username={username} pod={pod_name} stage={last_progress_stage} {progress_message}")
 
                 time.sleep(1)
             else:
@@ -1686,6 +1688,7 @@ def _migrate_internal(data):
             if progress and progress[0] != last_progress_stage:
                 last_progress_stage, progress_message = progress
                 set_pod_creation_status(username, last_progress_stage, progress_message)
+                app.logger.info(f"[MIGRATE] username={username} pod={new_pod_name} stage={last_progress_stage} {progress_message}")
         time.sleep(1)
     else:
         migrate_failure_reason = migrate_failure_reason or f"pod not ready within {max_wait}s"
@@ -1879,11 +1882,17 @@ def _get_farm_node_info(node_name: str) -> dict:
 def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -> str:
     """전용 서비스 계정으로 접속한다. 계정 쪽에 forced-command가 걸려 있어
     remote_command는 그대로 실행되지 않고 원격 스크립트가 참고하는 값으로만 쓰인다.
-    간헐적으로 최초 접속만 타임아웃되고 곧바로 재시도하면 성공하는 현상이 있어 타임아웃 시 1회 재시도한다."""
+    간헐적으로 최초 접속만 타임아웃되고 곧바로 재시도하면 성공하는 현상이 있었다 —
+    이 farm 환경엔 Kerberos(KRB5_REALM)가 있어 OpenSSH 클라이언트가 기본적으로
+    GSSAPI(Kerberos) 인증을 먼저 시도한 뒤 실패해야 키 인증으로 폴백하는데, 이 계정은
+    처음부터 -i 키 인증만 쓰므로 그 GSSAPI 협상 자체가 불필요한 지연 요인이었다.
+    명시적으로 꺼서 재시도에 의존하지 않고 매번 빠르게 붙도록 한다."""
     cmd = ["ssh",
            "-i", app.config["FARM_SSH_KEY_PATH"],
            "-o", "StrictHostKeyChecking=no",
            "-o", "BatchMode=yes",
+           "-o", "GSSAPIAuthentication=no",
+           "-o", "ConnectTimeout=10",
            "-p", str(port),
            f"{app.config['FARM_SSH_USER']}@{host}",
            remote_command]
