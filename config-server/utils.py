@@ -155,6 +155,19 @@ def get_pod_progress_stage(v1, namespace: str, pod_name: str):
 
 def get_pod_failure_reason(pod):
     if pod.status.phase == "Failed":
+        # pod.status.reason은 Evicted/NodeAffinity 같은 스케줄러 레벨 사유에만 채워지고,
+        # 컨테이너가 그냥 비정상 종료된 경우(가장 흔한 케이스)엔 비어있어 "PodFailed"로만
+        # 뭉뚱그려졌다. container_statuses[].state.terminated에 exit code/원인이 있으니
+        # 있으면 그걸 우선 사용한다.
+        for cs in (pod.status.container_statuses or []):
+            terminated = cs.state.terminated
+            if terminated:
+                detail = terminated.reason or "Error"
+                if terminated.exit_code is not None:
+                    detail += f" (exit={terminated.exit_code})"
+                if terminated.message:
+                    detail += f": {terminated.message}"
+                return f"PodFailed - {detail}"
         return pod.status.reason or "PodFailed"
     for cs in (pod.status.container_statuses or []):
         waiting = cs.state.waiting
