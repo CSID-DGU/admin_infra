@@ -2391,6 +2391,14 @@ def create_user():
                 delete_user_home_directory(name)
             except Exception:
                 pass
+            # _create_krb5_principal_and_secret는 AD principal 생성(①) 다음 k8s Secret
+            # 저장(②) 순으로 진행된다. ①만 성공하고 ②에서 실패해도 이 except는 그냥
+            # "실패"로 뭉뚱그려서 여기까지 오는데, 그러면 AD엔 이미 만들어진 principal이
+            # 그대로 남는다. 존재 여부와 무관하게 항상 삭제를 시도해 정리한다.
+            try:
+                _farm_ad_ssh(f"delete {name}")
+            except Exception:
+                app.logger.warning(f"[ACCOUNTS] 롤백 중 AD principal 삭제 실패(무시): {name}")
             _rollback_user(name)
             return jsonify(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}")), 500
 
@@ -2426,6 +2434,16 @@ def delete_user(username: str):
         required: true
         type: string
         example: user2100
+      - in: query
+        name: node_name
+        required: false
+        type: string
+        description: >
+          이번 삭제가 실제로 정리해야 하는 farm 노드. 주면 그 노드만 KRB5 정리를 시도한다.
+          안 주면(하위 호환) 예전처럼 설정된 모든 farm 노드를 훑는데, 이러면 이번 계정과
+          무관한 farm에 살아있는 동일 이름 레거시 계정까지 잘못 건드릴 수 있으니, 어느
+          노드에 배포했는지 아는 호출자는 반드시 넘겨야 한다.
+        example: farm2
 
     responses:
 
@@ -2442,6 +2460,8 @@ def delete_user(username: str):
       500:
         description: 서버 오류
     """
+    node_name = request.args.get("node_name")
+
     # Remove from /etc/passwd
     lines = read_passwd_lines()
     new_lines = []
@@ -2498,7 +2518,18 @@ def delete_user(username: str):
 
     if app.config.get("KRB5_REALM"):
         _delete_krb5_principal_and_secret(username)
-        _remove_krb5_from_all_farms(username)
+        if node_name:
+            try:
+                _remove_krb5_from_farm(username, node_name)
+            except Exception as e:
+                app.logger.warning(f"[KRB5] farm 정리 실패, 재조정 잡에 위임: {node_name} — {e}")
+                _record_krb5_cleanup_pending(username, node_name)
+        else:
+            app.logger.warning(
+                f"[ACCOUNTS] node_name 없이 사용자 삭제 요청됨 — 설정된 모든 farm 노드를 훑음: {username} "
+                "(무관한 farm의 동일 이름 레거시 계정을 건드릴 수 있음, 호출자가 node_name을 넘기도록 수정 필요)"
+            )
+            _remove_krb5_from_all_farms(username)
 
     return jsonify({"status": "deleted", "user": username})
 
