@@ -679,6 +679,9 @@ def create_pod():
                 str(e),
                 progress=e.progress,
                 pod_name=pod_name,
+                # 호출자(admin_be)가 계정 삭제 보상 트랜잭션을 실행할 때 이 노드만 정리하도록
+                # 넘겨주기 위함 — 없으면 대상 노드를 몰라서 전체 farm을 무차별로 훑게 된다.
+                node=best_node,
             )), 500
         except ValueError as e:
             set_pod_creation_status(username, "failed", "pod spec 생성 실패")
@@ -698,6 +701,7 @@ def create_pod():
                 str(e),
                 rollback={"nodeportsReleased": False},
                 pod_name=pod_name,
+                node=best_node,
             )), 500
         app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
 
