@@ -1930,7 +1930,14 @@ def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
 
     _farm_ssh(node["host"], node["port"], f"deploy {username} {uid}", stdin_data=keytab_b64)
     app.logger.info(f"[KRB5] farm 배포 완료 + TGT 확인됨: {username} → {node_name}")
-    _clear_krb5_cleanup_pending(username)
+    try:
+        _clear_krb5_cleanup_pending(username, node_name)
+    except Exception:
+        # 배포 자체는 이미 성공했으니 실패로 처리하지 않는다 — 다만 예전 정리 예약이
+        # 그대로 남아있을 수 있어서, 재조정 잡이 방금 배포한 keytab을 지울 위험이
+        # 있다는 걸 명확히 남긴다. 절대 이 예약을 새로 다시 걸지는 않는다(성공한
+        # 배포를 실패 경로로 되돌리는 꼴이 되므로).
+        app.logger.exception(f"[KRB5] cleanup_pending 정리 실패(수동 확인 필요, 배포 자체는 성공): {username} ← {node_name}")
 
 
 def _remove_krb5_from_farm(username: str, node_name: str) -> None:
@@ -1960,21 +1967,29 @@ def _record_krb5_cleanup_pending(username: str, node_name: str) -> None:
         conn.close()
 
 
-def _clear_krb5_cleanup_pending(username: str) -> None:
-    """이 유저의 계정/keytab이 지금 정상적으로 존재해야 한다는 게 확인된 시점(계정 생성,
-    pod용 keytab 배포 성공 등)에 호출한다. 예전에 실패했던 시도가 남긴 '나중에 삭제' 예약을
-    지워서, 재조정 잡이 방금 살려놓은 계정을 뒤늦게 지워버리는 사고를 막는다."""
+def _clear_krb5_cleanup_pending(username: str, node_name: str) -> None:
+    """_deploy_krb5_to_farm이 (username, node_name)에 대한 keytab 배포를 확인한 직후
+    호출한다. 예전에 실패했던 시도가 이 정확한 (username, node_name) 조합에 남긴 '나중에
+    삭제' 예약을 지워서, 재조정 잡이 방금 살려놓은 keytab을 뒤늦게 지워버리는 사고를 막는다.
+
+    username만으로 지우면 이번에 안 건드린 다른 노드의 정당한 정리 예약까지 같이
+    지워버리므로 반드시 node_name까지 조건에 건다 — krb5_cleanup_pending 자체가
+    (username, node_name) 조합으로 예약을 구분하는 테이블이다.
+
+    DB 실패는 조용히 삼키지 않고 그대로 올린다. 호출자가 "정리 예약이 그대로 남아있을
+    수 있다"는 걸 알고, 그렇다고 방금 성공한 배포를 실패로 되돌리지는 않게 대응해야
+    하기 때문이다."""
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM krb5_cleanup_pending WHERE username = %s",
-                (username,),
+                "DELETE FROM krb5_cleanup_pending WHERE username = %s AND node_name = %s",
+                (username, node_name),
             )
         conn.commit()
     except Exception:
-        app.logger.exception(f"[KRB5] cleanup_pending 정리 실패: {username}")
         conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -2414,7 +2429,13 @@ def create_user():
             _rollback_user(name)
             return jsonify(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}")), 500
 
-        _clear_krb5_cleanup_pending(name)
+        # 여기서는 아직 어느 farm 노드에도 keytab을 배포하지 않았다(그건 pod 생성 시
+        # build_pod_spec → _deploy_krb5_to_farm에서 함) — 그래서 지울 대상 node_name을
+        # 특정할 수 없다. krb5_cleanup_pending은 (username, node_name) 단위 예약이라
+        # node_name 없이 이 시점에 username만으로 지우면, 이번에 전혀 안 건드린 다른
+        # 노드의 정당한 정리 예약까지 같이 지워버릴 수 있다. 그래서 여기서는 정리하지
+        # 않고, 실제로 특정 노드에 배포가 확인되는 _deploy_krb5_to_farm에서만 그 노드
+        # 몫만 정리한다.
 
     return jsonify({
         "status": "created",
