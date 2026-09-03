@@ -1930,6 +1930,7 @@ def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
 
     _farm_ssh(node["host"], node["port"], f"deploy {username} {uid}", stdin_data=keytab_b64)
     app.logger.info(f"[KRB5] farm 배포 완료 + TGT 확인됨: {username} → {node_name}")
+    _clear_krb5_cleanup_pending(username)
 
 
 def _remove_krb5_from_farm(username: str, node_name: str) -> None:
@@ -1954,6 +1955,25 @@ def _record_krb5_cleanup_pending(username: str, node_name: str) -> None:
         conn.commit()
     except Exception:
         app.logger.exception(f"[KRB5] cleanup_pending 기록 실패: {username} ← {node_name}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def _clear_krb5_cleanup_pending(username: str) -> None:
+    """이 유저의 계정/keytab이 지금 정상적으로 존재해야 한다는 게 확인된 시점(계정 생성,
+    pod용 keytab 배포 성공 등)에 호출한다. 예전에 실패했던 시도가 남긴 '나중에 삭제' 예약을
+    지워서, 재조정 잡이 방금 살려놓은 계정을 뒤늦게 지워버리는 사고를 막는다."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM krb5_cleanup_pending WHERE username = %s",
+                (username,),
+            )
+        conn.commit()
+    except Exception:
+        app.logger.exception(f"[KRB5] cleanup_pending 정리 실패: {username}")
         conn.rollback()
     finally:
         conn.close()
@@ -2393,6 +2413,8 @@ def create_user():
                 pass
             _rollback_user(name)
             return jsonify(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}")), 500
+
+        _clear_krb5_cleanup_pending(name)
 
     return jsonify({
         "status": "created",
