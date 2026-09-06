@@ -1864,6 +1864,7 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
     처음부터 -i 키 인증만 쓰므로 그 GSSAPI 협상 자체가 불필요한 지연 요인이었다.
     명시적으로 꺼서 재시도에 의존하지 않고 매번 빠르게 붙도록 한다."""
     cmd = ["ssh",
+           "-v",
            "-i", app.config["FARM_SSH_KEY_PATH"],
            "-o", "StrictHostKeyChecking=no",
            "-o", "BatchMode=yes",
@@ -1876,14 +1877,25 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
     result = None
     last_error = None
     for attempt in range(2):
+        app.logger.info(f"[FARM SSH] {host}:{port} 접속 시도 {attempt+1}/2")
+        start = time.monotonic()
         try:
             result = subprocess.run(
                 cmd, input=stdin_data, capture_output=True, text=True, timeout=30,
             )
+            app.logger.info(f"[FARM SSH] {host}:{port} 접속 성공, {time.monotonic() - start:.1f}초 소요")
             break
         except subprocess.TimeoutExpired as e:
             last_error = e
-            app.logger.warning(f"[FARM SSH] {host}:{port} 타임아웃, 재시도 {attempt+1}/2")
+            # -v로 캡처된 ssh 자체의 디버그 트레이스를 그대로 남긴다. 어느 단계(TCP 연결/
+            # 배너 교환/키 교환/인증)에서 멈췄는지 이 로그만으로 바로 알 수 있어야,
+            # 다음에 같은 증상이 재발했을 때 원인 후보를 추론이 아니라 로그로 확인할 수 있다.
+            trace = (e.stderr or "").strip()
+            app.logger.warning(
+                f"[FARM SSH] {host}:{port} 타임아웃, 재시도 {attempt+1}/2, "
+                f"{time.monotonic() - start:.1f}초 경과 시점 ssh 트레이스 마지막 부분:\n"
+                f"{trace[-2000:]}"
+            )
     if result is None:
         raise last_error
 
