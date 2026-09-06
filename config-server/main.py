@@ -679,6 +679,9 @@ def create_pod():
                 str(e),
                 progress=e.progress,
                 pod_name=pod_name,
+                # 호출자(admin_be)가 계정 삭제 보상 트랜잭션을 실행할 때 이 노드만 정리하도록
+                # 넘겨주기 위함 — 없으면 대상 노드를 몰라서 전체 farm을 무차별로 훑게 된다.
+                node=best_node,
             )), 500
         except ValueError as e:
             set_pod_creation_status(username, "failed", "pod spec 생성 실패")
@@ -698,6 +701,7 @@ def create_pod():
                 str(e),
                 rollback={"nodeportsReleased": False},
                 pod_name=pod_name,
+                node=best_node,
             )), 500
         app.logger.debug(f"[CREATE POD] allocated ports: {allocated_ports}")
 
@@ -1639,9 +1643,11 @@ def _migrate_internal(data):
 
     pod_spec = spec_wrapper["config"]["kubernetes"]["pod"]
 
+    set_pod_creation_status(username, "creating_pod", f"마이그레이션: k8s pod 생성 중 (node={best_node})")
     try:
         v1.create_namespaced_pod(namespace=ns, body=pod_spec)
     except Exception:
+        set_pod_creation_status(username, "failed", "마이그레이션 실패: pod 생성 실패")
         release_nodeports(new_pod_name)
         raise
 
@@ -1678,6 +1684,7 @@ def _migrate_internal(data):
         return jsonify({"error": "new pod failed to start", "detail": migrate_failure_reason}), 500
 
     # 9. 새 Pod 성공 후 Service 생성
+    set_pod_creation_status(username, "creating_services", "마이그레이션: NodePort 서비스 생성 중")
     try:
         create_nodeport_services(
             username,
@@ -1686,22 +1693,35 @@ def _migrate_internal(data):
             allocated_ports
         )
     except Exception:
+        set_pod_creation_status(username, "failed", "마이그레이션 실패: 서비스 생성 실패")
         v1.delete_namespaced_pod(new_pod_name, ns)
         release_nodeports(new_pod_name)
         return jsonify({"error": "service creation failed"}), 500
 
-    # 10. 기존 Pod 정리
-    delete_nodeport_services(old_pod_name, ns)
-    release_nodeports(old_pod_name)
-    delete_pod_util(old_pod_name, ns)
+    # 10. 기존 Pod 정리 — 새 Pod는 이미 정상 기동되어 서비스 중이므로, 여기서 실패해도
+    # 마이그레이션 자체는 성공으로 응답한다 (호출자가 실패로 오인해 재시도하면 중복 Pod가 생길 수 있음).
+    # 다만 실패 사실은 응답에 남겨서 수동 정리가 필요함을 알 수 있게 한다.
+    old_pod_cleanup_failed = False
+    try:
+        delete_nodeport_services(old_pod_name, ns)
+        release_nodeports(old_pod_name)
+        delete_pod_util(old_pod_name, ns)
+    except Exception:
+        app.logger.exception(f"[MIGRATE] 기존 Pod({old_pod_name}) 정리 실패 — 새 Pod는 정상 기동됨, 수동 정리 필요")
+        old_pod_cleanup_failed = True
 
-    return jsonify({
+    set_pod_creation_status(username, "ready", f"마이그레이션 완료 (node={best_node})")
+
+    response = {
         "status": "migrated",
         "from": current_node,
         "to": best_node,
         "new_pod": new_pod_name,
         "ports": allocated_ports
-    }), 200
+    }
+    if old_pod_cleanup_failed:
+        response["old_pod_cleanup"] = "failed"
+    return jsonify(response), 200
 
 
 @app.route("/migrate", methods=["POST"])
@@ -1778,7 +1798,16 @@ def migrate():
     lock_path = f"/tmp/migrate-{username}.lock"
 
     with LockedFile(lock_path, "w"):
-        return _migrate_internal(data)
+        try:
+            return _migrate_internal(data)
+        except Exception as e:
+            app.logger.exception("[MIGRATE] unexpected error")
+            set_pod_creation_status(username, "failed", "마이그레이션 실패: 예기치 않은 오류")
+            return jsonify(infra_error(
+                "MIGRATE",
+                "MIGRATE_FAILED",
+                str(e),
+            )), 500
 
 
 
@@ -1918,6 +1947,14 @@ def _deploy_krb5_to_farm(username: str, uid: int, node_name: str) -> None:
 
     _farm_ssh(node["host"], node["port"], f"deploy {username} {uid}", stdin_data=keytab_b64)
     app.logger.info(f"[KRB5] farm 배포 완료 + TGT 확인됨: {username} → {node_name}")
+    try:
+        _clear_krb5_cleanup_pending(username, node_name)
+    except Exception:
+        # 배포 자체는 이미 성공했으니 실패로 처리하지 않는다 — 다만 예전 정리 예약이
+        # 그대로 남아있을 수 있어서, 재조정 잡이 방금 배포한 keytab을 지울 위험이
+        # 있다는 걸 명확히 남긴다. 절대 이 예약을 새로 다시 걸지는 않는다(성공한
+        # 배포를 실패 경로로 되돌리는 꼴이 되므로).
+        app.logger.exception(f"[KRB5] cleanup_pending 정리 실패(수동 확인 필요, 배포 자체는 성공): {username} ← {node_name}")
 
 
 def _remove_krb5_from_farm(username: str, node_name: str) -> None:
@@ -1943,6 +1980,33 @@ def _record_krb5_cleanup_pending(username: str, node_name: str) -> None:
     except Exception:
         app.logger.exception(f"[KRB5] cleanup_pending 기록 실패: {username} ← {node_name}")
         conn.rollback()
+    finally:
+        conn.close()
+
+
+def _clear_krb5_cleanup_pending(username: str, node_name: str) -> None:
+    """_deploy_krb5_to_farm이 (username, node_name)에 대한 keytab 배포를 확인한 직후
+    호출한다. 예전에 실패했던 시도가 이 정확한 (username, node_name) 조합에 남긴 '나중에
+    삭제' 예약을 지워서, 재조정 잡이 방금 살려놓은 keytab을 뒤늦게 지워버리는 사고를 막는다.
+
+    username만으로 지우면 이번에 안 건드린 다른 노드의 정당한 정리 예약까지 같이
+    지워버리므로 반드시 node_name까지 조건에 건다 — krb5_cleanup_pending 자체가
+    (username, node_name) 조합으로 예약을 구분하는 테이블이다.
+
+    DB 실패는 조용히 삼키지 않고 그대로 올린다. 호출자가 "정리 예약이 그대로 남아있을
+    수 있다"는 걸 알고, 그렇다고 방금 성공한 배포를 실패로 되돌리지는 않게 대응해야
+    하기 때문이다."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM krb5_cleanup_pending WHERE username = %s AND node_name = %s",
+                (username, node_name),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -2379,8 +2443,24 @@ def create_user():
                 delete_user_home_directory(name)
             except Exception:
                 pass
+            # _create_krb5_principal_and_secret는 AD principal 생성(①) 다음 k8s Secret
+            # 저장(②) 순으로 진행된다. ①만 성공하고 ②에서 실패해도 이 except는 그냥
+            # "실패"로 뭉뚱그려서 여기까지 오는데, 그러면 AD엔 이미 만들어진 principal이
+            # 그대로 남는다. 존재 여부와 무관하게 항상 삭제를 시도해 정리한다.
+            try:
+                _farm_ad_ssh(f"delete {name}")
+            except Exception:
+                app.logger.warning(f"[ACCOUNTS] 롤백 중 AD principal 삭제 실패(무시): {name}")
             _rollback_user(name)
             return jsonify(infra_error("CREATE_KRB5_PRINCIPAL", "KDC_FAILED", f"failed to create Kerberos principal for {name}")), 500
+
+        # 여기서는 아직 어느 farm 노드에도 keytab을 배포하지 않았다(그건 pod 생성 시
+        # build_pod_spec → _deploy_krb5_to_farm에서 함) — 그래서 지울 대상 node_name을
+        # 특정할 수 없다. krb5_cleanup_pending은 (username, node_name) 단위 예약이라
+        # node_name 없이 이 시점에 username만으로 지우면, 이번에 전혀 안 건드린 다른
+        # 노드의 정당한 정리 예약까지 같이 지워버릴 수 있다. 그래서 여기서는 정리하지
+        # 않고, 실제로 특정 노드에 배포가 확인되는 _deploy_krb5_to_farm에서만 그 노드
+        # 몫만 정리한다.
 
     return jsonify({
         "status": "created",
@@ -2414,6 +2494,16 @@ def delete_user(username: str):
         required: true
         type: string
         example: user2100
+      - in: query
+        name: node_name
+        required: false
+        type: string
+        description: >
+          이번 삭제가 실제로 정리해야 하는 farm 노드. 주면 그 노드만 KRB5 정리를 시도한다.
+          안 주면(하위 호환) 예전처럼 설정된 모든 farm 노드를 훑는데, 이러면 이번 계정과
+          무관한 farm에 살아있는 동일 이름 레거시 계정까지 잘못 건드릴 수 있으니, 어느
+          노드에 배포했는지 아는 호출자는 반드시 넘겨야 한다.
+        example: farm2
 
     responses:
 
@@ -2430,6 +2520,8 @@ def delete_user(username: str):
       500:
         description: 서버 오류
     """
+    node_name = request.args.get("node_name")
+
     # Remove from /etc/passwd
     lines = read_passwd_lines()
     new_lines = []
@@ -2486,7 +2578,18 @@ def delete_user(username: str):
 
     if app.config.get("KRB5_REALM"):
         _delete_krb5_principal_and_secret(username)
-        _remove_krb5_from_all_farms(username)
+        if node_name:
+            try:
+                _remove_krb5_from_farm(username, node_name)
+            except Exception as e:
+                app.logger.warning(f"[KRB5] farm 정리 실패, 재조정 잡에 위임: {node_name} — {e}")
+                _record_krb5_cleanup_pending(username, node_name)
+        else:
+            app.logger.warning(
+                f"[ACCOUNTS] node_name 없이 사용자 삭제 요청됨 — 설정된 모든 farm 노드를 훑음: {username} "
+                "(무관한 farm의 동일 이름 레거시 계정을 건드릴 수 있음, 호출자가 node_name을 넘기도록 수정 필요)"
+            )
+            _remove_krb5_from_all_farms(username)
 
     return jsonify({"status": "deleted", "user": username})
 
