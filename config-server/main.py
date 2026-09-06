@@ -95,6 +95,11 @@ app.config.from_mapping({
     "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
     "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
 
+    # GPU 유실 점검(check_gpu_pods.py)이 admin_be 내부 API(/api/internal/slack/notify)로
+    # 보낼 때 지정할 Slack webhook URL. 비어있으면 알림을 스킵하고 로그만 남긴다.
+    "INFRA_SLACK_WEBHOOK_URL": os.getenv("INFRA_SLACK_WEBHOOK_URL", ""),
+    "ADMIN_BE_INTERNAL_URL":   os.getenv("ADMIN_BE_INTERNAL_URL", "http://admin-prod.default"),
+
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
 
@@ -1212,7 +1217,9 @@ def build_pod_spec(
                                         "app": "ailab-guest",
                                         "managed-by": "ailab-infra",
                                         "username": username,
-                                        "pod_name": pod_name
+                                        "pod_name": pod_name,
+                                        # GPU 유실 점검 CronJob(check_gpu_pods.py)이 이 라벨로 대상을 고른다.
+                                        "has-gpu": "true" if num_gpu > 0 else "false"
                                     }
                                 },
                                 "spec": {
@@ -1264,25 +1271,6 @@ def build_pod_spec(
                                                     "periodSeconds": 2,
                                                     "failureThreshold": 30,
                                                 },
-                                                # GPU 디바이스는 컨테이너 생성 시점에만 주입되고 그 이후 호스트에서
-                                                # 재생성되면 갱신되지 않는다 (#139/#140 참고) — 이미 떠 있는 컨테이너를
-                                                # 무중단으로 복구할 방법이 없어서, 대신 GPU가 사라진 걸 감지하면
-                                                # 컨테이너를 통째로 다시 만들어 새로 주입받게 한다. num_gpu==0인
-                                                # pod에는 붙이지 않는다 (nvidia-smi 자체가 무의미).
-                                                # initialDelay/period/threshold를 넉넉히 잡아 sshd 기동 중 잠깐의
-                                                # 지연이나 순간적인 nvidia-smi 응답 지연으로 불필요하게 재시작되는
-                                                # 걸 방지한다.
-                                                **({
-                                                    "livenessProbe": {
-                                                        "exec": {
-                                                            "command": ["sh", "-c", "nvidia-smi -L | grep -q '^GPU'"]
-                                                        },
-                                                        "initialDelaySeconds": 60,
-                                                        "periodSeconds": 60,
-                                                        "timeoutSeconds": 10,
-                                                        "failureThreshold": 3,
-                                                    }
-                                                } if num_gpu > 0 else {}),
                                                 "resources": {
                                                     "requests": {
                                                         "cpu": app.config["DEFAULT_CPU_REQUEST"],
@@ -1297,10 +1285,7 @@ def build_pod_spec(
                                             }
                                         ],
                                         "volumes": volumes,
-                                        # GPU pod는 livenessProbe 실패 시 kubelet이 컨테이너를 재시작할 수 있어야
-                                        # 하므로 OnFailure로 둔다. GPU가 없는 pod는 기존과 동일하게 Never — 이
-                                        # 변경의 영향 범위를 GPU pod로만 좁힌다.
-                                        "restartPolicy": "OnFailure" if num_gpu > 0 else "Never"
+                                        "restartPolicy": "Never"
                                     }
                                 }
                             }
