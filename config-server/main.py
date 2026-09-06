@@ -1142,37 +1142,16 @@ def build_pod_spec(
                 break
     
         app.logger.info(f"[POD SPEC] resources cpu={cpu_limit} mem={memory_limit} gpu={num_gpu}")
-    
-        gpu_volume_mounts = []
-        gpu_volumes = []
 
-        if num_gpu > 0:
-            for i in range(num_gpu):
-                gpu_volume_mounts.append({
-                    "name": f"nvidia{i}",
-                    "mountPath": f"/dev/nvidia{i}"
-                })
-                gpu_volumes.append({
-                    "name": f"nvidia{i}",
-                    "hostPath": {
-                        "path": f"/dev/nvidia{i}",
-                        "type": "CharDevice"
-                    }
-                })
-
-            for dev in app.config["NVIDIA_AUX_DEVICES"]:
-                mount_name = dev.replace("-", "")
-                gpu_volume_mounts.append({
-                    "name": mount_name,
-                    "mountPath": f"/dev/{dev}"
-                })
-                gpu_volumes.append({
-                    "name": mount_name,
-                    "hostPath": {
-                        "path": f"/dev/{dev}",
-                        "type": "CharDevice"
-                    }
-                })
+        # GPU 디바이스는 개별 hostPath로 수동 마운트하지 않는다. 이미지에 baked-in된
+        # NVIDIA_VISIBLE_DEVICES=all과 노드의 기본 컨테이너 런타임(nvidia-container-runtime)이
+        # 컨테이너 생성 시점마다 현재 호스트 디바이스 상태를 다시 조회해서 알아서 주입해준다.
+        # 예전에는 /dev/nvidia{i}를 수동으로 bind mount했는데, 이 마운트는 마운트 시점의
+        # inode에 고정되기 때문에 이후 호스트에서 드라이버 리로드 등으로 디바이스 파일이
+        # 재생성되면 이미 떠 있던 컨테이너의 GPU 접근이 복구 불가능하게 끊기는 문제가 있었다
+        # (nvidia-container-runtime 훅과 중복/충돌하는 구조였음). 레거시 시스템(uid-gid,
+        # docker run --gpus device=all --runtime=nvidia)도 개별 디바이스를 수동 마운트하지
+        # 않는 방식이라 이 문제가 없었다.
 
         # NFS user-share 전체를 /home에 마운트 — 유저 격리는 chmod 700으로 처리
         # image-store PVC(pvc-image-store)는 제거 — 해당 PV의 NFS subdir가
@@ -1190,9 +1169,6 @@ def build_pod_spec(
                 "hostPath": {"path": resolve_farm_home_mount_root(target_node), "type": "Directory"},
             },
         ]
-
-        volume_mounts.extend(gpu_volume_mounts)
-        volumes.extend(gpu_volumes)
 
         if app.config["KRB5_REALM"]:
             # keytab은 컨테이너에 마운트하지 않는다 — farm 노드에만 배포하고 호스트가 갱신한 TGT만 공유한다.
