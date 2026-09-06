@@ -1916,8 +1916,12 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
         app.logger.info(f"[FARM SSH] {host}:{port} 접속 시도 {attempt+1}/2")
         start = time.monotonic()
         try:
+            # 원격 ailab-krb5-admin 스크립트는 자체적으로 kinit을 최대 30초(kinit_timeout)까지
+            # 기다린 뒤 응답한다. 클라이언트 타임아웃이 그것과 같은 30초면, 원격이 막 자기
+            # 한도를 다 채우고 정상적으로 응답하려는 순간 클라이언트가 먼저 끊어버리는 경합이
+            # 생긴다. 원격이 스스로 정리하고 응답할 시간을 확실히 벌어주기 위해 60초로 둔다.
             result = subprocess.run(
-                cmd, input=stdin_data, capture_output=True, text=True, timeout=30,
+                cmd, input=stdin_data, capture_output=True, text=True, timeout=60,
             )
             app.logger.info(f"[FARM SSH] {host}:{port} 접속 성공, {time.monotonic() - start:.1f}초 소요")
             break
