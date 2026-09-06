@@ -95,6 +95,11 @@ app.config.from_mapping({
     "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
     "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
 
+    # GPU 유실 점검(check_gpu_pods.py)이 admin_be 내부 API(/api/internal/slack/notify)로
+    # 보낼 때 지정할 Slack webhook URL. 비어있으면 알림을 스킵하고 로그만 남긴다.
+    "INFRA_SLACK_WEBHOOK_URL": os.getenv("INFRA_SLACK_WEBHOOK_URL", ""),
+    "ADMIN_BE_INTERNAL_URL":   os.getenv("ADMIN_BE_INTERNAL_URL", "http://admin-prod.default"),
+
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
 
@@ -1212,7 +1217,9 @@ def build_pod_spec(
                                         "app": "ailab-guest",
                                         "managed-by": "ailab-infra",
                                         "username": username,
-                                        "pod_name": pod_name
+                                        "pod_name": pod_name,
+                                        # GPU 유실 점검 CronJob(check_gpu_pods.py)이 이 라벨로 대상을 고른다.
+                                        "has-gpu": "true" if num_gpu > 0 else "false"
                                     }
                                 },
                                 "spec": {
@@ -1909,8 +1916,12 @@ def _farm_ssh(host: str, port: str, remote_command: str, stdin_data: str = "") -
         app.logger.info(f"[FARM SSH] {host}:{port} 접속 시도 {attempt+1}/2")
         start = time.monotonic()
         try:
+            # 원격 ailab-krb5-admin 스크립트는 자체적으로 kinit을 최대 30초(kinit_timeout)까지
+            # 기다린 뒤 응답한다. 클라이언트 타임아웃이 그것과 같은 30초면, 원격이 막 자기
+            # 한도를 다 채우고 정상적으로 응답하려는 순간 클라이언트가 먼저 끊어버리는 경합이
+            # 생긴다. 원격이 스스로 정리하고 응답할 시간을 확실히 벌어주기 위해 60초로 둔다.
             result = subprocess.run(
-                cmd, input=stdin_data, capture_output=True, text=True, timeout=30,
+                cmd, input=stdin_data, capture_output=True, text=True, timeout=60,
             )
             app.logger.info(f"[FARM SSH] {host}:{port} 접속 성공, {time.monotonic() - start:.1f}초 소요")
             break

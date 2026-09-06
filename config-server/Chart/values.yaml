@@ -45,6 +45,14 @@ security:
 krb5:
   realm: ""
 
+infra:
+  # GPU 유실 점검(check_gpu_pods.py)이 Slack 알림을 보낼 때 거치는 admin_be 내부 API.
+  # 실제 webhook URL 값은 Secret(config-server-infra-slack-secret, key: webhookUrl)으로
+  # 별도 관리 — 이 chart가 만들지 않으므로 배포 전에 직접 생성해야 한다:
+  #   kubectl create secret generic config-server-infra-slack-secret \
+  #     --from-literal=webhookUrl=<인프라 모니터링 채널 webhook URL> -n ailab-infra
+  adminBeInternalUrl: "http://admin-prod.default"
+
 
 config:
   namespace: ailab-infra
