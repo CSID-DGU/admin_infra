@@ -1,0 +1,35 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "containerssh-config-server.fullname" . }}-gpu-check
+  namespace: {{ .Values.config.namespace }}
+  labels:
+    app: containerssh-config-server
+spec:
+  # GPU 유실은 발견이 늦어질수록 사용자가 오래 방치되므로 krb5-reconcile(30분)보다 짧게 잡는다.
+  schedule: "*/10 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: containerssh-config-server
+        spec:
+          serviceAccountName: config-server
+          restartPolicy: OnFailure
+          containers:
+            - name: gpu-check
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["python", "check_gpu_pods.py"]
+              env:
+                - name: NAMESPACE
+                  value: "{{ .Values.config.namespace }}"
+                - name: ADMIN_BE_INTERNAL_URL
+                  value: "{{ .Values.infra.adminBeInternalUrl }}"
+                - name: INFRA_SLACK_WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: config-server-infra-slack-secret
+                      key: webhookUrl
+                      optional: true

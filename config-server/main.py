@@ -95,6 +95,11 @@ app.config.from_mapping({
     "FARM_AD_SSH_KEY_PATH": os.getenv("FARM_AD_SSH_KEY_PATH", ""),
     "FARM_AD_DC_NODES":     json.loads(os.getenv("FARM_AD_DC_NODES_JSON", "[]")),
 
+    # GPU 유실 점검(check_gpu_pods.py)이 admin_be 내부 API(/api/internal/slack/notify)로
+    # 보낼 때 지정할 Slack webhook URL. 비어있으면 알림을 스킵하고 로그만 남긴다.
+    "INFRA_SLACK_WEBHOOK_URL": os.getenv("INFRA_SLACK_WEBHOOK_URL", ""),
+    "ADMIN_BE_INTERNAL_URL":   os.getenv("ADMIN_BE_INTERNAL_URL", "http://admin-prod.default"),
+
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
 
@@ -1212,7 +1217,9 @@ def build_pod_spec(
                                         "app": "ailab-guest",
                                         "managed-by": "ailab-infra",
                                         "username": username,
-                                        "pod_name": pod_name
+                                        "pod_name": pod_name,
+                                        # GPU 유실 점검 CronJob(check_gpu_pods.py)이 이 라벨로 대상을 고른다.
+                                        "has-gpu": "true" if num_gpu > 0 else "false"
                                     }
                                 },
                                 "spec": {
