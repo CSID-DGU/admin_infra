@@ -41,8 +41,16 @@ def _get_expected_krb5_usernames_for_node(node_name: str) -> set:
 
 
 def reconcile_krb5_orphans() -> None:
-    """각 farm 노드의 keytab 목록과 '지금 이 노드에 떠 있어야 하는 username' 목록을 대조해
-    delete_pod/delete_user 흐름을 아예 타지 않은 고아(수동 조작, 코드 버그 등)까지 잡아낸다."""
+    """각 farm 노드의 keytab 목록과 '지금 이 노드에 떠 있어야 하는 username'(nodeport_allocations
+    기준) 목록을 대조해 delete_pod/delete_user 흐름을 아예 타지 않은 고아(수동 조작, 코드 버그 등)를
+    찾아낸다.
+
+    주의 — 지금은 자동 삭제하지 않고 후보만 로그로 남긴다. 레거시(마이그레이션 전) Docker
+    컨테이너 유저는 애초에 nodeport_allocations에 등록될 방법이 없어서, 이 대조만으로는
+    "아직 신시스템으로 안 옮긴, 지금도 살아서 쓰이는 레거시 계정"과 "진짜 고아"를 구분할 수
+    없다. 자동 삭제로 뒀다가 farm6의 레거시 계정 여러 개(2026-09-03 dry-run으로 확인, dm20020204/
+    donghyun2/jy/ohchanju3)가 한꺼번에 지워질 뻔한 적이 있다. 레거시 계정을 구분할 방법(예:
+    별도 allowlist/테이블)이 생기기 전까진 사람이 로그를 보고 직접 정리하는 게 안전하다."""
     for node in app.config["FARM_NODES"]:
         try:
             node_info = _get_farm_node_info(node["name"])
@@ -56,11 +64,10 @@ def reconcile_krb5_orphans() -> None:
         orphans = deployed_usernames - expected_usernames
 
         for username in orphans:
-            app.logger.warning(f"[KRB5 RECONCILE] 고아 keytab 발견: {username} @ {node['name']} — 정리")
-            try:
-                _remove_krb5_from_farm(username, node["name"])
-            except Exception as e:
-                app.logger.warning(f"[KRB5 RECONCILE] 고아 정리 실패(다음 주기에 재시도): {username} @ {node['name']} — {e}")
+            app.logger.warning(
+                f"[KRB5 RECONCILE] 고아 후보(자동 삭제 안 함, 확인 필요): {username} @ {node['name']} "
+                "— nodeport_allocations엔 없지만 레거시 계정일 수 있음, 직접 확인 후 정리할 것"
+            )
 
 
 if __name__ == "__main__":
