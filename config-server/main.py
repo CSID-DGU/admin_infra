@@ -1259,6 +1259,16 @@ def build_pod_spec(
                                                         {"name": "KRB5_REALM",          "value": app.config["KRB5_REALM"]},
                                                         {"name": "DECS_KRB5_PRINCIPAL", "value": f"{username}@{app.config['KRB5_REALM']}"},
                                                     ] if app.config["KRB5_REALM"] else []),
+                                                    # 이미지에 baked-in된 NVIDIA_VISIBLE_DEVICES=all을 덮어써서
+                                                    # nvidia-container-runtime의 env var 기반 자동 열거를 끈다.
+                                                    # GPU는 이제 k8s device plugin이 resources.limits의
+                                                    # nvidia.com/gpu 요청을 보고 CRI devices 필드로 명시적으로
+                                                    # 주입한다 — "void"는 그 경로만 쓰고 env var 경로는 쓰지
+                                                    # 말라는 NVIDIA 공식 권장값이다. all로 그대로 두면
+                                                    # nvidia-container-cli가 노드의 모든 GPU를 다시 열거하려
+                                                    # 시도해서, 죽은 GPU가 하나라도 있으면 device plugin이
+                                                    # 이미 걸러낸 뒤에도 컨테이너 생성이 실패할 수 있다.
+                                                    *([{"name": "NVIDIA_VISIBLE_DEVICES", "value": "void"}] if num_gpu > 0 else []),
                                                 ],
                                                 # readinessProbe가 없으면 k8s는 컨테이너 프로세스가 시작되기만 해도
                                                 # Ready로 본다. 실제로는 entrypoint.sh가 그 뒤에 계정 생성/비밀번호
@@ -1278,7 +1288,16 @@ def build_pod_spec(
                                                     },
                                                     "limits": {
                                                         "cpu": cpu_limit,
-                                                        "memory": memory_limit
+                                                        "memory": memory_limit,
+                                                        # nvidia.com/gpu는 확장 리소스라 requests를 별도로 안 줘도
+                                                        # limits와 같은 값으로 자동 적용된다. k8s device plugin이
+                                                        # 이 노드의 GPU num_gpu개를 전부 이 컨테이너에 배타적으로
+                                                        # 배정한다 — "호스트에서 쓰듯 통째로" 정책은 그대로 유지하되,
+                                                        # kubelet이 정식으로 추적하게 되어 daemon-reload에도 안전하고
+                                                        # (cgroup 규칙이 systemd가 아는 컨테이너 생성 절차의 일부가
+                                                        # 됨), device plugin의 Xid 헬스체크로 죽은 GPU는 애초에
+                                                        # 할당 후보에서 자동으로 빠진다.
+                                                        **({"nvidia.com/gpu": str(num_gpu)} if num_gpu > 0 else {})
                                                     }
                                                 },
                                                 "volumeMounts": volume_mounts

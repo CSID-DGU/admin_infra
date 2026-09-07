@@ -154,6 +154,13 @@ def get_pod_progress_stage(v1, namespace: str, pod_name: str):
 
 
 def get_pod_failure_reason(pod):
+    # 리소스 부족(예: nvidia.com/gpu 부족)으로 스케줄링 자체가 안 되면 pod는 Pending에
+    # 계속 머물고 container_statuses는 아예 비어있다 (컨테이너 시도조차 안 됐으므로).
+    # 이걸 못 잡으면 POD_READY_MAX_WAIT_SEC(500초)를 다 채운 뒤에야 애매한 타임아웃
+    # 메시지로 실패한다 — PodScheduled 컨디션을 먼저 확인해 빠르고 명확하게 실패시킨다.
+    for cond in (pod.status.conditions or []):
+        if cond.type == "PodScheduled" and cond.status == "False" and cond.reason == "Unschedulable":
+            return f"Unschedulable: {cond.message}"
     if pod.status.phase == "Failed":
         # pod.status.reason은 Evicted/NodeAffinity 같은 스케줄러 레벨 사유에만 채워지고,
         # 컨테이너가 그냥 비정상 종료된 경우(가장 흔한 케이스)엔 비어있어 "PodFailed"로만
