@@ -152,7 +152,9 @@ ContainerSSH가 사용자별 GPU Pod를 만들고 지우는 데 필요한 Flask 
 
 `POST /migrate`는 실행 중인 사용자 Pod를 더 나은 GPU 노드로 옮기는 API이다. `migrate()` 자체는 username 기준 lock 파일(`/tmp/migrate-<username>.lock`)을 잡아 같은 사용자의 migration이 동시에 실행되지 않게 하고, 실제 로직은 `_migrate_internal()`이 처리한다.
 
-`_migrate_internal()`은 먼저 현재 실행 중인 Pod를 찾고, 요청으로 받은 후보 노드 목록을 실제 Kubernetes node 이름으로 정규화한다. 현재 노드가 후보 목록에 없으면 잘못된 요청으로 보고, 후보가 현재 노드뿐이면 skip한다. 요청에 `same_node`가 true로 오면 현재 노드를 후보에서 빼지 않으므로, 점수 비교 결과에 따라 같은 노드에 Pod를 다시 만드는 재시작으로 동작할 수 있다. 이때도 새 Pod가 Ready가 된 뒤에 기존 Pod를 지우는 순서는 그대로다. `same_node`를 생략하면 기존과 동일하게 현재 노드를 후보에서 제외한다.
+`_migrate_internal()`은 먼저 현재 실행 중인 Pod를 찾고, 요청으로 받은 후보 노드 목록을 실제 Kubernetes node 이름으로 정규화한다. 현재 노드가 후보 목록에 없으면 잘못된 요청으로 본다. `same_node`가 false이거나 생략된 경우에는 현재 노드를 후보에서 제외하므로, 후보가 현재 노드뿐이면 skip한다.
+
+`same_node`를 true로 보내면 현재 노드를 후보에서 빼지 않아서 같은 노드에 Pod를 다시 만드는 재시작으로 동작할 수 있다. 다만 아래 설명하는 점수 비교는 그대로 적용된다. 현재 노드가 이미 가장 좋은 후보이면 개선 폭이 0이라 기본값 `min_improvement_ratio = 0.2` 기준으로는 skip되므로, 재시작 목적으로 호출할 때는 `min_improvement_ratio`를 0으로 함께 보내야 한다. 재시작으로 동작할 때도 새 Pod가 Ready가 된 뒤에 기존 Pod를 지우는 순서는 그대로다.
 
 그 다음 Prometheus GPU score를 현재 노드와 다른 후보 노드들에 대해 계산한다. 가장 좋은 후보 노드의 점수가 현재 노드보다 `min_improvement_ratio`만큼 충분히 좋아야 migration을 진행한다. 개선 폭이 부족하면 Pod를 건드리지 않고 skip 응답을 반환한다.
 

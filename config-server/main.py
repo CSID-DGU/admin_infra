@@ -1562,6 +1562,8 @@ def _migrate_internal(data):
     min_ratio = data.get("min_improvement_ratio", 0.2)
     # True면 현재 노드도 후보로 남겨서 같은 노드로의 재배치(재시작)를 허용한다.
     same_node = data.get("same_node", False)
+    if not isinstance(same_node, bool):
+        return jsonify({"error": "same_node must be a boolean"}), 400
 
     ns = app.config["NAMESPACE"]
 
@@ -1785,7 +1787,9 @@ def migrate():
               example: 0.2
             same_node:
               type: boolean
-              description: true면 현재 노드도 후보에 포함해 같은 노드로의 재배치를 허용한다. 생략 시 false
+              description: >
+                true면 현재 노드도 후보에 포함해 같은 노드로의 재배치를 허용한다. 생략 시 false.
+                점수 비교는 그대로 적용되므로, 재시작 목적이면 min_improvement_ratio를 0으로 함께 보내야 한다.
               example: false
 
     responses:
