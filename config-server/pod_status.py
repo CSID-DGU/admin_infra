@@ -12,8 +12,11 @@ r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=
 STATUS_TTL_SEC = 3600  # 완료/실패 후에도 조회 가능하도록 1시간 유지, 이후 자동 만료
 
 
-def set_pod_creation_status(username: str, stage: str, message: str = "") -> None:
-    key = f"pod_status:{username}"
+def set_pod_creation_status(key_value, stage: str, message: str = "") -> None:
+    # key_value는 create-pod 경로에서는 request_id, migrate 경로에서는 아직 username이다
+    # (한 사용자가 Pod를 여러 개 동시에 만들 수 있게 되면서, username 하나로는 서로 다른
+    # 생성 시도의 진행 상황이 같은 키에서 덮어써져 구분이 안 됐다).
+    key = f"pod_status:{key_value}"
     data = {
         "stage": stage,
         "message": message,
@@ -25,8 +28,8 @@ def set_pod_creation_status(username: str, stage: str, message: str = "") -> Non
         pass  # 상태 조회는 부가 기능 — Redis 장애가 pod 생성 자체를 막으면 안 됨
 
 
-def get_pod_creation_status(username: str):
-    key = f"pod_status:{username}"
+def get_pod_creation_status(key_value):
+    key = f"pod_status:{key_value}"
     raw = r.get(key)
     if raw is None:
         return None
