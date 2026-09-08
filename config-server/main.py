@@ -78,6 +78,13 @@ app.config.from_mapping({
     "DEFAULT_MEM_REQUEST": "1024Mi",
     "DEFAULT_CPU_LIMIT":  "1000m",
     "DEFAULT_MEM_LIMIT":  "1024Mi",
+    # ephemeral-storage request가 없으면(예전 상태) kubelet이 노드 디스크 압박 시 그 Pod의
+    # 실제 사용량과 무관하게 "request 대비 초과 사용"으로 잡아 무조건 축출 1순위로 삼는다 —
+    # 노드가 꽉 찬 진짜 원인(오래된 이미지 등)과 무관한 Pod가 대신 죽는 문제가 있었다.
+    # request를 걸어두면 그만큼은 이 Pod 몫으로 확보되고, 축출 판단도 실제 사용량 기준으로
+    # 공평해진다. limit은 한 Pod가 노드 디스크를 독점하지 못하게 막는 안전장치다.
+    "DEFAULT_EPHEMERAL_STORAGE_REQUEST": "5Gi",
+    "DEFAULT_EPHEMERAL_STORAGE_LIMIT": "50Gi",
 
     # NFS
     "NFS_USER_SHARE_PATH": os.getenv("NFS_USER_SHARE_PATH", "/volume1/share/user"),
@@ -1296,11 +1303,13 @@ def build_pod_spec(
                                                 "resources": {
                                                     "requests": {
                                                         "cpu": app.config["DEFAULT_CPU_REQUEST"],
-                                                        "memory": app.config["DEFAULT_MEM_REQUEST"]
+                                                        "memory": app.config["DEFAULT_MEM_REQUEST"],
+                                                        "ephemeral-storage": app.config["DEFAULT_EPHEMERAL_STORAGE_REQUEST"]
                                                     },
                                                     "limits": {
                                                         "cpu": cpu_limit,
-                                                        "memory": memory_limit
+                                                        "memory": memory_limit,
+                                                        "ephemeral-storage": app.config["DEFAULT_EPHEMERAL_STORAGE_LIMIT"]
                                                     }
                                                 },
                                                 "volumeMounts": volume_mounts
