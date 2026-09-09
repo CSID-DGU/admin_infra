@@ -34,7 +34,27 @@ def get_db_connection():
     except Exception:
         app.logger.exception("Failed to create DB connection")
         raise
-    
+
+# operation_log 전용 MySQL(log-mysql, operation_state_db) 접속을 위한 함수
+def get_log_db_connection():
+    try:
+        app.logger.debug("Creating log DB connection")
+
+        conn = pymysql.connect(
+            host=os.environ["LOG_DB_HOST"],
+            user=os.environ["LOG_DB_USER"],
+            password=os.environ["LOG_DB_PASSWORD"],
+            database=os.environ["LOG_DB_NAME"],
+            autocommit=False
+        )
+
+        app.logger.debug("Log DB connection established")
+        return conn
+
+    except Exception:
+        app.logger.exception("Failed to create log DB connection")
+        raise
+
 def load_k8s():
     # k8s client 초기
     try:

@@ -1,0 +1,75 @@
+# operation_log(v1.0)/access_state(v3.0)를 저장하는 전용 MySQL 인스턴스
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: log-mysql
+  namespace: ailab-infra
+spec:
+  serviceName: log-mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: log-mysql
+  template:
+    metadata:
+      labels:
+        app: log-mysql
+    spec:
+      # infra-mysql과 물리적으로 분리하기 위해 farm2 노드에 고정 배치
+      nodeSelector:
+        kubernetes.io/hostname: farm2
+      containers:
+      - name: mysql
+        image: mysql:8.0.36
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: log-mysql-secret
+              key: MYSQL_ROOT_PASSWORD
+        - name: MYSQL_DATABASE
+          value: operation_state_db
+        - name: MYSQL_USER
+          value: log_db_user
+        - name: MYSQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: log-mysql-secret
+              key: MYSQL_PASSWORD
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+        volumeMounts:
+        - name: mysql-data
+          mountPath: /var/lib/mysql
+
+  volumeClaimTemplates:
+  - metadata:
+      name: mysql-data
+    spec:
+      storageClassName: local-path
+      accessModes:
+        - ReadWriteOnce
+      resources:
+        requests:
+          storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: log-mysql
+  namespace: ailab-infra
+spec:
+  type: ClusterIP
+  selector:
+    app: log-mysql
+  ports:
+  - port: 3306
+    targetPort: 3306
