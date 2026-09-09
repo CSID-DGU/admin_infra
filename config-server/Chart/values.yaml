@@ -68,6 +68,16 @@ db:
   name: "pod_port_db"
   user: "pod_port_user"
 
+# v1.0 operation_log 전용 MySQL(infra-mysql과 물리적으로 분리된 별도 인스턴스,
+# farm2 노드). 비밀번호는 이 chart가 안 만듦 — 배포 전에 직접 생성해야 한다:
+#   kubectl -n ailab-infra create secret generic log-mysql-secret \
+#     --from-literal=MYSQL_ROOT_PASSWORD=<값> \
+#     --from-literal=MYSQL_PASSWORD=<값>
+logDb:
+  host: "log-mysql"
+  name: "operation_state_db"
+  user: "log_db_user"
+
 redis:
   host: redis-bg-master.ailab-infra.svc.cluster.local
   port: 6379
