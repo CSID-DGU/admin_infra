@@ -1,0 +1,99 @@
+name: Deploy Proposed Stack
+
+# 제안 시스템 실험 스택(ailab-noprobe / ailab-full)을 띄우거나 내린다. 수동 실행 전용이다.
+# 코드는 CSID-DGU/admin_infra-proposed에서 가져오고, 배포 시크릿은 이 레포의 것을 쓴다.
+# 운영 배포(deploy-config-server.yaml)와 트리거, 이미지 이름(config-server-exp), 배포 서버의 차트
+# 복사 경로(~/deploy-temp-exp), helm 릴리스명(config-server-<stack>)이 모두 달라 운영에 닿지 않는다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "스택"
+        type: choice
+        options: [noprobe, full]
+        required: true
+      ref:
+        description: "admin_infra-proposed의 브랜치·태그·커밋 (두 스택에 같은 코드를 올릴 때는 같은 커밋을 준다)"
+        default: develop
+        required: true
+      action:
+        description: "up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
+        type: choice
+        options: [up, down]
+        default: up
+
+concurrency:
+  group: proposed-stack-${{ inputs.stack }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 제안 시스템 코드 체크아웃
+        uses: actions/checkout@v4
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: ${{ inputs.ref }}
+          path: proposed
+
+      - name: 배포할 커밋
+        id: src
+        run: |
+          SHA=$(git -C proposed rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "admin_infra-proposed @ $SHA"
+
+      - name: Docker Hub 로그인
+        if: inputs.action == 'up'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: config-server 이미지 빌드
+        if: inputs.action == 'up'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./proposed/config-server
+          file: ./proposed/config-server/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}
+
+      - name: 배포 서버의 이전 복사본 정리
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.K8S_HOST }}
+          username: ${{ secrets.K8S_USERNAME }}
+          key: ${{ secrets.K8S_PRIVATE_KEY }}
+          port: ${{ secrets.K8S_PORT }}
+          script: rm -rf ~/deploy-temp-exp/${{ inputs.stack }} && mkdir -p ~/deploy-temp-exp/${{ inputs.stack }}
+
+      - name: 차트와 설치 스크립트 복사
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.K8S_HOST }}
+          username: ${{ secrets.K8S_USERNAME }}
+          key: ${{ secrets.K8S_PRIVATE_KEY }}
+          port: ${{ secrets.K8S_PORT }}
+          source: "proposed/config-server/Chart,proposed/pvc-image-chart,proposed/infra-sql,proposed/ops/proposed-stack"
+          target: "~/deploy-temp-exp/${{ inputs.stack }}"
+          strip_components: 1
+
+      - name: 실행
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.K8S_HOST }}
+          username: ${{ secrets.K8S_USERNAME }}
+          key: ${{ secrets.K8S_PRIVATE_KEY }}
+          port: ${{ secrets.K8S_PORT }}
+          command_timeout: 40m
+          script: |
+            cd ~/deploy-temp-exp/${{ inputs.stack }}
+            if [ "${{ inputs.action }}" = "up" ]; then
+              bash ops/proposed-stack/stack-up.sh ${{ inputs.stack }} ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}
+            else
+              bash ops/proposed-stack/stack-down.sh ${{ inputs.stack }}
+            fi
