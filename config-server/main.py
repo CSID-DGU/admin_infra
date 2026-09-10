@@ -59,13 +59,24 @@ app.logger.setLevel(logging.DEBUG)
 
 # ---- Global app configuration ----
 BASE_ETC_DIR = "/kube_share"
+
+# 같은 코드를 다른 네임스페이스에 한 벌 더 띄울 때(제안 시스템 실험 스택 등) 운영과 겹치면 안
+# 되는 값들. 기본값은 운영의 현재 동작과 같다.
+# admin_be 주소 — Pod 생성 시 사용자 설정 조회(WAS)와 내부 알림 중계가 모두 여기로 간다.
+ADMIN_BE_INTERNAL_URL = os.getenv("ADMIN_BE_INTERNAL_URL", "http://admin-prod.default").rstrip("/")
+# UID/GID 대역 — AD uidNumber와 NAS 홈 소유권은 스택이 달라도 공유되므로 대역이 겹치면 안 된다.
+UID_MIN = int(os.getenv("UID_MIN", "20000"))
+UID_MAX = int(os.getenv("UID_MAX", "0")) or None
+# 사용자 Pod NodePort 대역 — 클러스터 전체에서 공유되므로 스택끼리 같은 순간 같은 포트를 고르지 않게 나눈다.
+NODEPORT_MIN = int(os.getenv("NODEPORT_MIN", "30000"))
+NODEPORT_MAX = int(os.getenv("NODEPORT_MAX", "32767"))
 app.config.from_mapping({
     # Namespace
     "NAMESPACE": "ailab-infra",
 
     # External endpoints & timeouts
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
-    "WAS_URL_TEMPLATE": "http://admin-prod.default/api/requests/config/{username}",
+    "WAS_URL_TEMPLATE": ADMIN_BE_INTERNAL_URL + "/api/requests/config/{username}",
     "HTTP_TIMEOUT_SEC": 3.0,
     # 타임아웃 체인은 안쪽 레이어가 바깥쪽보다 항상 짧아야 한다 (그래야 바깥쪽이
     # 포기하기 전에 안쪽이 먼저 정상적으로 응답을 만들 기회를 가진다):
@@ -107,7 +118,7 @@ app.config.from_mapping({
     # GPU 유실 점검(check_gpu_pods.py)이 admin_be 내부 API(/api/internal/slack/notify)로
     # 보낼 때 지정할 Slack webhook URL. 비어있으면 알림을 스킵하고 로그만 남긴다.
     "INFRA_SLACK_WEBHOOK_URL": os.getenv("INFRA_SLACK_WEBHOOK_URL", ""),
-    "ADMIN_BE_INTERNAL_URL":   os.getenv("ADMIN_BE_INTERNAL_URL", "http://admin-prod.default"),
+    "ADMIN_BE_INTERNAL_URL":   ADMIN_BE_INTERNAL_URL,
 
     # image store
     "IMAGE_STORE_DIR": "/image-store/images",
@@ -344,7 +355,7 @@ def allocate_nodeports(username, pod_name, node_name, ports):
 
             app.logger.debug(f"[NODEPORT] used ports count={len(used)}")
             available = [
-                p for p in range(30000, 32768)
+                p for p in range(NODEPORT_MIN, NODEPORT_MAX + 1)
                 if p not in used
             ]
 
@@ -2527,7 +2538,16 @@ def create_user():
                               error_code="USER_ALREADY_EXISTS", error_detail="user already exists")
                 return jsonify({"error": "user already exists"}), 409
 
-            uid = _allocate_next_uid(lines)
+            uid = _allocate_next_uid(lines, min_uid=UID_MIN)
+            if UID_MAX is not None and uid > UID_MAX:
+                log_operation(request_id=request_id, username=name, resource_type="account",
+                              action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                              error_code="UID_RANGE_EXHAUSTED",
+                              error_detail=f"next uid {uid} exceeds UID_MAX {UID_MAX}")
+                return jsonify(infra_error(
+                    "CREATE_ACCOUNT", "UID_RANGE_EXHAUSTED",
+                    f"uid range {UID_MIN}~{UID_MAX} exhausted",
+                )), 500
             gid = uid
             app.logger.info(f"[ACCOUNTS] auto-assigned uid={uid} gid={gid} for user={name}")
 
@@ -3077,7 +3097,9 @@ def add_group():
             return jsonify({"error": f"group already exists (name: {name})"}), 409
 
         if gid is None:
-            gid = _allocate_next_gid(g_lines)
+            gid = _allocate_next_gid(g_lines, min_gid=UID_MIN)
+            if UID_MAX is not None and gid > UID_MAX:
+                return jsonify({"error": f"gid range {UID_MIN}~{UID_MAX} exhausted"}), 500
         elif any((parse_group_line(gl) or {}).get("gid") == gid for gl in g_lines):
             return jsonify({"error": f"group already exists (gid: {gid})"}), 409
 

@@ -11,7 +11,11 @@ from kubernetes import client
 from kubernetes.stream import stream
 import requests
 
-NAMESPACE = "ailab-infra"
+import os
+
+# 같은 차트를 다른 네임스페이스에 띄우면 그 네임스페이스의 Pod만 점검해야 한다. 하드코딩돼
+# 있으면 다른 스택의 크론잡이 운영 Pod를 점검하고 운영 채널로 알림을 보낸다.
+NAMESPACE = os.getenv("NAMESPACE", "ailab-infra")
 GPU_POD_LABEL_SELECTOR = "has-gpu=true"
 EXEC_TIMEOUT_SEC = 15
 

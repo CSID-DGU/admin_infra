@@ -54,6 +54,16 @@ infra:
   adminBeInternalUrl: "http://admin-prod.default"
 
 
+# 계정 UID/GID 대역. uidMax 0은 상한 없음. 다른 스택을 띄울 때는 운영과 겹치지 않는 대역을 준다.
+accounts:
+  uidMin: 20000
+  uidMax: 0
+
+# 사용자 Pod에 배정할 NodePort 대역. 클러스터 전체에서 공유되므로 스택마다 나눈다.
+nodeport:
+  min: 30000
+  max: 32767
+
 config:
   namespace: ailab-infra
 
