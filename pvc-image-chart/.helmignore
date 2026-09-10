@@ -1,3 +1,2 @@
-templates/README.md
 # templates/ 안의 설명 문서는 helm이 매니페스트로 해석하려다 렌더링이 실패한다.
 templates/README.md
