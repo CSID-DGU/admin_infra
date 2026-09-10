@@ -1529,9 +1529,8 @@ def delete_pod():
 
         rest = pod_name[len("ailab-"):]
         username = rest.rsplit("-", 1)[0]
-        # delete-pod는 admin_be가 아직 request_id를 안 보낸다(create-pod와 달리).
-        # 없으면 이 삭제 호출 하나만을 묶는 값을 자체 생성 — 나중에 admin_be가
-        # request_id를 보내기 시작하면 그 값을 그대로 쓰게 됨(코드 변경 불필요).
+        # admin_be는 이 Pod를 만든 신청 PK를 request_id로 보낸다. 대응하는 신청이 없는
+        # 고아 Pod 정리처럼 값이 없는 호출은 이 삭제 호출 하나만을 묶는 임시 키로 기록한다.
         request_id = data.get("request_id") or f"{username}-DELETE-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
         app.logger.info(f"[DELETE POD] parsed username={username}")
@@ -2507,11 +2506,9 @@ def create_user():
 
     ensure_etc_layout()
 
-    # create-pod는 admin_be가 request_id를 넘겨주지만, /accounts/users(이 엔드포인트)엔
-    # 아직 그 필드가 없다 — 오면 그대로 쓰고, 없으면 이 계정생성 호출 하나만을 묶는
-    # 값을 자체 생성한다(나중에 admin_be가 같은 request_id를 create-pod와 공유해서
-    # 보내주기 시작하면, 계정생성 로그와 Pod생성 로그가 자동으로 하나의 request_id로
-    # 묶이게 됨 — 코드 변경 불필요).
+    # admin_be는 /create-pod와 같은 신청 PK를 request_id로 보낸다. 그래야 한 승인의 계정
+    # 생성 이력과 Pod 생성 이력이 하나의 request_id로 묶인다. 값이 없는 호출(직접 호출 등)은
+    # 이 계정생성 호출 하나만을 묶는 임시 키로 기록한다.
     request_id = data.get("request_id") or f"{name}-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
 
     # 1) passwd — LOCK_EX를 read부터 write까지 유지해 uid 중복 배정 방지
@@ -2643,25 +2640,38 @@ def create_user():
             _rollback_user(name)
             return jsonify({"error": "failed to create sudoers file"}), 500
 
+    # passwd/group/shadow/sudoers까지가 계정 단계다. 홈과 Kerberos는 별도 단계로 기록해야
+    # 단계별 소요시간이 나뉘고 어느 단계에서 실패했는지가 action으로 드러난다. 뒤 단계가
+    # 실패하면 _rollback_user가 계정을 되돌리므로, 여기서 SUCCESS가 찍힌 계정이 이후
+    # 롤백됐는지는 같은 request_id의 뒤 단계 FAIL 행으로 판별한다.
+    log_operation(request_id=request_id, username=name, resource_type="account",
+                  action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
+
     # 5) NAS SSH로 홈 디렉터리 생성
+    log_operation(request_id=request_id, username=name, resource_type="storage",
+                  action=Action.CREATE_HOME, phase=Phase.START)
     try:
         create_user_home_directory(name, uid, gid)
     except Exception as e:
         app.logger.exception("[ACCOUNTS] home dir creation failed for user=%s, rolling back", name)
         log_operation(request_id=request_id, username=name, resource_type="storage",
-                      action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                      action=Action.CREATE_HOME, phase=Phase.FAIL,
                       error_code="NAS_SSH_FAILED", error_detail=str(e))
         _rollback_user(name)
         return jsonify(infra_error("CREATE_HOME_DIRECTORY", "NAS_SSH_FAILED", f"failed to create home directory for {name}")), 500
+    log_operation(request_id=request_id, username=name, resource_type="storage",
+                  action=Action.CREATE_HOME, phase=Phase.SUCCESS)
 
     # 6) Kerberos principal 생성 + keytab k8s Secret 저장
     if app.config.get("KRB5_REALM"):
+        log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                      action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.START)
         try:
             _create_krb5_principal_and_secret(name, uid, gid)
         except Exception as e:
             app.logger.exception("[ACCOUNTS] KRB5 principal creation failed for user=%s, rolling back", name)
             log_operation(request_id=request_id, username=name, resource_type="kerberos",
-                          action=Action.CREATE_ACCOUNT, phase=Phase.FAIL,
+                          action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.FAIL,
                           error_code="KDC_FAILED", error_detail=str(e))
             try:
                 delete_user_home_directory(name)
@@ -2685,9 +2695,9 @@ def create_user():
         # 노드의 정당한 정리 예약까지 같이 지워버릴 수 있다. 그래서 여기서는 정리하지
         # 않고, 실제로 특정 노드에 배포가 확인되는 _deploy_krb5_to_farm에서만 그 노드
         # 몫만 정리한다.
+        log_operation(request_id=request_id, username=name, resource_type="kerberos",
+                      action=Action.CREATE_KRB5_PRINCIPAL, phase=Phase.SUCCESS)
 
-    log_operation(request_id=request_id, username=name, resource_type="account",
-                  action=Action.CREATE_ACCOUNT, phase=Phase.SUCCESS)
     return jsonify({
         "status": "created",
         "user": entry,
@@ -2730,6 +2740,16 @@ def delete_user(username: str):
           무관한 farm에 살아있는 동일 이름 레거시 계정까지 잘못 건드릴 수 있으니, 어느
           노드에 배포했는지 아는 호출자는 반드시 넘겨야 한다.
         example: farm2
+      - in: query
+        name: request_id
+        required: false
+        type: string
+        description: >
+          이 회수를 유발한 승인 번호. 작업 이력을 승인 1건 단위로 묶는 키이므로,
+          아는 호출자는 반드시 넘겨야 한다. 안 주면 생성 쪽 이력과 조인할 수 없는
+          임시 키로 기록된다. 계정은 신청이 아니라 웹 계정에 귀속되어 있어
+          호출자가 승인 번호를 특정하지 못하는 경우가 있다.
+        example: "4821"
 
     responses:
 
@@ -2747,6 +2767,14 @@ def delete_user(username: str):
         description: 서버 오류
     """
     node_name = request.args.get("node_name")
+    # 회수 이력도 생성 쪽(/create-pod, PUT /accounts/users)과 같은 키로 묶는다. 그래야 한
+    # 승인의 생성부터 회수까지가 하나의 request_id로 조회되고 회수 소요시간이 나온다.
+    # 계정은 신청이 아니라 웹 계정에 귀속되어 있어 호출자가 승인 번호를 특정하지 못하는
+    # 경우가 있는데, 그때는 생성 이력과 조인되지 않는 임시 키로 떨어진다.
+    request_id = request.args.get("request_id") or f"{username}-DELETE-{datetime.now().strftime('%Y%m%d%H%M%S%f')[:-3]}"
+
+    log_operation(request_id=request_id, username=username, node_name=node_name,
+                  resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.START)
 
     # Remove from /etc/passwd
     lines = read_passwd_lines()
@@ -2759,56 +2787,98 @@ def delete_user(username: str):
             continue
         new_lines.append(line)
     if removed_user is None:
+        # 이 엔드포인트는 멱등이라 호출자(admin_be)가 404를 "이미 삭제됨"으로 처리한다.
+        # 이력에는 이 호출이 아무것도 지우지 않았다는 사실 그대로 남기되, 지표를 뽑을 때
+        # 실제 삭제 실패와 섞이지 않도록 error_code로 구분한다. 목표 상태에 이미 도달한
+        # 경우를 별도로 표현하는 것은 자원 재조회가 들어오는 v3.0의 몫이다.
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="USER_NOT_FOUND",
+                      error_detail=f"user {username!r} not present in passwd")
         return jsonify({"error": "user not found"}), 404
-    write_passwd_lines(new_lines)
+    # passwd/shadow/group 세 파일을 지워야 계정 제거가 끝난다. 중간에 실패하면 계정이
+    # 반만 지워진 채 남으므로, 그 사실이 이력에 남도록 묶어서 감싼다.
+    try:
+        write_passwd_lines(new_lines)
 
-    # Remove from /shadow
-    sh_lines = read_shadow_lines()
-    sh_new = []
-    for sl in sh_lines:
-        srec = parse_shadow_line(sl)
-        if srec and srec["name"] == username:
-            continue
-        sh_new.append(sl)
-    write_shadow_lines(sh_new)
+        # Remove from /shadow
+        sh_lines = read_shadow_lines()
+        sh_new = []
+        for sl in sh_lines:
+            srec = parse_shadow_line(sl)
+            if srec and srec["name"] == username:
+                continue
+            sh_new.append(sl)
+        write_shadow_lines(sh_new)
 
-    # Clean /etc/group: remove user from all member lists; delete any group that had this user
-    # (either explicitly in members or implicitly as the primary GID group) if now empty.
-    g_lines = read_group_lines()
-    g_new = []
-    for gl in g_lines:
-        grec = parse_group_line(gl)
-        if not grec:
-            g_new.append(gl)
-            continue
+        # Clean /etc/group: remove user from all member lists; delete any group that had this user
+        # (either explicitly in members or implicitly as the primary GID group) if now empty.
+        g_lines = read_group_lines()
+        g_new = []
+        for gl in g_lines:
+            grec = parse_group_line(gl)
+            if not grec:
+                g_new.append(gl)
+                continue
 
-        had_user_member = username in grec.get("members", [])
-        is_primary_group = (removed_user is not None and grec.get("gid") == removed_user.get("gid"))
+            had_user_member = username in grec.get("members", [])
+            is_primary_group = (removed_user is not None and grec.get("gid") == removed_user.get("gid"))
 
-        # Remove from explicit members list
-        if had_user_member:
-            grec["members"] = [m for m in grec["members"] if m != username]
+            # Remove from explicit members list
+            if had_user_member:
+                grec["members"] = [m for m in grec["members"] if m != username]
 
-        # If this group had the user (explicitly or via primary gid) and is now empty, drop the group
-        if (had_user_member or is_primary_group) and not grec.get("members"):
-            continue
+            # If this group had the user (explicitly or via primary gid) and is now empty, drop the group
+            if (had_user_member or is_primary_group) and not grec.get("members"):
+                continue
 
-        g_new.append(format_group_entry(grec))
+            g_new.append(format_group_entry(grec))
 
-    write_group_lines(g_new)
+        write_group_lines(g_new)
+    except Exception as e:
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.FAIL,
+                      error_code="ACCOUNT_FILE_WRITE_FAILED", error_detail=str(e))
+        raise
 
+    log_operation(request_id=request_id, username=username, node_name=node_name,
+                  resource_type="account", action=Action.DELETE_ACCOUNT, phase=Phase.SUCCESS)
+
+    log_operation(request_id=request_id, username=username, node_name=node_name,
+                  resource_type="storage", action=Action.DELETE_HOME, phase=Phase.START)
     try:
         delete_user_home_directory(username)
-    except Exception:
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="storage", action=Action.DELETE_HOME, phase=Phase.SUCCESS)
+    except Exception as e:
         app.logger.warning("[ACCOUNTS] home dir deletion failed for user=%s (account files already removed)", username, exc_info=True)
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="storage", action=Action.DELETE_HOME, phase=Phase.FAIL,
+                      error_code="HOME_DELETE_FAILED", error_detail=str(e))
 
     if app.config.get("KRB5_REALM"):
-        _delete_krb5_principal_and_secret(username)
+        log_operation(request_id=request_id, username=username, node_name=node_name,
+                      resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.START)
+        try:
+            _delete_krb5_principal_and_secret(username)
+        except Exception as e:
+            log_operation(request_id=request_id, username=username, node_name=node_name,
+                          resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.FAIL,
+                          error_code="KRB5_PRINCIPAL_DELETE_FAILED", error_detail=str(e))
+            raise
         if node_name:
             try:
                 _remove_krb5_from_farm(username, node_name)
+                log_operation(request_id=request_id, username=username, node_name=node_name,
+                              resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
             except Exception as e:
                 app.logger.warning(f"[KRB5] farm 정리 실패, 재조정 잡에 위임: {node_name} — {e}")
+                # principal은 지웠지만 노드의 keytab이 남았다. 재조정 잡이 나중에 치우므로
+                # 응답은 성공이지만, 이 시점의 접근 경로는 아직 살아있다 — 회수 완료로
+                # 기록됐는데 접근이 남는 경우가 정확히 여기서 나온다.
+                log_operation(request_id=request_id, username=username, node_name=node_name,
+                              resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.FAIL,
+                              error_code="KRB5_FARM_CLEANUP_FAILED", error_detail=str(e))
                 _record_krb5_cleanup_pending(username, node_name)
         else:
             app.logger.warning(
@@ -2816,6 +2886,8 @@ def delete_user(username: str):
                 "(무관한 farm의 동일 이름 레거시 계정을 건드릴 수 있음, 호출자가 node_name을 넘기도록 수정 필요)"
             )
             _remove_krb5_from_all_farms(username)
+            log_operation(request_id=request_id, username=username,
+                          resource_type="kerberos", action=Action.REMOVE_KRB5, phase=Phase.SUCCESS)
 
     return jsonify({"status": "deleted", "user": username})
 
