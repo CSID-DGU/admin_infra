@@ -17,6 +17,10 @@ on:
         description: "admin_infra-proposed의 브랜치·태그·커밋 (두 스택에 같은 코드를 올릴 때는 같은 커밋을 준다)"
         default: develop
         required: true
+      fe_ref:
+        description: "CSID-DGU/admin_fe의 브랜치·태그·커밋 (스택 프론트엔드)"
+        default: main
+        required: true
       action:
         description: "up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
         type: choice
@@ -62,6 +66,39 @@ jobs:
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}
 
+      - name: 프론트엔드 코드 체크아웃
+        if: inputs.action == 'up'
+        uses: actions/checkout@v4
+        with:
+          repository: CSID-DGU/admin_fe
+          ref: ${{ inputs.fe_ref }}
+          path: fe
+
+      # admin_fe의 nginx.conf는 /api/와 /pod-status/ 대상이 운영으로 고정돼 있다. 이 두 줄만 스택 주소로
+      # 바꿔 스택 전용 이미지를 만든다(운영 프론트엔드 이미지·배포는 건드리지 않음).
+      - name: 프론트엔드 nginx 대상을 스택으로 변경
+        id: fe
+        if: inputs.action == 'up'
+        run: |
+          NS=ailab-${{ inputs.stack }}
+          F=fe/nginx.conf
+          grep -q "admin-prod.default.svc.cluster.local" $F && grep -q "containerssh-config-service.ailab-infra.svc.cluster.local" $F \
+            || { echo "admin_fe nginx.conf의 프록시 대상이 예상과 달라 중단"; exit 1; }
+          sed -i -e "s#admin-prod.default.svc.cluster.local#admin-prod.$NS.svc.cluster.local#" \
+                 -e "s#containerssh-config-service.ailab-infra.svc.cluster.local#containerssh-config-service.$NS.svc.cluster.local#" $F
+          grep -n "proxy_pass" $F
+          if grep -q "ailab-infra\|admin-prod.default" $F; then echo "운영 대상이 남아 있어 중단"; exit 1; fi
+          echo "sha=$(git -C fe rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: 프론트엔드 이미지 빌드
+        if: inputs.action == 'up'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./fe
+          file: ./fe/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}
+
       - name: 배포 서버의 이전 복사본 정리
         uses: appleboy/ssh-action@master
         with:
@@ -93,7 +130,7 @@ jobs:
           script: |
             cd ~/deploy-temp-exp/${{ inputs.stack }}
             if [ "${{ inputs.action }}" = "up" ]; then
-              bash ops/proposed-stack/stack-up.sh ${{ inputs.stack }} ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}
+              bash ops/proposed-stack/stack-up.sh ${{ inputs.stack }} ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }} ${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}
             else
               bash ops/proposed-stack/stack-down.sh ${{ inputs.stack }}
             fi
