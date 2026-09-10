@@ -27,4 +27,4 @@ CREATE TABLE IF NOT EXISTS operation_log (
   created_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
   INDEX idx_req (request_id, created_at),
   INDEX idx_action_phase (action, phase)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;  -- 운영 log-mysql(SHOW CREATE TABLE)과 동일

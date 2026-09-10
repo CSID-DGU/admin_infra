@@ -52,6 +52,16 @@ spec:
               value: "{{ .Values.security.sudoAllowedCommands }}"
             - name: NAMESPACE
               value: "{{ .Values.config.namespace }}"
+            - name: ADMIN_BE_INTERNAL_URL
+              value: "{{ .Values.infra.adminBeInternalUrl }}"
+            - name: UID_MIN
+              value: "{{ .Values.accounts.uidMin }}"
+            - name: UID_MAX
+              value: "{{ .Values.accounts.uidMax }}"
+            - name: NODEPORT_MIN
+              value: "{{ .Values.nodeport.min }}"
+            - name: NODEPORT_MAX
+              value: "{{ .Values.nodeport.max }}"
             - name: DB_HOST
               value: "{{ .Values.db.host }}"
             - name: DB_NAME
