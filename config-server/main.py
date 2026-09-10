@@ -72,7 +72,8 @@ NODEPORT_MIN = int(os.getenv("NODEPORT_MIN", "30000"))
 NODEPORT_MAX = int(os.getenv("NODEPORT_MAX", "32767"))
 app.config.from_mapping({
     # Namespace
-    "NAMESPACE": "ailab-infra",
+    # 사용자 Pod·Service·keytab 시크릿을 만들고 지우는 네임스페이스. 차트가 config.namespace를 넣어 준다.
+    "NAMESPACE": os.getenv("NAMESPACE", "ailab-infra"),
 
     # External endpoints & timeouts
     "PROM_URL": "http://monitoring-kube-prometheus-prometheus.monitoring:9090",
