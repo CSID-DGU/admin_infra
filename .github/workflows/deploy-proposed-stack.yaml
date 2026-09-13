@@ -27,6 +27,10 @@ on:
         description: "CSID-DGU/admin_be의 브랜치·태그·커밋 (비우면 운영 admin_be 이미지를 그대로 씀)"
         default: ""
         required: false
+      be_async:
+        description: "스택 admin_be의 승인을 작업 등록 방식으로 (기본 꺼짐 — Operational Baseline은 동기 승인으로 측정한다)"
+        type: boolean
+        default: false
       action:
         description: "up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
         type: choice
@@ -178,7 +182,7 @@ jobs:
               bash ops/proposed-stack/stack-up.sh "${{ inputs.stack }}" \
                 "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}" \
                 "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}" \
-                "$BE_IMAGE"
+                "$BE_IMAGE" "${{ inputs.be_async }}"
             else
               bash ops/proposed-stack/stack-down.sh "${{ inputs.stack }}"
             fi
