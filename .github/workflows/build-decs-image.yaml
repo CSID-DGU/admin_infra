@@ -1,0 +1,104 @@
+name: Build DECS Image
+
+# 사용자 컨테이너 이미지(dguailab/decs)를 admin_infra_server 소스로 빌드해 올린다.
+# admin_infra_server의 이미지 워크플로는 container-images/.github/workflows 아래에 있어 GitHub가 실행하지
+# 않고, 그 저장소에는 Docker Hub 시크릿도 없다. 이 저장소의 Docker Hub 시크릿으로 대신 빌드한다.
+# variant 하나를 날짜 태그 하나로만 올리고 latest·stable 같은 별칭은 옮기지 않는다(쓰는 쪽이 태그를 골라 바꾼다).
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "container-images/image-variants.json의 variant id"
+        required: true
+        default: cuda11.8-tf2.13-ubuntu22.04
+        type: string
+      date_tag:
+        description: "YYMMDD 날짜 태그"
+        required: true
+        type: string
+      source_ref:
+        description: "admin_infra_server 브랜치 또는 커밋"
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-decs-${{ inputs.variant }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      # CUDA devel 이미지와 TensorFlow·conda를 합치면 기본 러너의 남는 디스크(약 14GB)를 넘는다.
+      - name: 러너 디스크 확보
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force >/dev/null
+          df -h /
+
+      - name: 이미지 소스 체크아웃
+        uses: actions/checkout@v4
+        with:
+          repository: CSID-DGU/admin_infra_server
+          ref: ${{ inputs.source_ref }}
+          path: src
+
+      - name: variant 설정 읽기
+        id: v
+        env:
+          VARIANT: ${{ inputs.variant }}
+          DATE_TAG: ${{ inputs.date_tag }}
+        run: |
+          [[ "$DATE_TAG" =~ ^[0-9]{6}$ ]] || { echo "날짜 태그는 YYMMDD여야 함: $DATE_TAG"; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          data = json.load(open("src/container-images/image-variants.json", encoding="utf-8"))
+          variant = next((v for v in data["variants"] if v["id"] == os.environ["VARIANT"]), None)
+          if variant is None:
+              raise SystemExit(f"없는 variant: {os.environ['VARIANT']}")
+          keys = ["base_image", "cuda_version", "tensorflow_version", "tensorflow_package",
+                  "python_version", "ubuntu_version", "min_nvidia_driver", "conda_packages"]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              for key in keys:
+                  out.write(f"{key}<<EOF_VALUE\n{variant.get(key, '')}\nEOF_VALUE\n")
+              out.write(f"tag={data['repository']}:{variant['id']}-{os.environ['DATE_TAG']}\n")
+          PY
+          echo "빌드할 태그: $(grep '^tag=' "$GITHUB_OUTPUT" | tail -1 | cut -d= -f2)"
+          echo "이미지 소스: $(git -C src rev-parse --short HEAD)"
+
+      - name: Docker Buildx 준비
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker Hub 로그인
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 빌드·푸시
+        uses: docker/build-push-action@v5
+        with:
+          context: src/container-images
+          file: src/container-images/Dockerfile
+          push: true
+          build-args: |
+            BASE_IMAGE=${{ steps.v.outputs.base_image }}
+            DECS_IMAGE_VARIANT=${{ inputs.variant }}
+            CUDA_VERSION=${{ steps.v.outputs.cuda_version }}
+            TENSORFLOW_VERSION=${{ steps.v.outputs.tensorflow_version }}
+            TENSORFLOW_PACKAGE=${{ steps.v.outputs.tensorflow_package }}
+            PYTHON_VERSION=${{ steps.v.outputs.python_version }}
+            UBUNTU_VERSION=${{ steps.v.outputs.ubuntu_version }}
+            MIN_NVIDIA_DRIVER=${{ steps.v.outputs.min_nvidia_driver }}
+            CONDA_PACKAGES=${{ steps.v.outputs.conda_packages }}
+          tags: ${{ steps.v.outputs.tag }}
+
+      - name: 결과
+        run: |
+          echo "올린 태그: ${{ steps.v.outputs.tag }}"
+          df -h /
