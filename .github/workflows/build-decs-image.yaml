@@ -1,6 +1,7 @@
 name: Build DECS Image
 
 # 사용자 컨테이너 이미지(dguailab/decs)를 admin_infra_server 소스로 빌드해 올린다.
+# 소스 저장소는 비공개라 ADMIN_INFRA_SERVER_TOKEN(그 저장소 Contents 읽기 전용) 시크릿으로 받는다.
 # admin_infra_server의 이미지 워크플로는 container-images/.github/workflows 아래에 있어 GitHub가 실행하지
 # 않고, 그 저장소에는 Docker Hub 시크릿도 없다. 이 저장소의 Docker Hub 시크릿으로 대신 빌드한다.
 # variant 하나를 날짜 태그 하나로만 올리고 latest·stable 같은 별칭은 옮기지 않는다(쓰는 쪽이 태그를 골라 바꾼다).
@@ -41,11 +42,20 @@ jobs:
           sudo docker image prune --all --force >/dev/null
           df -h /
 
+      # admin_infra_server는 비공개라 기본 토큰으로는 받을 수 없다. 그 저장소 읽기 권한만 준 토큰을 쓴다.
+      - name: 소스 저장소 토큰 확인
+        env:
+          SOURCE_TOKEN: ${{ secrets.ADMIN_INFRA_SERVER_TOKEN }}
+        run: |
+          [ -n "$SOURCE_TOKEN" ] || { echo "ADMIN_INFRA_SERVER_TOKEN 시크릿이 없음(admin_infra_server Contents 읽기 권한 토큰)"; exit 1; }
+
       - name: 이미지 소스 체크아웃
         uses: actions/checkout@v4
         with:
           repository: CSID-DGU/admin_infra_server
           ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.ADMIN_INFRA_SERVER_TOKEN }}
+          persist-credentials: false
           path: src
 
       - name: variant 설정 읽기
