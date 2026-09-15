@@ -1,6 +1,7 @@
 name: Deploy Proposed Stack
 
-# 제안 시스템 실험 스택(ailab-noprobe / ailab-full)을 띄우거나 내린다. 수동 실행 전용이다.
+# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 띄우거나 내린다. 수동 실행 전용이다.
+# 세 스택은 같은 코드이고 config-server의 실행 방식 하나만 다르다.
 # 코드는 CSID-DGU/admin_infra-proposed에서 가져오고, 프론트엔드와 admin_be는 원본 레포의 지정한
 # 브랜치에서 가져온다. 두 레포 모두 운영 배포는 main push에만 걸려 있어 브랜치를 올려도 운영에 닿지 않는다.
 # 배포 시크릿은 이 레포의 것을 쓴다.
@@ -13,10 +14,10 @@ on:
       stack:
         description: "스택"
         type: choice
-        options: [noprobe, full]
+        options: [baseline, noprobe, full]
         required: true
       ref:
-        description: "admin_infra-proposed의 브랜치·태그·커밋 (두 스택에 같은 코드를 올릴 때는 같은 커밋을 준다)"
+        description: "admin_infra-proposed의 브랜치·태그·커밋 (세 스택에 같은 커밋을 준다)"
         default: develop
         required: true
       fe_ref:
@@ -24,13 +25,9 @@ on:
         default: main
         required: true
       be_ref:
-        description: "CSID-DGU/admin_be의 브랜치·태그·커밋 (비우면 운영 admin_be 이미지를 그대로 씀)"
-        default: ""
-        required: false
-      be_async:
-        description: "스택 admin_be의 승인을 작업 등록 방식으로 (기본 꺼짐 — Operational Baseline은 동기 승인으로 측정한다)"
-        type: boolean
-        default: false
+        description: "CSID-DGU/admin_be의 브랜치·태그·커밋 (운영 admin_be 이미지는 작업 등록 인터페이스를 몰라 쓰지 않는다)"
+        default: develop
+        required: true
       action:
         description: "up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
         type: choice
@@ -109,10 +106,9 @@ jobs:
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}
 
-      # v2.0처럼 admin_be도 같이 바뀌는 변경은 병합하지 않은 브랜치를 여기에 지정해 스택에서만 돌린다.
-      # 운영 admin_be(Operational Baseline)는 그대로 둔다.
+      # 스택 admin_be는 세 방식 모두 같은 브랜치에서 빌드한다. 운영 admin_be 배포(main push)에는 닿지 않는다.
       - name: admin_be 코드 체크아웃
-        if: inputs.action == 'up' && inputs.be_ref != ''
+        if: inputs.action == 'up'
         uses: actions/checkout@v4
         with:
           repository: CSID-DGU/admin_be
@@ -120,7 +116,7 @@ jobs:
           path: be
 
       - name: JDK 17 설정
-        if: inputs.action == 'up' && inputs.be_ref != ''
+        if: inputs.action == 'up'
         uses: actions/setup-java@v4
         with:
           java-version: '17'
@@ -130,14 +126,14 @@ jobs:
       # /app/config에 마운트해 받고, 스택 자원을 가리키는 값만 설치 스크립트가 덮어쓴다.
       - name: admin_be 빌드
         id: be
-        if: inputs.action == 'up' && inputs.be_ref != ''
+        if: inputs.action == 'up'
         run: |
           cd be
           ./gradlew build -x test
           echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: admin_be 이미지 빌드
-        if: inputs.action == 'up' && inputs.be_ref != ''
+        if: inputs.action == 'up'
         uses: docker/build-push-action@v5
         with:
           context: ./be
@@ -176,13 +172,10 @@ jobs:
           script: |
             cd ~/deploy-temp-exp/${{ inputs.stack }}
             if [ "${{ inputs.action }}" = "up" ]; then
-              BE_SHA="${{ steps.be.outputs.sha }}"
-              BE_IMAGE=""
-              [ -n "$BE_SHA" ] && BE_IMAGE="${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:$BE_SHA"
               bash ops/proposed-stack/stack-up.sh "${{ inputs.stack }}" \
                 "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}" \
                 "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}" \
-                "$BE_IMAGE" "${{ inputs.be_async }}"
+                "${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ steps.be.outputs.sha }}"
             else
               bash ops/proposed-stack/stack-down.sh "${{ inputs.stack }}"
             fi
