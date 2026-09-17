@@ -177,9 +177,10 @@ jobs:
               if [ "${{ inputs.action }}" != "up" ]; then
                 echo "ailab-operation은 실사용자 데이터라 down을 지원하지 않음 (내리려면 수동으로)"; exit 1
               fi
+              # 프론트엔드 이미지는 여기서 안 쓴다(operation-up.sh는 config-server+admin_be만 배포함) —
+              # 그래도 위에서 빌드는 해둔다, 나중에 프론트엔드를 수동으로 붙일 때 바로 쓸 수 있게.
               bash ops/proposed-stack/operation-up.sh \
                 "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}" \
-                "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}" \
                 "${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ steps.be.outputs.sha }}"
             elif [ "${{ inputs.action }}" = "up" ]; then
               bash ops/proposed-stack/stack-up.sh "${{ inputs.stack }}" \
