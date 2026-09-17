@@ -3,7 +3,10 @@
 *.crt
 *.env
 CLAUDE.md
+AGENTS.md
 .codex
+.claude/
+.omc/
 secrets.yaml
 
 rendered*.yaml

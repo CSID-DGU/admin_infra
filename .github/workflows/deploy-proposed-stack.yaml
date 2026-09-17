@@ -1,7 +1,9 @@
 name: Deploy Proposed Stack
 
-# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 띄우거나 내린다. 수동 실행 전용이다.
-# 세 스택은 같은 코드이고 config-server의 실행 방식 하나만 다르다.
+# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)과 실사용자용 ailab-operation을 띄우거나
+# 내린다. 수동 실행 전용이다. 실험 스택 셋은 같은 코드이고 config-server의 실행 방식 하나만 다르다.
+# ailab-operation은 stack-up.sh(매번 새 DB·장부로 격리) 대신 operation-up.sh(기존 운영 DB·장부를
+# 재사용·이전)를 쓴다 — down은 실사용자 데이터라 아직 지원하지 않는다.
 # 코드는 CSID-DGU/admin_infra-proposed에서 가져오고, 프론트엔드와 admin_be는 원본 레포의 지정한
 # 브랜치에서 가져온다. 두 레포 모두 운영 배포는 main push에만 걸려 있어 브랜치를 올려도 운영에 닿지 않는다.
 # 배포 시크릿은 이 레포의 것을 쓴다.
@@ -14,7 +16,7 @@ on:
       stack:
         description: "스택"
         type: choice
-        options: [baseline, noprobe, full]
+        options: [baseline, noprobe, full, operation]
         required: true
       ref:
         description: "admin_infra-proposed의 브랜치·태그·커밋 (세 스택에 같은 커밋을 준다)"
@@ -171,7 +173,15 @@ jobs:
           command_timeout: 40m
           script: |
             cd ~/deploy-temp-exp/${{ inputs.stack }}
-            if [ "${{ inputs.action }}" = "up" ]; then
+            if [ "${{ inputs.stack }}" = "operation" ]; then
+              if [ "${{ inputs.action }}" != "up" ]; then
+                echo "ailab-operation은 실사용자 데이터라 down을 지원하지 않음 (내리려면 수동으로)"; exit 1
+              fi
+              bash ops/proposed-stack/operation-up.sh \
+                "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}" \
+                "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}" \
+                "${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ steps.be.outputs.sha }}"
+            elif [ "${{ inputs.action }}" = "up" ]; then
               bash ops/proposed-stack/stack-up.sh "${{ inputs.stack }}" \
                 "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}" \
                 "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}" \
