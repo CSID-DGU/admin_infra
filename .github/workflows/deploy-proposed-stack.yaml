@@ -1,6 +1,7 @@
 name: Deploy Proposed Stack
 
-# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 띄우거나 내린다. 수동 실행 전용이다.
+# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)과 실운영(ailab-operation)을 띄우거나 내린다.
+# operation은 구 운영이 쓰던 계정 대장을 그대로 이어받는다 — 격리된 실험 스택이 아니다. 수동 실행 전용이다.
 # 세 스택은 같은 코드이고 config-server의 실행 방식 하나만 다르다.
 # 코드는 CSID-DGU/admin_infra-proposed에서 가져오고, 프론트엔드와 admin_be는 원본 레포의 지정한
 # 브랜치에서 가져온다. 두 레포 모두 운영 배포는 main push에만 걸려 있어 브랜치를 올려도 운영에 닿지 않는다.
@@ -20,7 +21,7 @@ on:
       stack:
         description: "스택"
         type: choice
-        options: [baseline, noprobe, full]
+        options: [baseline, noprobe, full, operation]
         required: true
       ref:
         description: "admin_infra-proposed의 브랜치·태그·커밋 (세 스택에 같은 커밋을 준다)"
