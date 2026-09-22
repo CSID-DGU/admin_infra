@@ -7,6 +7,12 @@ name: Deploy Proposed Stack
 # 배포 시크릿은 이 레포의 것을 쓴다.
 # 운영 배포(deploy-config-server.yaml)와 트리거, 이미지 이름(config-server-exp), 배포 서버의 차트
 # 복사 경로(~/deploy-temp-exp), helm 릴리스명(config-server-<stack>)이 모두 달라 운영에 닿지 않는다.
+#
+# 이미지 세 개를 각각 다른 작업에서 만든다(서로 병렬). 예전에는 한 작업에 15단계가 일렬로 붙어 있어
+# 앞에서 하나만 깨져도 뒤가 전부 버려지고 다시 실행하면 처음부터 다시 만들었다. 지금은 만들어 둔
+# 이미지가 레지스트리에 남아, 같은 커밋을 다시 돌리면 그 빌드를 건너뛴다.
+# 세 스택은 같은 커밋을 쓰므로 config-server와 admin_be 이미지 태그가 서로 같다 — 먼저 돈 스택이
+# 만들어 두면 나머지 둘은 빌드를 건너뛴다(프론트엔드만 스택별 주소가 달라 따로 만든다).
 
 on:
   workflow_dispatch:
@@ -39,9 +45,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run:
+  config-server:
+    if: inputs.action == 'up'
     runs-on: ubuntu-latest
-
+    outputs:
+      sha: ${{ steps.src.outputs.sha }}
     steps:
       - name: 제안 시스템 코드 체크아웃
         uses: actions/checkout@v4
@@ -58,23 +66,45 @@ jobs:
           echo "admin_infra-proposed @ $SHA"
 
       - name: Docker Hub 로그인
-        if: inputs.action == 'up'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # 같은 커밋으로 만든 이미지가 이미 올라가 있으면 다시 만들 이유가 없다. 세 스택이 같은 커밋을
+      # 쓰므로 두 번째·세 번째 스택은 여기서 통째로 건너뛴다.
+      - name: 이미 있는 이미지인지 확인
+        id: exists
+        run: |
+          if docker manifest inspect "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "같은 커밋의 이미지가 이미 있어 빌드를 건너뜁니다"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 빌더 준비
+        if: steps.exists.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
+
       - name: config-server 이미지 빌드
-        if: inputs.action == 'up'
+        if: steps.exists.outputs.skip == 'false'
         uses: docker/build-push-action@v5
         with:
           context: ./proposed/config-server
           file: ./proposed/config-server/Dockerfile
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}
+          cache-from: type=gha,scope=config-server
+          cache-to: type=gha,mode=max,scope=config-server
 
+  frontend:
+    if: inputs.action == 'up'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.fe.outputs.sha }}
+    steps:
       - name: 프론트엔드 코드 체크아웃
-        if: inputs.action == 'up'
         uses: actions/checkout@v4
         with:
           repository: CSID-DGU/admin_fe
@@ -85,7 +115,6 @@ jobs:
       # 바꿔 스택 전용 이미지를 만든다(운영 프론트엔드 이미지·배포는 건드리지 않음).
       - name: 프론트엔드 nginx 대상을 스택으로 변경
         id: fe
-        if: inputs.action == 'up'
         run: |
           NS=ailab-${{ inputs.stack }}
           F=fe/nginx.conf
@@ -97,49 +126,117 @@ jobs:
           if grep -q "ailab-infra\|admin-prod.default" $F; then echo "운영 대상이 남아 있어 중단"; exit 1; fi
           echo "sha=$(git -C fe rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Docker Hub 로그인
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 프론트엔드는 프록시 대상이 스택마다 달라 태그에 스택 이름이 붙는다. 같은 커밋 + 같은 스택이면
+      # 내용이 같으므로 건너뛴다.
+      - name: 이미 있는 이미지인지 확인
+        id: exists
+        run: |
+          if docker manifest inspect "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "같은 커밋의 이미지가 이미 있어 빌드를 건너뜁니다"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 빌더 준비
+        if: steps.exists.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
+
       - name: 프론트엔드 이미지 빌드
-        if: inputs.action == 'up'
+        if: steps.exists.outputs.skip == 'false'
         uses: docker/build-push-action@v5
         with:
           context: ./fe
           file: ./fe/Dockerfile
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}
+          cache-from: type=gha,scope=frontend-${{ inputs.stack }}
+          cache-to: type=gha,mode=max,scope=frontend-${{ inputs.stack }}
 
+  backend:
+    if: inputs.action == 'up'
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.be.outputs.sha }}
+    steps:
       # 스택 admin_be는 세 방식 모두 같은 브랜치에서 빌드한다. 운영 admin_be 배포(main push)에는 닿지 않는다.
       - name: admin_be 코드 체크아웃
-        if: inputs.action == 'up'
         uses: actions/checkout@v4
         with:
           repository: CSID-DGU/admin_be
           ref: ${{ inputs.be_ref }}
           path: be
 
+      - name: 커밋 확인
+        id: be
+        run: echo "sha=$(git -C be rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Docker Hub 로그인
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      # 이미지가 이미 있으면 소스 빌드까지 통째로 건너뛴다 — 여기가 이 워크플로에서 가장 오래 걸린다.
+      - name: 이미 있는 이미지인지 확인
+        id: exists
+        run: |
+          if docker manifest inspect "${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ steps.be.outputs.sha }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "같은 커밋의 이미지가 이미 있어 빌드를 건너뜁니다"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: JDK 17 설정
-        if: inputs.action == 'up'
+        if: steps.exists.outputs.skip == 'false'
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
+          cache: gradle
 
       # 운영 배포와 달리 application.yml을 굽지 않는다. 스택 admin_be는 운영 설정 Secret 복사본을
       # /app/config에 마운트해 받고, 스택 자원을 가리키는 값만 설치 스크립트가 덮어쓴다.
       - name: admin_be 빌드
-        id: be
-        if: inputs.action == 'up'
+        if: steps.exists.outputs.skip == 'false'
         run: |
           cd be
           ./gradlew build -x test
-          echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: 빌더 준비
+        if: steps.exists.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
 
       - name: admin_be 이미지 빌드
-        if: inputs.action == 'up'
+        if: steps.exists.outputs.skip == 'false'
         uses: docker/build-push-action@v5
         with:
           context: ./be
           file: ./be/Dockerfile
           push: true
           tags: ${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ steps.be.outputs.sha }}
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,mode=max,scope=backend
+
+  deploy:
+    needs: [config-server, frontend, backend]
+    # down 은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. 건너뜀은 실패가 아니므로 그대로 진행한다.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: 제안 시스템 코드 체크아웃
+        uses: actions/checkout@v4
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: ${{ inputs.ref }}
+          path: proposed
 
       - name: 배포 서버의 이전 복사본 정리
         uses: appleboy/ssh-action@master
@@ -173,9 +270,9 @@ jobs:
             cd ~/deploy-temp-exp/${{ inputs.stack }}
             if [ "${{ inputs.action }}" = "up" ]; then
               bash ops/proposed-stack/stack-up.sh "${{ inputs.stack }}" \
-                "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.src.outputs.sha }}" \
-                "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ steps.fe.outputs.sha }}-${{ inputs.stack }}" \
-                "${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ steps.be.outputs.sha }}"
+                "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ needs.config-server.outputs.sha }}" \
+                "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ needs.frontend.outputs.sha }}-${{ inputs.stack }}" \
+                "${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ needs.backend.outputs.sha }}"
             else
               bash ops/proposed-stack/stack-down.sh "${{ inputs.stack }}"
             fi
