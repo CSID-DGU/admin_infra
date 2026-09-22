@@ -6,7 +6,10 @@ metadata:
   labels:
     app: containerssh-config-server
 spec:
-  replicas: {{ .Values.replicaCount | default 1 }}
+  # Sprig의 default는 0을 "비어있음"으로 보고 폴백시킨다 — replicaCount=0 지정이 무시되고
+  # 운영이 되살아나는 사고가 실제로 발생했다. values.yaml에 replicaCount: 1을 명시해뒀으므로
+  # default 없이 그대로 참조한다.
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       app: containerssh-config-server
