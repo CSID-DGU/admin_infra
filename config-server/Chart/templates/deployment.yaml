@@ -6,7 +6,7 @@ metadata:
   labels:
     app: containerssh-config-server
 spec:
-  replicas: 1
+  replicas: {{ .Values.replicaCount | default 1 }}
   selector:
     matchLabels:
       app: containerssh-config-server
