@@ -47,7 +47,7 @@ concurrency:
 jobs:
   config-server:
     if: inputs.action == 'up'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.src.outputs.sha }}
     steps:
@@ -100,7 +100,7 @@ jobs:
 
   frontend:
     if: inputs.action == 'up'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.fe.outputs.sha }}
     steps:
@@ -161,7 +161,7 @@ jobs:
 
   backend:
     if: inputs.action == 'up'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       sha: ${{ steps.be.outputs.sha }}
     steps:
@@ -229,7 +229,7 @@ jobs:
     needs: [config-server, frontend, backend]
     # down 은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. 건너뜀은 실패가 아니므로 그대로 진행한다.
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: 제안 시스템 코드 체크아웃
         uses: actions/checkout@v7

@@ -32,7 +32,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 340
     steps:
       # CUDA devel 이미지와 TensorFlow·conda를 합치면 기본 러너의 남는 디스크(약 14GB)를 넘는다.
