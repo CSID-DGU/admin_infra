@@ -14,11 +14,11 @@ jobs:
     steps:
     # 1. 소스 코드 체크아웃
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v7
 
     # 2. Docker Hub 로그인
     - name: Login to Docker Hub
-      uses: docker/login-action@v2
+      uses: docker/login-action@v4
       with:
         username: ${{ secrets.DOCKER_USERNAME }}
         password: ${{ secrets.DOCKER_PASSWORD }}
@@ -26,7 +26,7 @@ jobs:
     # 3. 이미지 빌드 및 푸시
     # secrets.DOCKER_USERNAME을 네임스페이스로 사용하여 푸시
     - name: Build and Push Docker Image
-      uses: docker/build-push-action@v4
+      uses: docker/build-push-action@v7
       with:
         context: ./config-server
         file: ./config-server/Dockerfile
