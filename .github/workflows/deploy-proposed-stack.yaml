@@ -138,8 +138,9 @@ jobs:
         run: |
           NS=ailab-${{ inputs.stack }}
           F=fe/nginx.conf
-          grep -q "admin-prod.default.svc.cluster.local" $F && grep -q "containerssh-config-service.ailab-infra.svc.cluster.local" $F \
-            || { echo "admin_fe nginx.conf의 프록시 대상이 예상과 달라 중단"; exit 1; }
+          if ! grep -q "admin-prod.default.svc.cluster.local" $F || ! grep -q "containerssh-config-service.ailab-infra.svc.cluster.local" $F; then
+            echo "admin_fe nginx.conf의 프록시 대상이 예상과 달라 중단"; exit 1
+          fi
           sed -i -e "s#admin-prod.default.svc.cluster.local#admin-prod.$NS.svc.cluster.local#" \
                  -e "s#containerssh-config-service.ailab-infra.svc.cluster.local#containerssh-config-service.$NS.svc.cluster.local#" $F
           grep -n "proxy_pass" $F
