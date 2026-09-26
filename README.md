@@ -1,56 +1,22 @@
 # 🚀 GPU 서버 관리 자동화 시스템 Infra Server 배포 및 운영 가이드
 
-이 문서는 `config-server`의 Git 브랜치 전략, CI/CD 파이프라인 구조, 그리고 배포 절차를 정의합니다.
+이 문서는 이 저장소의 브랜치·배포 규칙과 배포 워크플로를 설명합니다.
 > (나머지 자동화는 진행중 👻)
 
-## 1. 브랜치 전략 (Branch Strategy)
+## 브랜치·배포 규칙
 
-우리는 **Git Flow** 전략을 기반으로 운영하며, `main` 브랜치에 코드가 통합될 때만 실제 서버 배포가 이루어집니다.
+admin_fe·admin_be·admin_infra·admin_infra-proposed 네 저장소가 같은 규칙을 쓴다. 전문은 admin_wiki [`md/브랜치-규칙.md`](https://github.com/CSID-DGU/admin_wiki/blob/main/md/브랜치-규칙.md).
 
-| 브랜치 이름 | 역할 | 배포 여부 | 비고 |
-| :--- | :--- | :---: | :--- |
-| **`main`** | **운영(Production) 환경** | **O (자동)** | 배포 시점: PR Merge 직후 |
-| **`develop`** | **개발(Development) 통합** | X | 기능 개발 후 통합 테스트 용도 |
-| `feature/*` | 개별 기능 개발 | X | `develop`에서 분기하여 작업 |
-| `hotfix/*` | 운영 이슈 긴급 수정 | O | `main`에서 분기, Merge 후 즉시 배포 (사용 권장 X)|
+- 브랜치는 `main` 하나다. 작업은 `main`에서 `<커밋 타입>/v<버전>-<짧은 설명>` 브랜치를 따서(예: `fix/v3.0-returning-user-uid`) PR로 `main`에 squash 병합한다.
+- PR은 CI(테스트) 통과가 필요하다.
+- 어느 브랜치에 push해도 자동 배포는 없다. 배포는 admin_infra의 **Deploy Proposed Stack** 워크플로로만 한다.
+- 실험 스택은 `main`(또는 작업 브랜치)을, 운영(operation)은 네 저장소에 같은 이름으로 찍은 릴리스 태그 `vX.Y.Z`만 배포한다.
 
----
-
-## 2. CI/CD 파이프라인 (Deployment Pipeline)
-
-배포 자동화는 **GitHub Actions**를 사용하며, 오직 `main` 브랜치에 `push` 이벤트가 발생할 때 실행됩니다.
-
-### 🔄 배포 흐름 (Workflow)
-1.  **Trigger**: `develop` → `main`으로 PR이 Merge 되면 워크플로우가 시작됩니다.
-2.  **Build & Push**:
-    * 소스 코드를 기반으로 Docker 이미지를 빌드합니다.
-    * 이미지 태그는 `latest`와 `Git Commit Hash` 두 가지로 생성됩니다.
-    * Docker Hub의 팀/조직 레포지토리로 Push 됩니다.
-3.  **Deploy (Helm Upgrade)**:
-    * GitHub Actions가 운영 서버(`farm8`)에 SSH로 접속합니다.
-    * `helm upgrade` 명령어를 통해 Kubernetes 배포를 수행합니다.
-    * **Key Config**: `--set image.pullPolicy=Always` 옵션을 통해 항상 최신 이미지를 다운로드 받도록 강제합니다.
+이 레포의 `config-server/`는 구 운영용이다. 자동 배포 워크플로(`deploy-config-server.yaml`)는 없앴고, 운영 config-server 코드는 admin_infra-proposed에 있다.
 
 ---
 
-## 3. 작업 및 배포 규칙 (Workflow Rules)
-
-팀원 간 충돌을 방지하고 안정적인 배포를 위해 아래 절차를 준수해 주세요.
-
-### 🛠 기능 개발 (Feature)
-1.  본인이 생성한 Github 이슈 번호에 맞춰 `develop` 브랜치에서 `feature/#기능번호-기능명` 브랜치를 생성합니다. (e.g. feat/#155-scheduler)
-3.  로컬에서 개발 및 테스트를 진행합니다.
-4.  커밋 메시지 양식: [분류] #issue 설명 (e.g. `[feat] #4 메인 기능 만들기`)
-6.  작업이 완료되면 `feature` → `develop` 브랜치로 Pull Request(PR)를 생성합니다.
-
-### 🚀 정기 배포 (Release)
-1.  `develop` 브랜치에 충분한 기능이 모이고 테스트가 완료되면 배포를 준비합니다.
-2.  PR 제목: `[deploy] develop -> main (또는 부가 설명)`  **`develop` → `main`** 으로 PR을 생성합니다. 
-3.  코드 리뷰(Approve) 후 Merge 버튼을 누르면, **즉시 운영 서버에 배포됩니다.** 최소 한 명 이상의 Approve를 받아야 합니다.
-
----
-
-## 4. API 문서 및 모니터링
+## API 문서 및 모니터링 (구 운영 config-server)
 
 서버가 정상적으로 실행 중일 때, 아래 주소에서 API 명세(Swagger)를 확인할 수 있습니다.
 

@@ -1,0 +1,22 @@
+name: CI
+
+# PR과 main에 들어온 변경을 검사한다. 이 레포에는 테스트 코드가 없으므로 워크플로 정의 자체를 검사한다.
+# 공개 저장소라 로그에 인프라 주소·계정·설정값을 출력하는 단계를 두지 않는다.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  workflows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: |
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color

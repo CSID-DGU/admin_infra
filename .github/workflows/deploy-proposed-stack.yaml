@@ -3,11 +3,11 @@ name: Deploy Proposed Stack
 # 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)과 실운영(ailab-operation)을 띄우거나 내린다.
 # operation은 구 운영이 쓰던 계정 대장을 그대로 이어받는다 — 격리된 실험 스택이 아니다. 수동 실행 전용이다.
 # 세 스택은 같은 코드이고 config-server의 실행 방식 하나만 다르다.
-# 코드는 CSID-DGU/admin_infra-proposed에서 가져오고, 프론트엔드와 admin_be는 원본 레포의 지정한
-# 브랜치에서 가져온다. 두 레포 모두 운영 배포는 main push에만 걸려 있어 브랜치를 올려도 운영에 닿지 않는다.
-# 배포 시크릿은 이 레포의 것을 쓴다.
-# 운영 배포(deploy-config-server.yaml)와 트리거, 이미지 이름(config-server-exp), 배포 서버의 차트
-# 복사 경로(~/deploy-temp-exp), helm 릴리스명(config-server-<stack>)이 모두 달라 운영에 닿지 않는다.
+# 코드는 CSID-DGU/admin_infra-proposed, 프론트엔드는 CSID-DGU/admin_fe, 백엔드는 CSID-DGU/admin_be에서 가져온다.
+# 브랜치 규칙(admin_wiki 브랜치-규칙.md): 네 저장소 모두 main 하나. 실험 스택은 main(또는 작업 브랜치)을,
+# operation은 네 저장소에 같은 이름으로 찍은 릴리스 태그(vX.Y.Z)만 배포한다 — guard 작업이 막는다.
+# 배포 시크릿은 이 레포의 것을 쓴다. 이미지 이름(config-server-exp), 배포 서버의 차트 복사 경로
+# (~/deploy-temp-exp), helm 릴리스명(config-server-<stack>)은 스택마다 다르다.
 #
 # 이미지 세 개를 각각 다른 작업에서 만든다(서로 병렬). 예전에는 한 작업에 15단계가 일렬로 붙어 있어
 # 앞에서 하나만 깨져도 뒤가 전부 버려지고 다시 실행하면 처음부터 다시 만들었다. 지금은 만들어 둔
@@ -24,16 +24,16 @@ on:
         options: [baseline, noprobe, full, operation]
         required: true
       ref:
-        description: "admin_infra-proposed의 브랜치·태그·커밋 (세 스택에 같은 커밋을 준다)"
-        default: develop
+        description: "admin_infra-proposed의 브랜치·태그·커밋 (operation은 릴리스 태그 vX.Y.Z만)"
+        default: main
         required: true
       fe_ref:
-        description: "CSID-DGU/admin_fe의 브랜치·태그·커밋 (스택 프론트엔드)"
+        description: "CSID-DGU/admin_fe의 브랜치·태그·커밋 (operation은 릴리스 태그 vX.Y.Z만)"
         default: main
         required: true
       be_ref:
-        description: "CSID-DGU/admin_be의 브랜치·태그·커밋 (운영 admin_be 이미지는 작업 등록 인터페이스를 몰라 쓰지 않는다)"
-        default: develop
+        description: "CSID-DGU/admin_be의 브랜치·태그·커밋 (operation은 릴리스 태그 vX.Y.Z만)"
+        default: main
         required: true
       action:
         description: "up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
@@ -46,7 +46,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # operation은 세 저장소에 같은 이름으로 찍은 릴리스 태그만 받는다. 브랜치를 주면 배포 시점마다 다른 코드가
+  # 운영에 올라가고, 무엇이 떠 있는지 태그 하나로 말할 수 없다.
+  guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: operation 배포 대상 확인
+        if: inputs.stack == 'operation' && inputs.action == 'up'
+        env:
+          REF: ${{ inputs.ref }}
+          FE_REF: ${{ inputs.fe_ref }}
+          BE_REF: ${{ inputs.be_ref }}
+        run: |
+          if ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || [ "$FE_REF" != "$REF" ] || [ "$BE_REF" != "$REF" ]; then
+            echo "operation은 세 저장소에 같은 릴리스 태그(vX.Y.Z)만 배포합니다: ref=$REF fe_ref=$FE_REF be_ref=$BE_REF"
+            exit 1
+          fi
+
   config-server:
+    needs: guard
     if: inputs.action == 'up'
     runs-on: ubuntu-24.04
     outputs:
@@ -100,6 +118,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=config-server
 
   frontend:
+    needs: guard
     if: inputs.action == 'up'
     runs-on: ubuntu-24.04
     outputs:
@@ -161,6 +180,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=frontend-${{ inputs.stack }}
 
   backend:
+    needs: guard
     if: inputs.action == 'up'
     runs-on: ubuntu-24.04
     outputs:
@@ -227,7 +247,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=backend
 
   deploy:
-    needs: [config-server, frontend, backend]
+    needs: [guard, config-server, frontend, backend]
     # down 은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. 건너뜀은 실패가 아니므로 그대로 진행한다.
     if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
