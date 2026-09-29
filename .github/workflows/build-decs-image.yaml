@@ -1,4 +1,5 @@
 name: Build DECS Image
+run-name: "decs ${{ inputs.variant }}-${{ inputs.date_tag }} (source ${{ inputs.source_ref }})"
 
 # 사용자 컨테이너 이미지(dguailab/decs)를 admin_infra_server 소스로 빌드해 올린다.
 # 소스 저장소는 비공개라 ADMIN_INFRA_SERVER_TOKEN(그 저장소 Contents 읽기 전용) 시크릿으로 받는다.

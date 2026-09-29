@@ -1,4 +1,5 @@
 name: Cleanup DECS Tags
+run-name: "decs 태그 ${{ inputs.delete && '삭제' || '목록만' }} — 남김 ${{ inputs.keep_pattern }}"
 
 # 사용자 컨테이너 이미지(dguailab/decs)에서 keep_pattern에 맞지 않는 태그를 지운다.
 # 기본은 지울 목록만 출력하고, delete를 켜야 실제로 지운다. 지운 태그는 되돌릴 수 없다 — 그 태그로 띄운 Pod는
