@@ -1,0 +1,76 @@
+name: Cleanup DECS Tags
+
+# 사용자 컨테이너 이미지(dguailab/decs)에서 keep_pattern에 맞지 않는 태그를 지운다.
+# 기본은 지울 목록만 출력하고, delete를 켜야 실제로 지운다. 지운 태그는 되돌릴 수 없다 — 그 태그로 띄운 Pod는
+# 노드에 이미지가 캐시돼 있는 동안만 다시 뜬다. 쓰는 중인 태그(스택 DB의 container_image)를 keep_pattern에 넣는다.
+# 공개 저장소라 로그에는 태그 이름과 응답 코드만 남긴다.
+on:
+  workflow_dispatch:
+    inputs:
+      keep_pattern:
+        description: "남길 태그 정규식(grep -E, 전체 일치). 예: .*-2609(29|30)"
+        required: true
+        type: string
+      delete:
+        description: "켜면 실제로 지운다(끄면 목록만 출력)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleanup-decs-tags
+  cancel-in-progress: false
+
+env:
+  REPOSITORY: dguailab/decs
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: 태그 목록
+        env:
+          KEEP_PATTERN: ${{ inputs.keep_pattern }}
+        run: |
+          set -euo pipefail
+          url="https://hub.docker.com/v2/namespaces/${REPOSITORY%%/*}/repositories/${REPOSITORY#*/}/tags?page_size=100"
+          : > all.txt
+          while [ -n "$url" ] && [ "$url" != "null" ]; do
+            page=$(curl -fsS "$url")
+            jq -r '.results[].name' <<<"$page" >> all.txt
+            url=$(jq -r '.next' <<<"$page")
+          done
+          sort -u -o all.txt all.txt
+          grep -xE -- "$KEEP_PATTERN" all.txt > keep.txt || true
+          grep -vxF -f keep.txt all.txt > delete.txt || true
+          echo "전체 $(wc -l < all.txt)개, 남김 $(wc -l < keep.txt)개, 지움 $(wc -l < delete.txt)개"
+          echo "--- 남김"; cat keep.txt
+          echo "--- 지움"; cat delete.txt
+          # 패턴 오타로 전부 지우는 일을 막는다.
+          [ -s keep.txt ] || { echo "keep_pattern에 맞는 태그가 하나도 없어 중단"; exit 1; }
+
+      - name: 태그 삭제
+        if: inputs.delete
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          token=$(jq -n --arg id "$DOCKER_USERNAME" --arg secret "$DOCKER_PASSWORD" '{identifier: $id, secret: $secret}' \
+            | curl -fsS -H 'Content-Type: application/json' -d @- https://hub.docker.com/v2/auth/token \
+            | jq -r '.access_token')
+          [ -n "$token" ] && [ "$token" != "null" ] || { echo "Docker Hub 토큰 발급 실패"; exit 1; }
+          echo "::add-mask::$token"
+          failed=0
+          while read -r tag; do
+            [ -n "$tag" ] || continue
+            code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "Authorization: Bearer $token" \
+              "https://hub.docker.com/v2/repositories/${REPOSITORY}/tags/${tag}/")
+            echo "$tag $code"
+            [ "$code" = 204 ] || failed=$((failed + 1))
+          done < delete.txt
+          [ "$failed" -eq 0 ] || { echo "삭제 실패 ${failed}개"; exit 1; }
