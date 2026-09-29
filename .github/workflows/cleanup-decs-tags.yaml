@@ -63,7 +63,10 @@ jobs:
           token=$(jq -n --arg id "$DOCKER_USERNAME" --arg secret "$DOCKER_PASSWORD" '{identifier: $id, secret: $secret}' \
             | curl -fsS -H 'Content-Type: application/json' -d @- https://hub.docker.com/v2/auth/token \
             | jq -r '.access_token')
-          [ -n "$token" ] && [ "$token" != "null" ] || { echo "Docker Hub 토큰 발급 실패"; exit 1; }
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "Docker Hub 토큰 발급 실패"
+            exit 1
+          fi
           echo "::add-mask::$token"
           failed=0
           while read -r tag; do
