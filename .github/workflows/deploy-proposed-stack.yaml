@@ -262,41 +262,35 @@ jobs:
           ref: ${{ inputs.ref }}
           path: proposed
 
-      - name: 배포 서버의 이전 복사본 정리
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.K8S_HOST }}
-          username: ${{ secrets.K8S_USERNAME }}
-          key: ${{ secrets.K8S_PRIVATE_KEY }}
-          port: ${{ secrets.K8S_PORT }}
-          script: rm -rf ~/deploy-temp-exp/${{ inputs.stack }} && mkdir -p ~/deploy-temp-exp/${{ inputs.stack }}
-
-      - name: 차트와 설치 스크립트 복사
-        uses: appleboy/scp-action@master
-        with:
-          host: ${{ secrets.K8S_HOST }}
-          username: ${{ secrets.K8S_USERNAME }}
-          key: ${{ secrets.K8S_PRIVATE_KEY }}
-          port: ${{ secrets.K8S_PORT }}
-          source: "proposed/config-server/Chart,proposed/pvc-image-chart,proposed/infra-sql,proposed/ops/proposed-stack"
-          target: "~/deploy-temp-exp/${{ inputs.stack }}"
-          strip_components: 1
-
+      # 정리·복사·실행을 ssh 연결 하나로 한다. 예전에는 단계마다 액션이 실행 파일을 받고 연결을 새로 맺어
+      # 파일 몇 개 옮기는 데만 10초 넘게 걸렸다. 값은 전부 환경 변수로 넘겨 명령 문자열에 끼워 넣지 않는다.
+      # 접속 주소가 로그에 남지 않도록 ssh 안내 출력(LogLevel)을 끈다.
       - name: 실행
-        uses: appleboy/ssh-action@master
-        with:
-          host: ${{ secrets.K8S_HOST }}
-          username: ${{ secrets.K8S_USERNAME }}
-          key: ${{ secrets.K8S_PRIVATE_KEY }}
-          port: ${{ secrets.K8S_PORT }}
-          command_timeout: 40m
-          script: |
-            cd ~/deploy-temp-exp/${{ inputs.stack }}
-            if [ "${{ inputs.action }}" = "up" ]; then
-              bash ops/proposed-stack/stack-up.sh "${{ inputs.stack }}" \
-                "${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ needs.config-server.outputs.sha }}" \
-                "${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ needs.frontend.outputs.sha }}-${{ inputs.stack }}" \
-                "${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ needs.backend.outputs.sha }}"
-            else
-              bash ops/proposed-stack/stack-down.sh "${{ inputs.stack }}"
-            fi
+        timeout-minutes: 40
+        env:
+          K8S_HOST: ${{ secrets.K8S_HOST }}
+          K8S_USERNAME: ${{ secrets.K8S_USERNAME }}
+          K8S_PRIVATE_KEY: ${{ secrets.K8S_PRIVATE_KEY }}
+          K8S_PORT: ${{ secrets.K8S_PORT }}
+          STACK: ${{ inputs.stack }}
+          ACTION: ${{ inputs.action }}
+          CONFIG_IMAGE: ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ needs.config-server.outputs.sha }}
+          FE_IMAGE: ${{ secrets.DOCKER_USERNAME }}/ailab-frontend-exp:${{ needs.frontend.outputs.sha }}-${{ inputs.stack }}
+          BE_IMAGE: ${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ needs.backend.outputs.sha }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          (umask 077; printf '%s\n' "$K8S_PRIVATE_KEY" > ~/.ssh/deploy_key)
+          remote() {
+            ssh -i ~/.ssh/deploy_key -p "$K8S_PORT" -o BatchMode=yes -o IdentitiesOnly=yes \
+              -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=30 \
+              "$K8S_USERNAME@$K8S_HOST" "$@"
+          }
+          DIR="deploy-temp-exp/$STACK"
+          tar -C proposed -czf - config-server/Chart pvc-image-chart infra-sql ops/proposed-stack \
+            | remote "rm -rf ~/$DIR && mkdir -p ~/$DIR && tar -xzf - -C ~/$DIR"
+          if [ "$ACTION" = "up" ]; then
+            remote "cd ~/$DIR && bash ops/proposed-stack/stack-up.sh '$STACK' '$CONFIG_IMAGE' '$FE_IMAGE' '$BE_IMAGE'"
+          else
+            remote "cd ~/$DIR && bash ops/proposed-stack/stack-down.sh '$STACK'"
+          fi
