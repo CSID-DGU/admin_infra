@@ -133,14 +133,15 @@ jobs:
           ref: ${{ inputs.fe_ref }}
           path: fe
 
-      # admin_fe의 nginx.conf는 /api/와 /pod-status/ 대상이 운영으로 고정돼 있다. 이 두 줄만 스택 주소로
-      # 바꿔 스택 전용 이미지를 만든다(운영 프론트엔드 이미지·배포는 건드리지 않음).
+      # admin_fe의 nginx.conf는 /api/ 대상이 운영으로 고정돼 있다. 이 줄만 스택 주소로 바꿔 스택 전용 이미지를
+      # 만든다(운영 프론트엔드 이미지·배포는 건드리지 않음). 옛 admin_fe는 /pod-status/로 config-server도
+      # 직접 가리켰으므로, 그 줄이 있으면 함께 바꾼다(옛 버전으로 되돌려 배포할 때를 위해 남겨 둔다).
       - name: 프론트엔드 nginx 대상을 스택으로 변경
         id: fe
         run: |
           NS=ailab-${{ inputs.stack }}
           F=fe/nginx.conf
-          if ! grep -q "admin-prod.default.svc.cluster.local" $F || ! grep -q "containerssh-config-service.ailab-infra.svc.cluster.local" $F; then
+          if ! grep -q "admin-prod.default.svc.cluster.local" $F; then
             echo "admin_fe nginx.conf의 프록시 대상이 예상과 달라 중단"; exit 1
           fi
           sed -i -e "s#admin-prod.default.svc.cluster.local#admin-prod.$NS.svc.cluster.local#" \
