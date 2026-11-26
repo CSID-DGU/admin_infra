@@ -143,3 +143,19 @@ jobs:
             args+=(--image-tag "$IMAGE_TAG" --image-digest "$IMAGE_DIGEST")
           fi
           bash proposed/ops/cluster-config/deploy.sh "${args[@]}"
+
+      - name: FARM 승격용 LAB 성공 digest 기록
+        if: inputs.action == 'upgrade'
+        env:
+          IMAGE_DIGEST: ${{ needs.image.outputs.image_digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "LAB_DEPLOYED_IMAGE_DIGEST=$IMAGE_DIGEST"
+          {
+            echo "### LAB Config Server 배포 성공 digest"
+            echo
+            echo "FARM upgrade의 expected_image_digest 입력에 아래 값을 그대로 사용한다."
+            echo
+            echo "\`$IMAGE_DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"

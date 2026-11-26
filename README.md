@@ -24,6 +24,12 @@ kubeconfig나 SSH private key를 GitHub Secret으로 전달하지 않는다. `up
 이미지는 source revision OCI label을 확인하고 최종 registry digest로 고정하므로 같은 tag가 나중에 바뀌어도
 실제 배포 payload는 변하지 않는다.
 
+같은 릴리스를 LAB에서 검증한 뒤 FARM으로 승격할 때는 **LAB upgrade를 먼저 성공**시킨다. 성공한 LAB
+workflow의 Summary 또는 `LAB_DEPLOYED_IMAGE_DIGEST=` 로그에 나온 `sha256:...` 값을 FARM upgrade의
+`expected_image_digest`에 그대로 입력한다. FARM workflow는 GitHub-hosted runner에서 준비한 image digest와
+이 값을 비교하고, 형식이 틀리거나 한 글자라도 다르면 FARM-MGMT runner를 배정하기 전에 중단한다. FARM
+`probe`에서는 `expected_image_digest`를 비워 둬야 한다.
+
 ---
 
 ## API 문서 및 모니터링 (구 운영 config-server)

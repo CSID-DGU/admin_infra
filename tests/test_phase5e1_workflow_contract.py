@@ -80,6 +80,47 @@ class Phase5E1WorkflowContractTests(unittest.TestCase):
         self.assertIn('echo "tag=$SOURCE_SHA" >> "$GITHUB_OUTPUT"', source)
         self.assertIn('echo "digest=$digest" >> "$GITHUB_OUTPUT"', source)
 
+    def test_farm_upgrade_requires_the_exact_lab_deployed_image_digest(self):
+        farm = (WORKFLOWS / "deploy-farm-config-server.yaml").read_text()
+        lab = (WORKFLOWS / "deploy-lab-config-server.yaml").read_text()
+
+        self.assertIn(
+            '''      expected_image_digest:
+        description: "upgrade: 성공한 LAB run의 LAB_DEPLOYED_IMAGE_DIGEST / probe: 비워 둠"
+        required: false
+        type: string
+        default: ""''',
+            farm,
+        )
+        self.assertIn("EXPECTED_IMAGE_DIGEST: ${{ inputs.expected_image_digest }}", farm)
+        self.assertIn('test -z "$EXPECTED_IMAGE_DIGEST" || {', farm)
+        self.assertIn(
+            '[[ "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {', farm
+        )
+        self.assertIn("image_contract:", farm)
+        self.assertIn("BUILT_IMAGE_DIGEST: ${{ needs.image.outputs.image_digest }}", farm)
+        self.assertIn('[[ "$BUILT_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]', farm)
+        self.assertIn('test "$BUILT_IMAGE_DIGEST" = "$EXPECTED_IMAGE_DIGEST" || {', farm)
+        self.assertIn("needs: [source, image, image_contract]", farm)
+        self.assertIn("needs.image_contract.result == 'success'", farm)
+        contract = farm.split("  image_contract:", 1)[1].split("\n  deploy:", 1)[0]
+        self.assertIn("runs-on: ubuntu-24.04", contract)
+        self.assertNotIn("provi-farm-mgmt-deploy", contract)
+        self.assertLess(
+            farm.index("  image_contract:"),
+            farm.index("      group: provi-farm-mgmt-deploy"),
+        )
+        self.assertNotIn("expected_image_digest:", lab)
+        self.assertIn("FARM 승격용 LAB 성공 digest 기록", lab)
+        self.assertIn('echo "LAB_DEPLOYED_IMAGE_DIGEST=$IMAGE_DIGEST"', lab)
+        self.assertIn(
+            "FARM upgrade의 expected_image_digest 입력에 아래 값을 그대로 사용한다.", lab
+        )
+        self.assertLess(
+            lab.index('bash proposed/ops/cluster-config/deploy.sh "${args[@]}"'),
+            lab.index("FARM 승격용 LAB 성공 digest 기록"),
+        )
+
     def test_external_actions_are_pinned_to_full_commits(self):
         targets = [
             "_build-config-server-image.yaml",
