@@ -8,8 +8,9 @@ run-name: "${{ inputs.stack }} ${{ inputs.action }} — infra ${{ inputs.ref }} 
 # 코드는 CSID-DGU/admin_infra-proposed, 프론트엔드는 CSID-DGU/admin_fe, 백엔드는 CSID-DGU/admin_be에서 가져온다.
 # 브랜치 규칙(admin_wiki 브랜치-규칙.md): 네 저장소 모두 main 하나. 실험 스택은 main(또는 작업 브랜치)을,
 # operation은 네 저장소에 같은 이름으로 찍은 릴리스 태그(vX.Y.Z)만 배포한다 — guard 작업이 막는다.
-# 배포 시크릿은 이 레포의 것을 쓴다. 이미지 이름(config-server-exp), 배포 서버의 차트 복사 경로
-# (~/deploy-temp-exp), helm 릴리스명(config-server-<stack>)은 스택마다 다르다.
+# 배포 시크릿은 이 레포의 것을 쓴다. 이미지 이름(config-server-exp)과
+# helm 릴리스명(config-server-<stack>)은 스택마다 다르다. 실제 배포는 FARM-MGMT의 제한된
+# self-hosted runner가 로컬 kubeconfig를 사용해 실행하며, SSH 키나 중간 배포 서버는 쓰지 않는다.
 #
 # 이미지 세 개를 각각 다른 작업에서 만든다(서로 병렬). 예전에는 한 작업에 15단계가 일렬로 붙어 있어
 # 앞에서 하나만 깨져도 뒤가 전부 버려지고 다시 실행하면 처음부터 다시 만들었다. 지금은 만들어 둔
@@ -65,17 +66,26 @@ jobs:
             exit 1
           fi
 
-  # 실제 배포를 바꾸기 전에 FARM-MGMT 조직 러너와 로컬 kubeconfig만 읽기 전용으로 점검한다.
-  # checkout, 이미지 빌드, Helm 변경, Kubernetes 쓰기 작업은 수행하지 않는다.
+  # 실제 배포를 바꾸기 전에 FARM-MGMT 조직 러너, 로컬 kubeconfig, 배포 소스와 실행 도구를
+  # 읽기 전용으로 점검한다. 이미지 빌드, Helm 변경, Kubernetes 쓰기 작업은 수행하지 않는다.
   executor-probe:
     needs: guard
     if: inputs.action == 'probe'
     runs-on:
       group: provi-farm-mgmt-deploy
       labels: provi-farm-mgmt-deploy
-    permissions: {}
+    permissions:
+      contents: read
     timeout-minutes: 5
     steps:
+      - name: 제안 시스템 코드 체크아웃
+        uses: actions/checkout@v7
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: ${{ inputs.ref }}
+          path: proposed
+          persist-credentials: false
+
       - name: FARM-MGMT 로컬 실행 경로 읽기 전용 점검
         shell: bash
         run: |
@@ -83,15 +93,37 @@ jobs:
           test "$(hostname)" = "farm-mgmt"
           test "$(id -un)" = "svmanager"
 
-          KUBECONFIG=/etc/kubernetes/ci-deployer.conf
+          readonly KUBECONFIG=/etc/kubernetes/ci-deployer.conf
+          export KUBECONFIG
           test -r "$KUBECONFIG"
           test "$(stat -c '%U:%G:%a' "$KUBECONFIG")" = "root:svmanager:640"
-          test "$(kubectl --kubeconfig="$KUBECONFIG" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.2.198:6443"
-          test "$(kubectl --kubeconfig="$KUBECONFIG" --request-timeout=20s get --raw=/readyz)" = "ok"
-          test "$(kubectl --kubeconfig="$KUBECONFIG" get nodes --no-headers | awk '$2 != "Ready" {count++} END {print count+0}')" = "0"
+          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.2.198:6443"
+          test "$(kubectl --request-timeout=20s get --raw=/readyz)" = "ok"
+          test "$(kubectl get nodes --no-headers | awk '$2 != "Ready" {count++} END {print count+0}')" = "0"
+
+          for command in bash awk sed grep head od tr base64 sort sha256sum python3 ssh-keyscan kubectl helm; do
+            command -v "$command" >/dev/null
+          done
+          for path in \
+            proposed/config-server/Chart/Chart.yaml \
+            proposed/infra-sql/pod_port_db.sql \
+            proposed/infra-sql/operation_log.sql \
+            proposed/infra-sql/trial_manifest.sql \
+            proposed/ops/proposed-stack/stack-up.sh \
+            proposed/ops/proposed-stack/stack-down.sh \
+            proposed/ops/proposed-stack/cluster_profile.py \
+            proposed/ops/proposed-stack/ssh_targets.py; do
+            test -r "$path"
+          done
+          bash -n proposed/ops/proposed-stack/stack-up.sh
+          bash -n proposed/ops/proposed-stack/stack-down.sh
+          python3 -m py_compile \
+            proposed/ops/proposed-stack/cluster_profile.py \
+            proposed/ops/proposed-stack/ssh_targets.py
 
           helm version --short
-          echo "FARM-MGMT executor probe passed without a Kubernetes mutation"
+          echo "admin_infra-proposed @ $(git -C proposed rev-parse HEAD)"
+          echo "FARM-MGMT local deploy probe passed without a Kubernetes mutation"
 
   config-server:
     needs: guard
@@ -282,7 +314,12 @@ jobs:
     needs: [guard, config-server, frontend, backend]
     # down 은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. 건너뜀은 실패가 아니므로 그대로 진행한다.
     if: ${{ inputs.action != 'probe' && !cancelled() && !contains(needs.*.result, 'failure') }}
-    runs-on: ubuntu-24.04
+    runs-on:
+      group: provi-farm-mgmt-deploy
+      labels: provi-farm-mgmt-deploy
+    permissions:
+      contents: read
+    timeout-minutes: 45
     steps:
       - name: 제안 시스템 코드 체크아웃
         uses: actions/checkout@v7
@@ -290,17 +327,13 @@ jobs:
           repository: CSID-DGU/admin_infra-proposed
           ref: ${{ inputs.ref }}
           path: proposed
+          persist-credentials: false
 
-      # 정리·복사·실행을 ssh 연결 하나로 한다. 예전에는 단계마다 액션이 실행 파일을 받고 연결을 새로 맺어
-      # 파일 몇 개 옮기는 데만 10초 넘게 걸렸다. 값은 전부 환경 변수로 넘겨 명령 문자열에 끼워 넣지 않는다.
-      # 접속 주소가 로그에 남지 않도록 ssh 안내 출력(LogLevel)을 끈다.
-      - name: 실행
-        timeout-minutes: 40
+      # 제한된 조직 runner가 FARM-MGMT에서 직접 실행한다. 별도 SSH 키·원격 임시 경로 없이 checkout된
+      # 정확한 커밋과 로컬 API kubeconfig를 사용한다. build 작업은 계속 GitHub-hosted runner에서 수행한다.
+      - name: FARM-MGMT에서 실행
         env:
-          K8S_HOST: ${{ secrets.K8S_HOST }}
-          K8S_USERNAME: ${{ secrets.K8S_USERNAME }}
-          K8S_PRIVATE_KEY: ${{ secrets.K8S_PRIVATE_KEY }}
-          K8S_PORT: ${{ secrets.K8S_PORT }}
+          KUBECONFIG: /etc/kubernetes/ci-deployer.conf
           STACK: ${{ inputs.stack }}
           ACTION: ${{ inputs.action }}
           CONFIG_IMAGE: ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ needs.config-server.outputs.sha }}
@@ -308,18 +341,25 @@ jobs:
           BE_IMAGE: ${{ secrets.DOCKER_USERNAME }}/admin-prod-exp:${{ needs.backend.outputs.sha }}
         run: |
           set -euo pipefail
-          install -m 700 -d ~/.ssh
-          (umask 077; printf '%s\n' "$K8S_PRIVATE_KEY" > ~/.ssh/deploy_key)
-          remote() {
-            ssh -i ~/.ssh/deploy_key -p "$K8S_PORT" -o BatchMode=yes -o IdentitiesOnly=yes \
-              -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ServerAliveInterval=30 \
-              "$K8S_USERNAME@$K8S_HOST" "$@"
-          }
-          DIR="deploy-temp-exp/$STACK"
-          tar -C proposed -czf - config-server/Chart pvc-image-chart infra-sql ops/proposed-stack \
-            | remote "rm -rf ~/$DIR && mkdir -p ~/$DIR && tar -xzf - -C ~/$DIR"
-          if [ "$ACTION" = "up" ]; then
-            remote "cd ~/$DIR && bash ops/proposed-stack/stack-up.sh '$STACK' '$CONFIG_IMAGE' '$FE_IMAGE' '$BE_IMAGE'"
-          else
-            remote "cd ~/$DIR && bash ops/proposed-stack/stack-down.sh '$STACK'"
-          fi
+          test "$(hostname)" = "farm-mgmt"
+          test "$(id -un)" = "svmanager"
+          test -r "$KUBECONFIG"
+          test "$(stat -c '%U:%G:%a' "$KUBECONFIG")" = "root:svmanager:640"
+          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.2.198:6443"
+          test "$(kubectl --request-timeout=20s get --raw=/readyz)" = "ok"
+          test "$(kubectl get nodes --no-headers | awk '$2 != "Ready" {count++} END {print count+0}')" = "0"
+
+          cd proposed
+          echo "admin_infra-proposed @ $(git rev-parse HEAD)"
+          case "$ACTION" in
+            up)
+              bash ops/proposed-stack/stack-up.sh "$STACK" "$CONFIG_IMAGE" "$FE_IMAGE" "$BE_IMAGE"
+              ;;
+            down)
+              bash ops/proposed-stack/stack-down.sh "$STACK"
+              ;;
+            *)
+              echo "지원하지 않는 action: $ACTION" >&2
+              exit 2
+              ;;
+          esac
