@@ -39,7 +39,7 @@ on:
         default: main
         required: true
       action:
-        description: "probe: FARM-MGMT 실행 경로만 점검 / up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
+        description: "probe: FARM-MGMT 실행 경로만 점검 / up: 띄우기(이미 있으면 재배포) / down: 실험 스택만 정리 후 내리기(operation 금지)"
         type: choice
         options: [probe, up, down]
         default: up
@@ -54,6 +54,14 @@ jobs:
   guard:
     runs-on: ubuntu-24.04
     steps:
+      # operation은 기존 사용자 계정 대장을 공유한다. 범용 stack-down은 빈 접두어가 모든 운영 계정을
+      # 대상으로 확장될 수 있으므로, 전용 폐기 절차가 생기기 전까지 workflow 입구에서 차단한다.
+      - name: operation down 차단
+        if: inputs.stack == 'operation' && inputs.action == 'down'
+        run: |
+          echo "operation down은 이 workflow에서 지원하지 않습니다. 운영 계정 전체에 영향을 줄 수 있어 전용 검토·폐기 절차가 필요합니다." >&2
+          exit 1
+
       - name: operation 배포 대상 확인
         if: inputs.stack == 'operation' && inputs.action == 'up'
         env:
@@ -312,8 +320,9 @@ jobs:
 
   deploy:
     needs: [guard, config-server, frontend, backend]
-    # down 은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. 건너뜀은 실패가 아니므로 그대로 진행한다.
-    if: ${{ inputs.action != 'probe' && !cancelled() && !contains(needs.*.result, 'failure') }}
+    # 실험 스택 down은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. operation down은 guard 실패와
+    # 별개로 이 job 조건에서도 제외해 FARM-MGMT runner에 도달하지 못하게 한다.
+    if: ${{ inputs.action != 'probe' && (inputs.stack != 'operation' || inputs.action != 'down') && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on:
       group: provi-farm-mgmt-deploy
       labels: provi-farm-mgmt-deploy
@@ -351,6 +360,13 @@ jobs:
 
           cd proposed
           echo "admin_infra-proposed @ $(git rev-parse HEAD)"
+
+          # workflow 조건이 향후 잘못 수정되더라도 실제 범용 stack-down 실행 직전에 다시 차단한다.
+          if [ "$STACK" = "operation" ] && [ "$ACTION" = "down" ]; then
+            echo "operation down은 FARM-MGMT 범용 배포 경로에서 실행할 수 없습니다." >&2
+            exit 1
+          fi
+
           case "$ACTION" in
             up)
               bash ops/proposed-stack/stack-up.sh "$STACK" "$CONFIG_IMAGE" "$FE_IMAGE" "$BE_IMAGE"
