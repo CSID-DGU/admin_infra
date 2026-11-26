@@ -38,9 +38,9 @@ on:
         default: main
         required: true
       action:
-        description: "up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
+        description: "probe: FARM-MGMT 실행 경로만 점검 / up: 띄우기(이미 있으면 재배포) / down: 테스트 계정 정리 후 내리기"
         type: choice
-        options: [up, down]
+        options: [probe, up, down]
         default: up
 
 concurrency:
@@ -64,6 +64,34 @@ jobs:
             echo "operation은 세 저장소에 같은 릴리스 태그(vX.Y.Z)만 배포합니다: ref=$REF fe_ref=$FE_REF be_ref=$BE_REF"
             exit 1
           fi
+
+  # 실제 배포를 바꾸기 전에 FARM-MGMT 조직 러너와 로컬 kubeconfig만 읽기 전용으로 점검한다.
+  # checkout, 이미지 빌드, Helm 변경, Kubernetes 쓰기 작업은 수행하지 않는다.
+  executor-probe:
+    needs: guard
+    if: inputs.action == 'probe'
+    runs-on:
+      group: provi-farm-mgmt-deploy
+      labels: provi-farm-mgmt-deploy
+    permissions: {}
+    timeout-minutes: 5
+    steps:
+      - name: FARM-MGMT 로컬 실행 경로 읽기 전용 점검
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "farm-mgmt"
+          test "$(id -un)" = "svmanager"
+
+          KUBECONFIG=/etc/kubernetes/ci-deployer.conf
+          test -r "$KUBECONFIG"
+          test "$(stat -c '%U:%G:%a' "$KUBECONFIG")" = "root:svmanager:640"
+          test "$(kubectl --kubeconfig="$KUBECONFIG" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.2.198:6443"
+          test "$(kubectl --kubeconfig="$KUBECONFIG" --request-timeout=20s get --raw=/readyz)" = "ok"
+          test "$(kubectl --kubeconfig="$KUBECONFIG" get nodes --no-headers | awk '$2 != "Ready" {count++} END {print count+0}')" = "0"
+
+          helm version --short
+          echo "FARM-MGMT executor probe passed without a Kubernetes mutation"
 
   config-server:
     needs: guard
@@ -253,7 +281,7 @@ jobs:
   deploy:
     needs: [guard, config-server, frontend, backend]
     # down 은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. 건너뜀은 실패가 아니므로 그대로 진행한다.
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
+    if: ${{ inputs.action != 'probe' && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-24.04
     steps:
       - name: 제안 시스템 코드 체크아웃
