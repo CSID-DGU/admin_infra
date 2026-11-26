@@ -1,3 +1,4 @@
 self-hosted-runner:
   labels:
     - provi-farm-mgmt-deploy
+    - provi-lab-mgmt-deploy

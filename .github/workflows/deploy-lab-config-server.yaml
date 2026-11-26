@@ -1,0 +1,145 @@
+name: Deploy LAB Config Server
+run-name: "LAB config-server ${{ inputs.action }} — source ${{ inputs.ref }}"
+
+# LAB Config Server만 다룬다. 이 경로는 별도 LAB-MGMT 제한 runner에서만 실행된다.
+# Phase 7-B 전에는 entrypoint가 controller/CronJob/쓰기 기능의 API-only gate를 강제한다.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "probe: 읽기 전용 검증 / upgrade: API-only gate를 보존하며 기존 release 갱신"
+        required: true
+        type: choice
+        options: [probe, upgrade]
+        default: probe
+      ref:
+        description: "probe는 main, upgrade는 admin_infra-proposed 릴리스 태그(vX.Y.Z)"
+        required: true
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  # 공통 Config Server image tag를 FARM/legacy operation 경로와 동시에 쓰지 않는다.
+  group: proposed-stack-operation
+  cancel-in-progress: false
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: workflow 및 입력 경계 검증
+        env:
+          ACTION: ${{ inputs.action }}
+          SOURCE_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          case "$ACTION" in
+            probe)
+              test "$SOURCE_REF" = "main" || {
+                echo "probe는 보호된 main의 배포 진입점만 실행합니다." >&2
+                exit 1
+              }
+              ;;
+            upgrade)
+              [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+                echo "upgrade는 vX.Y.Z 릴리스 태그만 허용합니다." >&2
+                exit 1
+              }
+              ;;
+            *)
+              echo "지원하지 않는 action: $ACTION" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: 제안 시스템 소스 해석
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: ${{ inputs.ref }}
+          path: proposed
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: 정확한 소스 커밋 고정
+        id: source
+        env:
+          ACTION: ${{ inputs.action }}
+          SOURCE_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          sha=$(git -C proposed rev-parse HEAD)
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          git -C proposed show-ref --verify --quiet refs/remotes/origin/main
+          git -C proposed merge-base --is-ancestor "$sha" refs/remotes/origin/main || {
+            echo "보호된 main 이력 밖의 소스는 실행할 수 없습니다." >&2
+            exit 1
+          }
+          if [ "$ACTION" = "upgrade" ]; then
+            tag_commit=$(git -C proposed rev-parse "refs/tags/${SOURCE_REF}^{commit}")
+            test "$tag_commit" = "$sha"
+          fi
+          test -f proposed/ops/cluster-config/deploy.sh
+          bash -n proposed/ops/cluster-config/deploy.sh
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: source
+    if: inputs.action == 'upgrade'
+    uses: ./.github/workflows/_build-config-server-image.yaml
+    with:
+      source_sha: ${{ needs.source.outputs.sha }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  deploy:
+    needs: [source, image]
+    if: ${{ always() && needs.source.result == 'success' && (inputs.action == 'probe' || needs.image.result == 'success') }}
+    runs-on:
+      group: provi-lab-mgmt-deploy
+      labels: provi-lab-mgmt-deploy
+    # drain + Helm apply + explicit rollback/recovery의 최악 경로까지 포함한다.
+    timeout-minutes: 120
+    steps:
+      - name: 검증된 제안 시스템 커밋 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: ${{ needs.source.outputs.sha }}
+          path: proposed
+          persist-credentials: false
+
+      - name: LAB-MGMT에서 Config Server 경계 실행
+        env:
+          ACTION: ${{ inputs.action }}
+          SOURCE_SHA: ${{ needs.source.outputs.sha }}
+          IMAGE_TAG: ${{ needs.image.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ needs.image.outputs.image_digest }}
+          KUBECONFIG: /etc/kubernetes/ci-deployer.conf
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "lab-mgmt"
+          test "$(id -un)" = "svmanager"
+          test -r "$KUBECONFIG"
+          test "$(stat -c '%U:%G:%a' "$KUBECONFIG")" = "root:svmanager:640"
+          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.1.198:6443"
+          test "$(kubectl --request-timeout=20s get --raw=/readyz)" = "ok"
+          test "$(git -C proposed rev-parse HEAD)" = "$SOURCE_SHA"
+          bash -n proposed/ops/cluster-config/deploy.sh
+
+          args=(--target lab --action "$ACTION")
+          if [ "$ACTION" = "upgrade" ]; then
+            test "$IMAGE_TAG" = "$SOURCE_SHA"
+            [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+            args+=(--image-tag "$IMAGE_TAG" --image-digest "$IMAGE_DIGEST")
+          fi
+          bash proposed/ops/cluster-config/deploy.sh "${args[@]}"

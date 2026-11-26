@@ -2,12 +2,14 @@ name: Deploy Proposed Stack
 # 실행 목록에서 어느 스택에 무엇을 했는지 바로 보이게 입력값을 제목에 넣는다.
 run-name: "${{ inputs.stack }} ${{ inputs.action }} — infra ${{ inputs.ref }} · fe ${{ inputs.fe_ref }} · be ${{ inputs.be_ref }}"
 
-# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)과 실운영(ailab-operation)을 띄우거나 내린다.
-# operation은 구 운영이 쓰던 계정 대장을 그대로 이어받는다 — 격리된 실험 스택이 아니다. 수동 실행 전용이다.
+# 실험 스택(ailab-baseline / ailab-noprobe / ailab-full)을 띄우거나 내린다.
+# 실운영(ailab-operation)은 구 운영 계정 대장을 공유하므로 이 workflow에서는 읽기 전용
+# executor probe만 허용하고, Config Server 변경은 Deploy FARM Config Server workflow로만 수행한다.
 # 세 스택은 같은 코드이고 config-server의 실행 방식 하나만 다르다.
 # 코드는 CSID-DGU/admin_infra-proposed, 프론트엔드는 CSID-DGU/admin_fe, 백엔드는 CSID-DGU/admin_be에서 가져온다.
-# 브랜치 규칙(admin_wiki 브랜치-규칙.md): 네 저장소 모두 main 하나. 실험 스택은 main(또는 작업 브랜치)을,
-# operation은 네 저장소에 같은 이름으로 찍은 릴리스 태그(vX.Y.Z)만 배포한다 — guard 작업이 막는다.
+# 브랜치 규칙(admin_wiki 브랜치-규칙.md): 네 저장소 모두 main 하나. 이 workflow의
+# 실험 스택은 main(또는 작업 브랜치)을 사용하고, operation 변경은 전용 workflow가
+# 보호된 main 이력의 릴리스 태그(vX.Y.Z)를 검증한 뒤 수행한다.
 # 배포 시크릿은 이 레포의 것을 쓴다. 이미지 이름(config-server-exp)과
 # helm 릴리스명(config-server-<stack>)은 스택마다 다르다. 실제 배포는 FARM-MGMT의 제한된
 # self-hosted runner가 로컬 kubeconfig를 사용해 실행하며, SSH 키나 중간 배포 서버는 쓰지 않는다.
@@ -27,19 +29,19 @@ on:
         options: [baseline, noprobe, full, operation]
         required: true
       ref:
-        description: "admin_infra-proposed의 브랜치·태그·커밋 (operation은 릴리스 태그 vX.Y.Z만)"
+        description: "admin_infra-proposed의 브랜치·태그·커밋 (operation은 probe만 허용)"
         default: main
         required: true
       fe_ref:
-        description: "CSID-DGU/admin_fe의 브랜치·태그·커밋 (operation은 릴리스 태그 vX.Y.Z만)"
+        description: "CSID-DGU/admin_fe의 브랜치·태그·커밋 (operation probe에서는 사용하지 않음)"
         default: main
         required: true
       be_ref:
-        description: "CSID-DGU/admin_be의 브랜치·태그·커밋 (operation은 릴리스 태그 vX.Y.Z만)"
+        description: "CSID-DGU/admin_be의 브랜치·태그·커밋 (operation probe에서는 사용하지 않음)"
         default: main
         required: true
       action:
-        description: "probe: FARM-MGMT 실행 경로만 점검 / up: 띄우기(이미 있으면 재배포) / down: 실험 스택만 정리 후 내리기(operation 금지)"
+        description: "probe: 실행 경로만 점검 / up·down: 실험 스택 전용(operation 금지)"
         type: choice
         options: [probe, up, down]
         default: up
@@ -49,30 +51,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # operation은 세 저장소에 같은 이름으로 찍은 릴리스 태그만 받는다. 브랜치를 주면 배포 시점마다 다른 코드가
-  # 운영에 올라가고, 무엇이 떠 있는지 태그 하나로 말할 수 없다.
+  # operation 변경은 chart·image digest·rollback gate를 갖춘 전용 workflow로만 수행한다.
+  # 이 guard는 이전 범용 stack workflow가 운영 Config Server를 다시 덮는 우회 경로를 닫는다.
   guard:
     runs-on: ubuntu-24.04
     steps:
-      # operation은 기존 사용자 계정 대장을 공유한다. 범용 stack-down은 빈 접두어가 모든 운영 계정을
-      # 대상으로 확장될 수 있으므로, 전용 폐기 절차가 생기기 전까지 workflow 입구에서 차단한다.
-      - name: operation down 차단
-        if: inputs.stack == 'operation' && inputs.action == 'down'
+      - name: operation 변경을 전용 workflow로 강제
+        if: inputs.stack == 'operation' && inputs.action != 'probe'
         run: |
-          echo "operation down은 이 workflow에서 지원하지 않습니다. 운영 계정 전체에 영향을 줄 수 있어 전용 검토·폐기 절차가 필요합니다." >&2
+          echo "operation up/down은 이 workflow에서 영구 차단되었습니다." >&2
+          echo "FARM Config Server는 Actions > Deploy FARM Config Server를 사용하세요." >&2
+          echo "operation 전체 폐기는 별도 검토·폐기 절차가 필요합니다." >&2
           exit 1
-
-      - name: operation 배포 대상 확인
-        if: inputs.stack == 'operation' && inputs.action == 'up'
-        env:
-          REF: ${{ inputs.ref }}
-          FE_REF: ${{ inputs.fe_ref }}
-          BE_REF: ${{ inputs.be_ref }}
-        run: |
-          if ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || [ "$FE_REF" != "$REF" ] || [ "$BE_REF" != "$REF" ]; then
-            echo "operation은 세 저장소에 같은 릴리스 태그(vX.Y.Z)만 배포합니다: ref=$REF fe_ref=$FE_REF be_ref=$BE_REF"
-            exit 1
-          fi
 
   # 실제 배포를 바꾸기 전에 FARM-MGMT 조직 러너, 로컬 kubeconfig, 배포 소스와 실행 도구를
   # 읽기 전용으로 점검한다. 이미지 빌드, Helm 변경, Kubernetes 쓰기 작업은 수행하지 않는다.
@@ -87,7 +77,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: 제안 시스템 코드 체크아웃
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: CSID-DGU/admin_infra-proposed
           ref: ${{ inputs.ref }}
@@ -141,7 +131,7 @@ jobs:
       sha: ${{ steps.src.outputs.sha }}
     steps:
       - name: 제안 시스템 코드 체크아웃
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: CSID-DGU/admin_infra-proposed
           ref: ${{ inputs.ref }}
@@ -155,7 +145,7 @@ jobs:
           echo "admin_infra-proposed @ $SHA"
 
       - name: Docker Hub 로그인
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -174,11 +164,11 @@ jobs:
 
       - name: 빌더 준비
         if: steps.exists.outputs.skip == 'false'
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: config-server 이미지 빌드
         if: steps.exists.outputs.skip == 'false'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ./proposed/config-server
           file: ./proposed/config-server/Dockerfile
@@ -195,7 +185,7 @@ jobs:
       sha: ${{ steps.fe.outputs.sha }}
     steps:
       - name: 프론트엔드 코드 체크아웃
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: CSID-DGU/admin_fe
           ref: ${{ inputs.fe_ref }}
@@ -219,7 +209,7 @@ jobs:
           echo "sha=$(git -C fe rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Docker Hub 로그인
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -238,11 +228,11 @@ jobs:
 
       - name: 빌더 준비
         if: steps.exists.outputs.skip == 'false'
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: 프론트엔드 이미지 빌드
         if: steps.exists.outputs.skip == 'false'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ./fe
           file: ./fe/Dockerfile
@@ -260,7 +250,7 @@ jobs:
     steps:
       # 스택 admin_be는 세 방식 모두 같은 브랜치에서 빌드한다. 운영 admin_be 배포(main push)에는 닿지 않는다.
       - name: admin_be 코드 체크아웃
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: CSID-DGU/admin_be
           ref: ${{ inputs.be_ref }}
@@ -271,7 +261,7 @@ jobs:
         run: echo "sha=$(git -C be rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Docker Hub 로그인
-        uses: docker/login-action@v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
@@ -289,7 +279,7 @@ jobs:
 
       - name: JDK 17 설정
         if: steps.exists.outputs.skip == 'false'
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6
         with:
           java-version: '17'
           distribution: 'temurin'
@@ -305,11 +295,11 @@ jobs:
 
       - name: 빌더 준비
         if: steps.exists.outputs.skip == 'false'
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: admin_be 이미지 빌드
         if: steps.exists.outputs.skip == 'false'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: ./be
           file: ./be/Dockerfile
@@ -320,9 +310,9 @@ jobs:
 
   deploy:
     needs: [guard, config-server, frontend, backend]
-    # 실험 스택 down은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. operation down은 guard 실패와
+    # 실험 스택 down은 이미지가 필요 없어 위 세 작업이 건너뛰어진다. operation 변경은 guard와
     # 별개로 이 job 조건에서도 제외해 FARM-MGMT runner에 도달하지 못하게 한다.
-    if: ${{ inputs.action != 'probe' && (inputs.stack != 'operation' || inputs.action != 'down') && !cancelled() && !contains(needs.*.result, 'failure') }}
+    if: ${{ inputs.action != 'probe' && inputs.stack != 'operation' && !cancelled() && !contains(needs.*.result, 'failure') }}
     runs-on:
       group: provi-farm-mgmt-deploy
       labels: provi-farm-mgmt-deploy
@@ -331,7 +321,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: 제안 시스템 코드 체크아웃
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: CSID-DGU/admin_infra-proposed
           ref: ${{ inputs.ref }}
@@ -361,9 +351,9 @@ jobs:
           cd proposed
           echo "admin_infra-proposed @ $(git rev-parse HEAD)"
 
-          # workflow 조건이 향후 잘못 수정되더라도 실제 범용 stack-down 실행 직전에 다시 차단한다.
-          if [ "$STACK" = "operation" ] && [ "$ACTION" = "down" ]; then
-            echo "operation down은 FARM-MGMT 범용 배포 경로에서 실행할 수 없습니다." >&2
+          # workflow 조건이 향후 잘못 수정되더라도 실제 범용 mutation 직전에 다시 차단한다.
+          if [ "$STACK" = "operation" ]; then
+            echo "operation 변경은 Deploy FARM Config Server workflow로만 실행할 수 있습니다." >&2
             exit 1
           fi
 

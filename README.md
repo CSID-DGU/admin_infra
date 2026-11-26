@@ -9,10 +9,19 @@ admin_fe·admin_be·admin_infra·admin_infra-proposed 네 저장소가 같은 �
 
 - 브랜치는 `main` 하나다. 작업은 `main`에서 `<커밋 타입>/v<버전>-<짧은 설명>` 브랜치를 따서(예: `fix/v3.0-returning-user-uid`) PR로 `main`에 squash 병합한다.
 - PR은 CI(테스트) 통과가 필요하다.
-- 어느 브랜치에 push해도 자동 배포는 없다. 배포는 admin_infra의 **Deploy Proposed Stack** 워크플로로만 한다.
+- 어느 브랜치에 push해도 자동 배포는 없다. 수동 배포는 목적별 workflow로 분리한다.
+  - **Deploy Proposed Stack**: 기존 실험·operation 전체 스택 경로이며 전환 기간 rollback 용도로 보존한다.
+  - **Deploy FARM Config Server**: FARM-MGMT에서 기존 FARM Config Server release만 점검하거나 갱신한다.
+  - **Deploy LAB Config Server**: LAB-MGMT에서 기존 LAB API-only Config Server release만 점검하거나 갱신한다.
 - 실험 스택은 `main`(또는 작업 브랜치)을, 운영(operation)은 네 저장소에 같은 이름으로 찍은 릴리스 태그 `vX.Y.Z`만 배포한다.
 
-이 레포의 `config-server/`는 구 운영용이다. 자동 배포 워크플로(`deploy-config-server.yaml`)는 없앴고, 운영 config-server 코드는 admin_infra-proposed에 있다.
+이 레포의 `config-server/`는 구 운영용이다. 운영 Config Server 코드와 역할별 배포 진입점은
+`admin_infra-proposed`에 있다. FARM/LAB workflow는 이미지를 GitHub-hosted runner에서 준비한 뒤 각 관리
+호스트의 제한된 self-hosted runner와 로컬 `/etc/kubernetes/ci-deployer.conf`만 사용한다. 클러스터
+kubeconfig나 SSH private key를 GitHub Secret으로 전달하지 않는다. `upgrade`는 보호된 `main` 이력에
+포함된 `admin_infra-proposed`의 `vX.Y.Z` 태그만 받아, 같은 커밋의 chart와 Config Server 이미지를 함께 적용한다.
+이미지는 source revision OCI label을 확인하고 최종 registry digest로 고정하므로 같은 tag가 나중에 바뀌어도
+실제 배포 payload는 변하지 않는다.
 
 ---
 
@@ -84,5 +93,10 @@ kubectl describe pod <POD_NAME> -n cssh | grep Image
 # 7. 환경 변수 및 시크릿
 CI/CD 작동을 위해 GitHub Repository Secrets에 다음 변수들이 등록되어 있습니다.
 - Docker Hub: `DOCKER_USERNAME`, `DOCKER_PASSWORD`
-- Kubernetes Access: `K8S_HOST`, `K8S_USERNAME`, `K8S_PRIVATE_KEY`, `K8S_PORT`
-> 현재는 username이 toni와 key로 되어있으며, 관리자 변경 시 인수인계가 필요합니다.
+- Deprecated Kubernetes Access: `K8S_HOST`, `K8S_USERNAME`, `K8S_PRIVATE_KEY`, `K8S_PORT`
+
+FARM/LAB Config Server 분리 workflow는 위 `K8S_*` Secret을 사용하지 않는다. FARM-MGMT와 LAB-MGMT의
+제한된 runner가 각각 로컬 kubeconfig를 사용하며, GitHub에는 Docker Hub 자격만 전달한다.
+`Sync Config Server Secrets to K8s`는 구 SSH·Helm 우회 경로를 제거한 audit/history용 fail-closed
+workflow로, 실행하면 Secret을 읽거나 클러스터를 변경하지 않고 즉시 실패한다. 현재
+저장소 workflow 중 `K8S_*`를 참조하는 경로는 없으며, 외부 사용처가 없음을 확인한 뒤 폐기한다.

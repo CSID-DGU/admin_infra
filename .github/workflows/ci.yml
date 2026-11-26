@@ -1,6 +1,6 @@
 name: CI
 
-# PR과 main에 들어온 변경을 검사한다. 이 레포에는 테스트 코드가 없으므로 워크플로 정의 자체를 검사한다.
+# PR과 main에 들어온 변경을 검사한다. 배포 workflow의 정적 계약 테스트와 actionlint를 함께 실행한다.
 # 공개 저장소라 로그에 인프라 주소·계정·설정값을 출력하는 단계를 두지 않는다.
 
 on:
@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+      - name: Phase 5-E1 배포 경계 계약 테스트
+        run: python3 -m unittest -v tests/test_phase5e1_workflow_contract.py
       - name: actionlint
         run: |
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
