@@ -1,0 +1,148 @@
+name: Build Config Server Image
+
+# FARM/LAB 배포 workflow가 공통으로 쓰는 이미지 준비 경계다. 수동 실행할 수 없고,
+# 호출자가 GitHub-hosted runner에서 해석·검증한 정확한 40자리 소스 SHA만 받는다.
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: "admin_infra-proposed의 검증된 40자리 커밋 SHA"
+        required: true
+        type: string
+    outputs:
+      image_tag:
+        description: "배포할 config-server 불변 이미지 태그"
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_digest:
+        description: "검증된 config-server registry digest"
+        value: ${{ jobs.build.outputs.image_digest }}
+    secrets:
+      DOCKER_USERNAME:
+        required: true
+      DOCKER_PASSWORD:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image_tag: ${{ steps.result.outputs.tag }}
+      image_digest: ${{ steps.result.outputs.digest }}
+    steps:
+      - name: 소스 SHA 형식 확인
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - name: 제안 시스템의 정확한 커밋 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: ${{ inputs.source_sha }}
+          path: proposed
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 체크아웃 및 이미지 입력 검증
+        id: source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git -C proposed rev-parse HEAD)" = "$SOURCE_SHA"
+          git -C proposed show-ref --verify --quiet refs/remotes/origin/main
+          git -C proposed merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main || {
+            echo "보호된 main 이력 밖의 소스 이미지는 빌드할 수 없습니다." >&2
+            exit 1
+          }
+          test -f proposed/config-server/Dockerfile
+          test -f proposed/config-server/Chart/Chart.yaml
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: 운영 Docker Hub repository 소유자 확인
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: |
+          set -euo pipefail
+          test "$DOCKER_USERNAME" = "dguailab" || {
+            echo "운영 Config Server repository 소유자가 예상과 달라 중단합니다." >&2
+            exit 1
+          }
+
+      - name: Docker Hub 인증
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 동일한 source label의 기존 이미지 확인
+        id: image
+        env:
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.source.outputs.sha }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          exists=false
+          digest=
+          if docker pull "$IMAGE" >/dev/null 2>&1; then
+            # 예전 이미지처럼 Labels 또는 RepoDigests가 비어 있어도 inspect 오류로
+            # workflow 전체가 즉시 끝나지 않게 한다. 두 값이 모두 계약을 만족할
+            # 때만 기존 이미지를 재사용하고, 아니면 아래 build 단계로 보낸다.
+            revision=$(docker image inspect \
+              --format '{{ with .Config.Labels }}{{ index . "org.opencontainers.image.revision" }}{{ end }}' \
+              "$IMAGE" 2>/dev/null || true)
+            repository=${IMAGE%:*}
+            repo_digest=$(docker image inspect \
+              --format '{{ range .RepoDigests }}{{ println . }}{{ end }}' \
+              "$IMAGE" 2>/dev/null \
+              | awk -v prefix="$repository@" 'index($0, prefix) == 1 { print; exit }' \
+              || true)
+            candidate=${repo_digest##*@}
+            if [ "$revision" = "$SOURCE_SHA" ] && [[ "$candidate" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              exists=true
+              digest=$candidate
+              echo "동일한 source label과 registry digest가 검증돼 빌드를 재사용합니다."
+            else
+              echo "기존 tag의 source label 또는 digest가 달라 검증된 이미지로 교체합니다."
+            fi
+          fi
+          echo "exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Buildx 준비
+        if: steps.image.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: config-server 이미지 빌드 및 푸시
+        id: build
+        if: steps.image.outputs.exists == 'false'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: ./proposed/config-server
+          file: ./proposed/config-server/Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_USERNAME }}/config-server-exp:${{ steps.source.outputs.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/CSID-DGU/admin_infra-proposed
+          cache-from: type=gha,scope=config-server
+          cache-to: type=gha,mode=max,scope=config-server
+
+      - name: 최종 registry digest 봉인
+        id: result
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          EXISTING_DIGEST: ${{ steps.image.outputs.digest }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          digest=${EXISTING_DIGEST:-$BUILT_DIGEST}
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "tag=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
