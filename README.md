@@ -10,10 +10,11 @@ admin_fe·admin_be·admin_infra·admin_infra-proposed 네 저장소가 같은 �
 - 브랜치는 `main` 하나다. 작업은 `main`에서 `<커밋 타입>/v<버전>-<짧은 설명>` 브랜치를 따서(예: `fix/v3.0-returning-user-uid`) PR로 `main`에 squash 병합한다.
 - PR은 CI(테스트) 통과가 필요하다.
 - 어느 브랜치에 push해도 자동 배포는 없다. 수동 배포는 목적별 workflow로 분리한다.
-  - **Deploy Proposed Stack**: 기존 실험·operation 전체 스택 경로이며 전환 기간 rollback 용도로 보존한다.
+  - **Deploy Proposed Stack**: 실험 스택과 operation 실행 경로 probe만 유지한다. operation `up/down`은 차단한다.
   - **Deploy FARM Config Server**: FARM-MGMT에서 기존 FARM Config Server release만 점검하거나 갱신한다.
   - **Deploy LAB Config Server**: LAB-MGMT에서 기존 LAB API-only Config Server release만 점검하거나 갱신한다.
-- 실험 스택은 `main`(또는 작업 브랜치)을, 운영(operation)은 네 저장소에 같은 이름으로 찍은 릴리스 태그 `vX.Y.Z`만 배포한다.
+- 실험 스택은 `main`(또는 작업 브랜치)을 사용한다. FARM/LAB Config Server `upgrade`는 보호된
+  `admin_infra-proposed/main` 이력의 릴리스 태그 `vX.Y.Z`만 사용한다.
 
 이 레포의 `config-server/`는 구 운영용이다. 운영 Config Server 코드와 역할별 배포 진입점은
 `admin_infra-proposed`에 있다. FARM/LAB workflow는 이미지를 GitHub-hosted runner에서 준비한 뒤 각 관리

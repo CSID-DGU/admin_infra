@@ -2,7 +2,8 @@ name: Deploy FARM Config Server
 run-name: "FARM config-server ${{ inputs.action }} — source ${{ inputs.ref }}"
 
 # FARM Config Server만 다룬다. Admin Web/BE/DB/Redis와 LAB 자원은 이 workflow의
-# 배포 범위가 아니다. 기존 deploy-proposed-stack.yaml은 검증된 롤백 경로로 보존한다.
+# 배포 범위가 아니다. 기존 deploy-proposed-stack.yaml의 operation mutation은 차단되어 있으며,
+# FARM Config Server 변경은 이 전용 workflow로만 수행한다.
 on:
   workflow_dispatch:
     inputs:
