@@ -1,9 +1,125 @@
+import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy-master-admin.yaml"
+RULES_VALIDATOR = ROOT / ".github" / "scripts" / "phase5g2b-reader-effective-rules-validator.jq"
+MONITORING_VALIDATOR = ROOT / ".github" / "scripts" / "phase5g2b-monitoring-render-validator.sh"
+MONITORING_IMAGE_PINS = ROOT / ".github" / "config" / "master-monitoring-image-pins.yaml"
+
+PROPOSED_SHA = "9600e377c15ed9f678ae039dd7daa72d615039b4"
+FRONTEND_SHA = "bb1c5f80c9313619d7897c3a25a96032d2b2f6e4"
+BACKEND_SHA = "d9be83b8fe699ba034fa5b3d5f50ce945d61c980"
+
+MONITORING_RENDER_FIXTURE = """---
+apiVersion: v1
+kind: Service
+metadata:
+  name: master-monitoring
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: master-monitoring-operator
+spec:
+  template:
+    spec:
+      hostNetwork: false
+      initContainers:
+        - name: busybox
+          image: docker.io/library/busybox:1.31.1@sha256:95cf004f559831017cdf4628aaf1bb30133677be8702a8c5f2994629f637a209
+      containers:
+        - name: grafana
+          image: docker.io/grafana/grafana:12.3.0@sha256:70d9599b186ce287be0d2c5ba9a78acb2e86c1a68c9c41449454d0fc3eeb84e8
+        - name: sidecar
+          image: quay.io/kiwigrid/k8s-sidecar:2.1.2@sha256:716b0b33ff2dc938a3f2bc64e5ea791d81fb09760bcd27cec1eb896968d6e134
+        - name: operator
+          image: quay.io/prometheus-operator/prometheus-operator:v0.87.1@sha256:6dbbbbeca6d7b94aa30723bfaa55262e41b9f8c15304c484611c696503840aac
+          args:
+            - --prometheus-config-reloader=quay.io/prometheus-operator/prometheus-config-reloader:v0.87.1@sha256:257ce3543e8f45c059dab488bcf897d8cc598cabd78afba12f41d6dbe36e22d2
+            - --thanos-default-base-image=quay.io/thanos/thanos:v0.40.1@sha256:aae7b2b030ed00d88abd8c5a357d08b46f22151ca0d50d9c796223fa332389c8
+        - name: node-exporter
+          image: quay.io/prometheus/node-exporter:v1.10.2@sha256:337ff1d356b68d39cef853e8c6345de11ce7556bb34cda8bd205bcf2ed30b565
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.17.0@sha256:2bbc915567334b13632bf62c0a97084aff72a36e13c4dabd5f2f11c898c5bacd
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: master-monitoring-prometheus
+spec:
+  image: quay.io/prometheus/prometheus:v3.8.0@sha256:d936808bdea528155c0154a922cd42fd75716b8bb7ba302641350f9f3eaeba09
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Alertmanager
+metadata:
+  name: master-monitoring-alertmanager
+spec:
+  image: quay.io/prometheus/alertmanager:v0.29.0@sha256:88743b63b3e09ea6e31e140ced5bf45f4a8e82c617c2a963f78841f4995ad1d7
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: master-monitoring-admission-create
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+spec:
+  template:
+    spec:
+      containers:
+        - name: create
+          image: ghcr.io/jkroepke/kube-webhook-certgen:1.7.3@sha256:c7f925cc3ec386e11b7393f941a8844786311fd2328943fe3e7c744c373ed864
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: master-monitoring-admission-patch
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+spec:
+  template:
+    spec:
+      containers:
+        - name: patch
+          image: ghcr.io/jkroepke/kube-webhook-certgen:1.7.3@sha256:c7f925cc3ec386e11b7393f941a8844786311fd2328943fe3e7c744c373ed864
+"""
+
+
+def valid_reader_rules_review():
+    return {
+        "apiVersion": "authorization.k8s.io/v1",
+        "kind": "SelfSubjectRulesReview",
+        "spec": {"namespace": "ailab-operation"},
+        "status": {
+            "incomplete": False,
+            "resourceRules": [
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list"]},
+                {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+                {"apiGroups": [""], "resources": ["events"], "verbs": ["list"]},
+                {
+                    "apiGroups": ["authorization.k8s.io"],
+                    "resources": ["selfsubjectaccessreviews", "selfsubjectrulesreviews"],
+                    "verbs": ["create"],
+                },
+                {
+                    "apiGroups": ["authentication.k8s.io"],
+                    "resources": ["selfsubjectreviews"],
+                    "verbs": ["create"],
+                },
+            ],
+            "nonResourceRules": [
+                {"nonResourceURLs": ["/api", "/api/*", "/version"], "verbs": ["get"]}
+            ],
+        },
+    }
 
 
 class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
@@ -11,136 +127,271 @@ class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
     def setUpClass(cls):
         cls.source = WORKFLOW.read_text()
 
-    def test_actions_and_shared_operation_concurrency_are_exact(self):
-        self.assertIn("options: [probe, restore, shadow, activate, rollback]", self.source)
+    def validator_accepts(self, fixture):
+        completed = subprocess.run(
+            [
+                "jq",
+                "-e",
+                "--arg",
+                "expected_namespace",
+                "ailab-operation",
+                "-f",
+                str(RULES_VALIDATOR),
+            ],
+            input=json.dumps(fixture),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return completed.returncode == 0
+
+    def monitoring_validator_accepts(self, rendered):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            render_path = directory / "rendered.yaml"
+            render_path.write_text(rendered)
+            completed = subprocess.run(
+                [
+                    "bash",
+                    str(MONITORING_VALIDATOR),
+                    str(render_path),
+                    str(directory / "live-images.txt"),
+                    str(directory / "operator-args.txt"),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            return completed.returncode == 0
+
+    def test_only_probe_restore_shadow_can_be_dispatched(self):
+        self.assertIn("options: [probe, restore, shadow]", self.source)
+        self.assertNotIn("options: [probe, restore, shadow,", self.source)
+        self.assertNotIn("cutover_receipt_sha256:", self.source)
+        self.assertNotIn("rollback_revision:", self.source)
+        self.assertNotIn("            activate)", self.source)
+        self.assertNotIn("            rollback)", self.source)
+        self.assertNotIn("--set-string dataMode=ACTIVE", self.source)
+        self.assertNotIn("--set-string runtimeMode=ACTIVE", self.source)
+        self.assertNotIn("--set activation.confirmSingleWriter=true", self.source)
+        self.assertNotIn("--set ingress.enabled=true", self.source)
+        self.assertNotIn("helm rollback", self.source)
+
+    def test_merge_alone_cannot_dispatch_the_workflow(self):
+        trigger = self.source.split("permissions:", 1)[0]
+        self.assertIn("workflow_dispatch:", trigger)
+        self.assertNotIn("push:", trigger)
+        self.assertNotIn("pull_request:", trigger)
+
+    def test_shared_operation_concurrency_is_exact(self):
         self.assertIn("group: proposed-stack-operation", self.source)
         self.assertIn("cancel-in-progress: false", self.source)
 
     def test_receipt_inputs_are_fail_closed_by_action(self):
-        self.assertIn("mysql_receipt_sha256:", self.source)
-        self.assertIn("redis_receipt_sha256:", self.source)
         validation = self.source.split("- name: 입력의 상호배타 경계 검증", 1)[1].split(
             "- name: Master Admin chart 소스 체크아웃", 1
         )[0]
-        self.assertIn('[[ "$MYSQL_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]', validation)
-        self.assertIn('[[ "$REDIS_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]', validation)
         self.assertIn("probe|restore)", validation)
         self.assertIn("shadow)", validation)
-        self.assertIn("activate)", validation)
+        self.assertIn('test -z "$MYSQL_RECEIPT_SHA256"', validation)
+        self.assertIn('test -z "$REDIS_RECEIPT_SHA256"', validation)
+        self.assertIn('[[ "$MYSQL_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]', validation)
+        self.assertIn('[[ "$REDIS_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]', validation)
+
+    def test_all_three_sources_are_hard_pinned_and_reverified(self):
+        for sha, repository, variable in (
+            (PROPOSED_SHA, "CSID-DGU/admin_infra-proposed", "REVIEWED_PROPOSED_SHA"),
+            (FRONTEND_SHA, "CSID-DGU/admin_fe", "REVIEWED_FRONTEND_SHA"),
+            (BACKEND_SHA, "CSID-DGU/admin_be", "REVIEWED_BACKEND_SHA"),
+        ):
+            with self.subTest(repository=repository):
+                self.assertIn(f"repository: {repository}", self.source)
+                self.assertIn(f"ref: {sha}", self.source)
+                self.assertIn(f"{variable}: {sha}", self.source)
+                self.assertIn(f'= "${variable}"', self.source)
+        for forbidden in ("inputs.proposed_ref", "inputs.fe_ref", "inputs.be_ref"):
+            self.assertNotIn(forbidden, self.source)
 
     def test_builds_are_hosted_and_only_shadow_builds_images(self):
-        boundaries = {
-            "backend-image": "frontend-image",
-            "frontend-image": "execute",
-        }
+        boundaries = {"backend-image": "frontend-image", "frontend-image": "execute"}
         for job, next_job in boundaries.items():
-            block = self.source.split(f"\n  {job}:\n", 1)[1].split(
-                f"\n  {next_job}:\n", 1
-            )[0]
+            block = self.source.split(f"\n  {job}:\n", 1)[1].split(f"\n  {next_job}:\n", 1)[0]
             self.assertIn("if: inputs.action == 'shadow'", block)
             self.assertIn("runs-on: ubuntu-24.04", block)
             self.assertNotIn("provi-master-deploy", block)
         self.assertIn("./gradlew build", self.source)
         self.assertIn("org.opencontainers.image.revision=", self.source)
 
-    def test_exact_master_runner_and_kubeconfig_are_fail_closed(self):
+    def test_exact_master_runner_kubeconfig_and_current_workflow_are_pinned(self):
         execute = self.source.split("  execute:", 1)[1]
         self.assertIn("group: provi-master-deploy", execute)
         self.assertIn("labels: provi-master-deploy", execute)
+        self.assertIn("repository: CSID-DGU/admin_infra", execute)
+        self.assertIn("ref: ${{ github.sha }}", execute)
+        self.assertIn('test "$(git -C workflow-source rev-parse HEAD)" = "$GITHUB_SHA"', execute)
         self.assertIn('test "$(hostname)" = "CSID-DGU-Desktop"', execute)
         self.assertIn('test "$(id -un)" = "svmanager"', execute)
         self.assertIn("KUBECONFIG: /etc/kubernetes/provi-master-ci-deployer.conf", execute)
         self.assertIn('test "$(kubectl config current-context)" = "provi-master"', execute)
         self.assertIn('= "https://192.168.2.199:6443"', execute)
-        self.assertIn("provi-master", execute)
-        self.assertIn(".items | length", execute)
 
-    def test_source_checkouts_include_chart_and_backend_refs(self):
-        self.assertIn("repository: CSID-DGU/admin_infra-proposed", self.source)
-        self.assertIn("ref: ${{ inputs.proposed_ref }}", self.source)
-        self.assertIn("repository: CSID-DGU/admin_be", self.source)
-        self.assertIn("ref: ${{ inputs.be_ref }}", self.source)
-        self.assertIn("proposed/ops/master-admin/Chart/Chart.yaml", self.source)
-        self.assertIn("RuntimeModeProperties.java", self.source)
-        self.assertIn("ShadowModeMutationFilter.java", self.source)
+    def test_farm_credential_uses_fail_closed_effective_rule_review(self):
+        validator = RULES_VALIDATOR.read_text()
+        self.assertIn("SelfSubjectRulesReview", self.source)
+        self.assertIn("selfsubjectrulesreviews", self.source)
+        self.assertIn("phase5g2b-reader-effective-rules-validator.jq", self.source)
+        self.assertIn(".status.incomplete == false", validator)
+        self.assertIn('all(.apiGroups[]; . != "*")', validator)
+        self.assertIn('all(.resources[]; . != "*")', validator)
+        self.assertIn('all(.verbs[]; . != "*")', validator)
+        self.assertIn("resourceNames", validator)
+        self.assertTrue(self.validator_accepts(valid_reader_rules_review()))
 
-    def test_shadow_forces_read_only_and_no_ingress(self):
-        shadow = self.source.rsplit("            shadow)", 1)[1].split("            activate)", 1)[0]
-        self.assertIn("--set-string dataMode=SHADOW", shadow)
-        self.assertIn("--set-string runtimeMode=SHADOW", shadow)
-        self.assertIn("--set ingress.enabled=false", shadow)
-        self.assertIn("--set mysql.readOnly=true", shadow)
-        self.assertIn("--set redis.readOnly=true", shadow)
-        self.assertIn('mysql.expectedReceiptSha256="$MYSQL_RECEIPT_SHA256"', shadow)
-        self.assertIn('redis.expectedReceiptSha256="$REDIS_RECEIPT_SHA256"', shadow)
-        self.assertIn("--set activation.confirmSingleWriter=false", shadow)
-        self.assertIn("--set adminBackend.farmReadOnlyCredential.enabled=true", shadow)
-        self.assertIn(
-            '--set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR"',
-            shadow,
+    def test_effective_rule_validator_rejects_incomplete_wildcard_and_extras(self):
+        mutations = []
+        incomplete = valid_reader_rules_review()
+        incomplete["status"]["incomplete"] = True
+        mutations.append(("incomplete", incomplete))
+        evaluation_error = valid_reader_rules_review()
+        evaluation_error["status"]["evaluationError"] = "rules are incomplete"
+        mutations.append(("evaluation-error", evaluation_error))
+        wildcard_api_group = valid_reader_rules_review()
+        wildcard_api_group["status"]["resourceRules"][0]["apiGroups"] = ["*"]
+        mutations.append(("wildcard-api-group", wildcard_api_group))
+        wildcard_verb = valid_reader_rules_review()
+        wildcard_verb["status"]["resourceRules"][0]["verbs"].append("*")
+        mutations.append(("wildcard-verb", wildcard_verb))
+        wildcard_resource = valid_reader_rules_review()
+        wildcard_resource["status"]["resourceRules"][0]["resources"].append("*")
+        mutations.append(("wildcard-resource", wildcard_resource))
+        resource_names = valid_reader_rules_review()
+        resource_names["status"]["resourceRules"][0]["resourceNames"] = ["one-pod"]
+        mutations.append(("resourceNames", resource_names))
+        pods_exec = valid_reader_rules_review()
+        pods_exec["status"]["resourceRules"].append(
+            {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create"]}
         )
-        self.assertIn(
-            '--set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT"',
-            shadow,
-        )
-        self.assertIn(
-            '--set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT"',
-            shadow,
-        )
-        self.assertIn("--set networkPolicy.backendMonitoringEgress.enabled=true", shadow)
-        self.assertIn('mysql.image.digest="$MYSQL_DIGEST"', shadow)
-        self.assertIn('redis.image.digest="$REDIS_DIGEST"', shadow)
-        # A failed receipt/init gate must leave the new read-only/blocked
-        # StatefulSet in place. Automatic rollback would reopen RESTORE, whose
-        # datastores are intentionally writable for the importer.
-        master_upgrade = shadow.split('helm upgrade --install "$MASTER_RELEASE"', 1)[1]
-        self.assertNotIn("--rollback-on-failure", master_upgrade)
-        self.assertNotIn("kubectl delete", shadow)
-        self.assertNotIn("helm uninstall", shadow)
+        mutations.append(("pods-exec", pods_exec))
+        extra_watch = valid_reader_rules_review()
+        extra_watch["status"]["resourceRules"][0]["verbs"].append("watch")
+        mutations.append(("extra-watch", extra_watch))
+        nonresource_wildcard = valid_reader_rules_review()
+        nonresource_wildcard["status"]["nonResourceRules"][0]["nonResourceURLs"].append("*")
+        mutations.append(("nonresource-wildcard", nonresource_wildcard))
+        extra_nonresource = valid_reader_rules_review()
+        extra_nonresource["status"]["nonResourceRules"][0]["nonResourceURLs"].append("/metrics")
+        mutations.append(("extra-nonresource", extra_nonresource))
+        missing_required = valid_reader_rules_review()
+        missing_required["status"]["resourceRules"] = missing_required["status"]["resourceRules"][1:]
+        mutations.append(("missing-required", missing_required))
+        for label, fixture in mutations:
+            with self.subTest(label=label):
+                self.assertFalse(self.validator_accepts(fixture))
 
-    def test_farm_credential_is_precreated_read_only_and_live_mounted(self):
-        self.assertIn("FARM_READONLY_CIDR: 192.168.2.198/32", self.source)
-        self.assertIn('FARM_API_PORT: "6443"', self.source)
-        self.assertIn('FARM_CONFIG_SERVER_PORT: "30482"', self.source)
-        self.assertIn(
-            'get secret master-admin-farm-readonly',
-            self.source,
-        )
-        self.assertIn("require_secret_key master-admin-farm-readonly kubeconfig", self.source)
-        self.assertIn("select(.immutable == true", self.source)
-        self.assertIn(
-            "system:serviceaccount:ailab-operation:provi-master-admin-shadow-reader",
-            self.source,
-        )
+    def test_defense_in_depth_denies_source_exec_and_writes(self):
         for denied in (
-            "auth can-i get secrets -n ailab-operation",
-            "auth can-i create pods -n ailab-operation",
-            "auth can-i patch deployments -n ailab-operation",
+            "auth can-i get secrets",
+            "auth can-i create pods ",
+            "auth can-i create pods/exec",
+            "auth can-i create pods/attach",
+            "auth can-i create pods/portforward",
+            "auth can-i update pods/ephemeralcontainers",
+            "auth can-i create jobs.batch",
+            "auth can-i delete pods",
+            "auth can-i patch deployments.apps",
+            "auth can-i impersonate users",
             "auth can-i get nodes",
             "auth can-i list pods -n default",
         ):
-            self.assertIn(denied, self.source)
-        self.assertIn('secretName == "master-admin-farm-readonly"', self.source)
-        self.assertIn('mountPath == "/etc/provi/kubeconfigs/farm-readonly.yaml"', self.source)
-        self.assertIn('"kubernetes.io/metadata.name":"provi-monitoring"', self.source)
-        self.assertIn('"prometheus":"master-monitoring-kube-prometheus-prometheus"', self.source)
+            with self.subTest(denied=denied):
+                self.assertIn(denied, self.source)
 
-    def test_restore_is_initial_only_writable_datastore_with_no_apps_or_ingress(self):
-        restore = self.source.rsplit("            restore)", 1)[1].split(
-            "            shadow)", 1
+    def test_restore_requires_fresh_release_storageclass_pvs_and_pvcs(self):
+        restore = self.source.rsplit("            restore)", 1)[1].split("            shadow)", 1)[0]
+        gate = self.source.split("require_fresh_restore_storage()", 1)[1].split(
+            "assert_namespace_not_exposed()", 1
         )[0]
-        self.assertIn("--set-string dataMode=RESTORE", restore)
-        self.assertIn("--set-string runtimeMode=SHADOW", restore)
-        self.assertIn("--set adminBackend.replicas=0", restore)
-        self.assertIn("--set adminFrontend.replicas=0", restore)
-        self.assertIn("--set ingress.enabled=false", restore)
-        self.assertIn("--set mysql.readOnly=false", restore)
-        self.assertIn("--set redis.readOnly=false", restore)
-        self.assertIn("helm list --all", restore)
-        self.assertIn('test -z "$MYSQL_RECEIPT_SHA256"', restore)
-        self.assertIn('test -z "$REDIS_RECEIPT_SHA256"', restore)
+        self.assertIn("helm list --all", gate)
+        for name in (
+            "master-admin-mysql",
+            "master-admin-redis",
+            "master-admin-backup",
+            "provi-master-admin-mysql",
+            "provi-master-admin-redis",
+            "provi-master-admin-backup",
+            "provi-master-admin-local",
+        ):
+            self.assertIn(name, gate)
+        self.assertIn("--ignore-not-found -o name", gate)
+        self.assertLess(
+            restore.index("require_fresh_restore_storage"),
+            restore.index('helm upgrade --install "$MASTER_RELEASE"'),
+        )
+
+    def test_restore_is_initial_only_writable_datastore_with_no_apps(self):
+        restore = self.source.rsplit("            restore)", 1)[1].split("            shadow)", 1)[0]
+        for expected in (
+            "--set-string dataMode=RESTORE",
+            "--set-string runtimeMode=SHADOW",
+            "--set adminBackend.replicas=0",
+            "--set adminFrontend.replicas=0",
+            "--set ingress.enabled=false",
+            "--set mysql.readOnly=false",
+            "--set redis.readOnly=false",
+            "--set activation.confirmSingleWriter=false",
+            "assert_namespace_not_exposed",
+        ):
+            self.assertIn(expected, restore)
         self.assertNotIn("kubectl delete", restore)
         self.assertNotIn("helm uninstall", restore)
+
+    def test_shadow_forces_read_only_and_no_external_exposure(self):
+        shadow = self.source.rsplit("\n            shadow)", 1)[1].split("\n            *)", 1)[0]
+        for expected in (
+            "--set-string dataMode=SHADOW",
+            "--set-string runtimeMode=SHADOW",
+            "--set ingress.enabled=false",
+            "--set mysql.readOnly=true",
+            "--set redis.readOnly=true",
+            "--set activation.confirmSingleWriter=false",
+            "assert_namespace_not_exposed",
+        ):
+            self.assertIn(expected, shadow)
+        # A failed receipt/init gate must leave the target StatefulSets in the
+        # new read-only/blocked state.  Automatic rollback would reopen the
+        # prior RESTORE release, whose datastores are intentionally writable
+        # only for the one-time importer.
+        master_upgrade = shadow.split('helm upgrade --install "$MASTER_RELEASE"', 1)[1]
+        self.assertNotIn("--rollback-on-failure", master_upgrade)
+        self.assertIn('mysql.expectedReceiptSha256="$MYSQL_RECEIPT_SHA256"', shadow)
+        self.assertIn('redis.expectedReceiptSha256="$REDIS_RECEIPT_SHA256"', shadow)
+        self.assertNotIn("kubectl delete", shadow)
+        self.assertNotIn("helm uninstall", shadow)
+
+    def test_render_and_live_exposure_assertions_are_exhaustive(self):
+        for expected in (
+            "assert_render_not_exposed",
+            "assert_namespace_not_exposed",
+            "master-admin-backend\\tClusterIP\\tcluster",
+            "master-admin-frontend\\tClusterIP\\tcluster",
+            "master-admin-mysql\\tClusterIP\\theadless",
+            "master-admin-redis\\tClusterIP\\theadless",
+            '(.spec.type // "ClusterIP") == "ClusterIP"',
+            "externalIPs",
+            "nodePort",
+            "loadBalancerIP",
+            "loadBalancerClass",
+            "hostNetwork",
+            "hostPort",
+            "Ingress|Gateway|HTTPRoute|GRPCRoute|TCPRoute|TLSRoute|UDPRoute|Route",
+            "ingresses.networking.k8s.io",
+            "gateways.gateway.networking.k8s.io",
+            "httproutes.gateway.networking.k8s.io",
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, self.source)
 
     def test_shadow_installs_separate_pinned_master_monitoring_release(self):
         self.assertIn("MONITORING_NAMESPACE: provi-monitoring", self.source)
@@ -150,56 +401,84 @@ class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
             "MONITORING_CHART_SHA256: 33896f603cdbbcaad03ee618cda2da61ce6549b469582682a85d715ae4aea1d3",
             self.source,
         )
-        self.assertIn("proposed/ops/master-monitoring/values-shadow.yaml", self.source)
         self.assertIn("sha256sum --check --strict", self.source)
         self.assertIn('helm upgrade --install "$MONITORING_RELEASE"', self.source)
-        self.assertIn('helm upgrade --install "$MASTER_RELEASE"', self.source)
-        self.assertIn('wait_ready_pods "prometheus=$prometheus_name"', self.source)
-        self.assertIn('wait_ready_pods "alertmanager=$alertmanager_name"', self.source)
-        self.assertNotIn("rollout status statefulset \\\n                -l app.kubernetes.io/instance=", self.source)
-        self.assertNotIn("ailab-monitoring", self.source)
+        self.assertEqual(
+            self.source.count("--set prometheus-node-exporter.hostNetwork=false"), 2
+        )
+        self.assertEqual(
+            self.source.count("--set prometheus-node-exporter.hostPID=false"), 2
+        )
+        self.assertEqual(
+            self.source.count(
+                "--values workflow-source/.github/config/master-monitoring-image-pins.yaml"
+            ),
+            2,
+        )
+        self.assertIn("phase5g2b-monitoring-render-validator.sh", self.source)
+        self.assertIn("assert_monitoring_namespace_not_exposed", self.source)
+        monitoring_assertion = self.source.split(
+            "assert_monitoring_namespace_not_exposed()", 1
+        )[1].split("live_values()", 1)[0]
+        self.assertIn("MONITORING_RELEASE-prometheus-node-exporter", monitoring_assertion)
+        self.assertIn(".spec.template.spec.hostNetwork == false", monitoring_assertion)
+        self.assertIn(".spec.template.spec.hostPID == false", monitoring_assertion)
+        self.assertIn("hostPort", monitoring_assertion)
+        self.assertIn("ingresses.networking.k8s.io", monitoring_assertion)
 
-    def test_activate_requires_the_complete_cutover_receipt(self):
-        activate = self.source.rsplit("            activate)", 1)[1].split("            rollback)", 1)[0]
-        for key in (
-            "verified_at",
-            "mysql_snapshot_sha256",
-            "redis_rdb_sha256",
-            "source_freeze_receipt_sha256",
-            "target_verify_receipt_sha256",
+    def test_monitoring_images_and_operator_defaults_are_exactly_digest_pinned(self):
+        pins = MONITORING_IMAGE_PINS.read_text()
+        validator = MONITORING_VALIDATOR.read_text()
+        self.assertIn("MONITORING_IMAGE_VALUES_SHA256: 9cc6b513ca6d0897549f2c06cc3bd4d09a0040574f0cd2addaad899eabf9acae", self.source)
+        self.assertIn("testFramework:\n    enabled: false", pins)
+        for digest in (
+            "70d9599b186ce287be0d2c5ba9a78acb2e86c1a68c9c41449454d0fc3eeb84e8",
+            "95cf004f559831017cdf4628aaf1bb30133677be8702a8c5f2994629f637a209",
+            "716b0b33ff2dc938a3f2bc64e5ea791d81fb09760bcd27cec1eb896968d6e134",
+            "2bbc915567334b13632bf62c0a97084aff72a36e13c4dabd5f2f11c898c5bacd",
+            "337ff1d356b68d39cef853e8c6345de11ce7556bb34cda8bd205bcf2ed30b565",
+            "6dbbbbeca6d7b94aa30723bfaa55262e41b9f8c15304c484611c696503840aac",
+            "257ce3543e8f45c059dab488bcf897d8cc598cabd78afba12f41d6dbe36e22d2",
+            "c7f925cc3ec386e11b7393f941a8844786311fd2328943fe3e7c744c373ed864",
+            "aae7b2b030ed00d88abd8c5a357d08b46f22151ca0d50d9c796223fa332389c8",
+            "88743b63b3e09ea6e31e140ced5bf45f4a8e82c617c2a963f78841f4995ad1d7",
+            "d936808bdea528155c0154a922cd42fd75716b8bb7ba302641350f9f3eaeba09",
         ):
-            self.assertIn(key, self.source)
-        self.assertIn("validate_cutover_receipt", activate)
-        self.assertIn("assert_live_shadow_identity", activate)
-        self.assertIn(".immutable == true", self.source)
-        self.assertIn('test "$value" = "$MYSQL_RECEIPT_SHA256"', self.source)
-        self.assertIn('test "$value" = "$REDIS_RECEIPT_SHA256"', self.source)
-        self.assertIn("--set-string dataMode=ACTIVE", activate)
-        self.assertIn("--set-string runtimeMode=ACTIVE", activate)
-        self.assertIn("--set activation.confirmSingleWriter=true", activate)
-        self.assertIn('mysql.expectedReceiptSha256="$MYSQL_RECEIPT_SHA256"', activate)
-        self.assertIn('redis.expectedReceiptSha256="$REDIS_RECEIPT_SHA256"', activate)
-        self.assertIn("--set adminBackend.replicas=0", activate)
-        self.assertIn("--set adminFrontend.replicas=0", activate)
-        self.assertIn("--set adminBackend.replicas=1", activate)
-        self.assertIn("--set adminFrontend.replicas=1", activate)
-        self.assertIn('statefulset/"$MASTER_RELEASE-mysql"', activate)
-        self.assertIn('statefulset/"$MASTER_RELEASE-redis"', activate)
-        self.assertEqual(activate.count('helm upgrade "$MASTER_RELEASE"'), 2)
-        self.assertLess(activate.index("validate_cutover_receipt"), activate.index("helm upgrade"))
+            with self.subTest(digest=digest):
+                self.assertIn(digest, pins)
+                self.assertIn(digest, self.source + validator)
 
-    def test_rollback_can_only_target_a_shadow_revision(self):
-        rollback = self.source.rsplit("            rollback)", 1)[1].split("            *)", 1)[0]
-        self.assertIn("--revision \"$ROLLBACK_REVISION\"", rollback)
-        self.assertIn(".dataMode", rollback)
-        self.assertIn(".runtimeMode", rollback)
-        self.assertIn(".mysql.expectedReceiptSha256", rollback)
-        self.assertIn(".redis.expectedReceiptSha256", rollback)
-        self.assertIn("SHADOW", rollback)
-        self.assertIn(".ingress.enabled", rollback)
-        self.assertIn("helm rollback", rollback)
-        self.assertNotIn("kubectl delete", rollback)
-        self.assertNotIn("helm uninstall", rollback)
+    def test_monitoring_render_validator_is_offline_and_fail_closed(self):
+        validator = MONITORING_VALIDATOR.read_text()
+        self.assertNotIn("kubectl", validator)
+        self.assertNotIn("jq", validator)
+        self.assertTrue(self.monitoring_validator_accepts(MONITORING_RENDER_FIXTURE))
+        unsafe_variants = {
+            "nodeport": MONITORING_RENDER_FIXTURE.replace(
+                "  type: ClusterIP", "  type: NodePort", 1
+            ),
+            "host-network": MONITORING_RENDER_FIXTURE.replace(
+                "      hostNetwork: false", "      hostNetwork: true", 1
+            ),
+            "host-port": MONITORING_RENDER_FIXTURE.replace(
+                "          image: quay.io/prometheus/node-exporter",
+                "          hostPort: 9100\n          image: quay.io/prometheus/node-exporter",
+                1,
+            ),
+            "tag-only-image": MONITORING_RENDER_FIXTURE.replace(
+                "@sha256:70d9599b186ce287be0d2c5ba9a78acb2e86c1a68c9c41449454d0fc3eeb84e8",
+                "",
+                1,
+            ),
+            "tag-only-operator-default": MONITORING_RENDER_FIXTURE.replace(
+                "@sha256:aae7b2b030ed00d88abd8c5a357d08b46f22151ca0d50d9c796223fa332389c8",
+                "",
+                1,
+            ),
+        }
+        for label, rendered in unsafe_variants.items():
+            with self.subTest(label=label):
+                self.assertFalse(self.monitoring_validator_accepts(rendered))
 
     def test_workflow_never_deletes_data_or_uses_ssh(self):
         for forbidden in (
