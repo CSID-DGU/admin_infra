@@ -18,6 +18,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Phase 5-E1 배포 경계 계약 테스트
         run: python3 -m unittest -v tests/test_phase5e1_workflow_contract.py
+      - name: Phase 5-G2B Master Admin 배포 경계 계약 테스트
+        run: python3 -m unittest -v tests/test_phase5g2b_master_admin_workflow_contract.py
       - name: actionlint
         run: |
           bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
