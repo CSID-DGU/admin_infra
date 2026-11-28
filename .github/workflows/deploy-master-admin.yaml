@@ -189,9 +189,11 @@ jobs:
           grep -Rqs -- 'RUNTIME_SHADOW_READ_ONLY' backend/src/main
           grep -Rqs -- 'provi.runtime-mode' backend/src/test backend/src/main/resources
 
-          echo "proposed_sha=$proposed_sha" >> "$GITHUB_OUTPUT"
-          echo "frontend_sha=$frontend_sha" >> "$GITHUB_OUTPUT"
-          echo "backend_sha=$backend_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo "proposed_sha=$proposed_sha"
+            echo "frontend_sha=$frontend_sha"
+            echo "backend_sha=$backend_sha"
+          } >> "$GITHUB_OUTPUT"
 
   backend-image:
     needs: source
@@ -429,7 +431,10 @@ jobs:
             --set-string redis.image.repository="$REDIS_REPOSITORY" \
             --set-string redis.image.digest="$REDIS_DIGEST" \
             > "$RUNNER_TEMP/master-admin-shadow.yaml"
-          ! grep -Eq 'kind: Ingress$' "$RUNNER_TEMP/master-admin-shadow.yaml"
+          if grep -Eq 'kind: Ingress$' "$RUNNER_TEMP/master-admin-shadow.yaml"; then
+            echo "SHADOW render unexpectedly contains an Ingress" >&2
+            exit 1
+          fi
           grep -Eq 'value: "?SHADOW"?$' "$RUNNER_TEMP/master-admin-shadow.yaml"
           helm template "$MASTER_RELEASE" proposed/ops/master-admin/Chart \
             --namespace "$MASTER_NAMESPACE" \
@@ -454,8 +459,14 @@ jobs:
             --set-string redis.image.repository="$REDIS_REPOSITORY" \
             --set-string redis.image.digest="$REDIS_DIGEST" \
             > "$RUNNER_TEMP/master-admin-restore.yaml"
-          ! grep -Eq 'kind: Ingress$' "$RUNNER_TEMP/master-admin-restore.yaml"
-          ! grep -Eq 'name: verify-restore-receipt$' "$RUNNER_TEMP/master-admin-restore.yaml"
+          if grep -Eq 'kind: Ingress$' "$RUNNER_TEMP/master-admin-restore.yaml"; then
+            echo "RESTORE render unexpectedly contains an Ingress" >&2
+            exit 1
+          fi
+          if grep -Eq 'name: verify-restore-receipt$' "$RUNNER_TEMP/master-admin-restore.yaml"; then
+            echo "RESTORE render unexpectedly contains a receipt gate" >&2
+            exit 1
+          fi
           helm version --short
 
       - name: 고정된 monitoring chart 준비 및 checksum 검증
@@ -583,8 +594,8 @@ jobs:
           }
 
           wait_ready_pods() {
-            local selector=$1 label=$2 attempt pods
-            for attempt in $(seq 1 120); do
+            local selector=$1 label=$2 _attempt pods
+            for _attempt in $(seq 1 120); do
               pods=$(kubectl -n "$MONITORING_NAMESPACE" get pods -l "$selector" -o json)
               if jq -e \
                 '.items | length > 0 and all(.[]; .status.phase == "Succeeded" or (.status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True")))' \
