@@ -11,7 +11,7 @@ RULES_VALIDATOR = ROOT / ".github" / "scripts" / "phase5g2b-reader-effective-rul
 MONITORING_VALIDATOR = ROOT / ".github" / "scripts" / "phase5g2b-monitoring-render-validator.sh"
 MONITORING_IMAGE_PINS = ROOT / ".github" / "config" / "master-monitoring-image-pins.yaml"
 
-PROPOSED_SHA = "9600e377c15ed9f678ae039dd7daa72d615039b4"
+PROPOSED_SHA = "cd0cecf6786a531c0f3c6227d298ba31e1455641"
 FRONTEND_SHA = "bb1c5f80c9313619d7897c3a25a96032d2b2f6e4"
 BACKEND_SHA = "d9be83b8fe699ba034fa5b3d5f50ce945d61c980"
 

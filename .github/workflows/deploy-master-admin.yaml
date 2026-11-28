@@ -62,7 +62,7 @@ env:
   FARM_READONLY_CIDR: 192.168.2.198/32
   FARM_API_PORT: "6443"
   FARM_CONFIG_SERVER_PORT: "30482"
-  REVIEWED_PROPOSED_SHA: 9600e377c15ed9f678ae039dd7daa72d615039b4
+  REVIEWED_PROPOSED_SHA: cd0cecf6786a531c0f3c6227d298ba31e1455641
   REVIEWED_FRONTEND_SHA: bb1c5f80c9313619d7897c3a25a96032d2b2f6e4
   REVIEWED_BACKEND_SHA: d9be83b8fe699ba034fa5b3d5f50ce945d61c980
 
@@ -103,7 +103,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: CSID-DGU/admin_infra-proposed
-          ref: 9600e377c15ed9f678ae039dd7daa72d615039b4
+          ref: cd0cecf6786a531c0f3c6227d298ba31e1455641
           path: proposed
           fetch-depth: 1
           persist-credentials: false
