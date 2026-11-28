@@ -56,10 +56,14 @@ class Phase5E1WorkflowContractTests(unittest.TestCase):
             self.assertIn("cancel-in-progress: false", source)
             self.assertIn("timeout-minutes: 120", source)
 
-    def test_upgrade_source_is_release_tag_on_protected_main(self):
+    def test_probe_and_upgrade_source_is_release_tag_on_protected_main(self):
         for filename, *_ in self.TARGETS:
             with self.subTest(filename=filename):
                 source = (WORKFLOWS / filename).read_text()
+                self.assertIn(
+                    'description: "probe/upgrade 공통: admin_infra-proposed의 보호된 릴리스 태그(vX.Y.Z)"',
+                    source,
+                )
                 self.assertIn('[[ "$SOURCE_REF" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]', source)
                 self.assertIn(
                     'git -C proposed merge-base --is-ancestor "$sha" refs/remotes/origin/main', source
@@ -68,6 +72,8 @@ class Phase5E1WorkflowContractTests(unittest.TestCase):
                     'tag_commit=$(git -C proposed rev-parse "refs/tags/${SOURCE_REF}^{commit}")', source
                 )
                 self.assertIn('test "$tag_commit" = "$sha"', source)
+                self.assertNotIn('test "$SOURCE_REF" = "main"', source)
+                self.assertNotIn("if [ \"$ACTION\" = \"upgrade\" ]; then\n            tag_commit=", source)
                 self.assertIn('test "$IMAGE_TAG" = "$SOURCE_SHA"', source)
                 self.assertIn('[[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]', source)
 
