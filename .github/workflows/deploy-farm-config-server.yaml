@@ -14,10 +14,9 @@ on:
         options: [probe, upgrade]
         default: probe
       ref:
-        description: "probe는 main, upgrade는 admin_infra-proposed 릴리스 태그(vX.Y.Z)"
+        description: "probe/upgrade 공통: admin_infra-proposed의 보호된 릴리스 태그(vX.Y.Z)"
         required: true
         type: string
-        default: main
       expected_image_digest:
         description: "upgrade: 성공한 LAB run의 LAB_DEPLOYED_IMAGE_DIGEST / probe: 비워 둠"
         required: false
@@ -48,24 +47,20 @@ jobs:
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
+          [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "probe와 upgrade는 모두 vX.Y.Z 릴리스 태그만 허용합니다." >&2
+            exit 1
+          }
           case "$ACTION" in
             probe)
               test -z "$EXPECTED_IMAGE_DIGEST" || {
                 echo "probe에는 expected_image_digest를 입력할 수 없습니다." >&2
                 exit 1
               }
-              test "$SOURCE_REF" = "main" || {
-                echo "probe는 보호된 main의 배포 진입점만 실행합니다." >&2
-                exit 1
-              }
               ;;
             upgrade)
               [[ "$EXPECTED_IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || {
                 echo "upgrade에는 LAB에 성공 배포된 exact sha256 digest가 필요합니다." >&2
-                exit 1
-              }
-              [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-                echo "upgrade는 vX.Y.Z 릴리스 태그만 허용합니다." >&2
                 exit 1
               }
               ;;
@@ -99,10 +94,8 @@ jobs:
             echo "보호된 main 이력 밖의 소스는 실행할 수 없습니다." >&2
             exit 1
           }
-          if [ "$ACTION" = "upgrade" ]; then
-            tag_commit=$(git -C proposed rev-parse "refs/tags/${SOURCE_REF}^{commit}")
-            test "$tag_commit" = "$sha"
-          fi
+          tag_commit=$(git -C proposed rev-parse "refs/tags/${SOURCE_REF}^{commit}")
+          test "$tag_commit" = "$sha"
           test -f proposed/ops/cluster-config/deploy.sh
           bash -n proposed/ops/cluster-config/deploy.sh
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
