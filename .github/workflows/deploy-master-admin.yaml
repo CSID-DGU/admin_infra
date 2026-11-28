@@ -1,0 +1,1049 @@
+name: Deploy Master Admin
+run-name: "provi-master admin ${{ inputs.action }} — reviewed Phase 5-G2B sources"
+
+# Master의 독립 관리 클러스터에 Admin 전용 스택만 배포한다. FARM/LAB Config Server,
+# 사용자 Pod, FARM/LAB 데이터베이스는 이 workflow의 범위가 아니다.
+#
+# 데이터 경계:
+# - probe: 실행 경로와 렌더링만 검사하며 Kubernetes를 변경하지 않는다.
+# - restore: 새 retained PV에 Admin MySQL/Redis만 writable로 기동한다. FE/BE는
+#   0개이고 Ingress는 없으며, 데이터 복제 도구가 검증 영수증을 만든 뒤에만
+#   shadow로 넘어갈 수 있다.
+# - shadow: 외부 Ingress와 모든 애플리케이션 쓰기를 닫고, 사전에 복제·검증된
+#   Admin MySQL/Redis를 read-only로만 기동한다. 데이터 복사 자체는 여기서 하지 않는다.
+# - ACTIVE/cutover/rollback은 이 Phase 5-G2B workflow에서 의도적으로 제거했다.
+#   소스 freeze와 단일 writer 승인 경계를 갖춘 후속 workflow 전에는 실행할 수 없다.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "probe / restore / shadow"
+        required: true
+        type: choice
+        options: [probe, restore, shadow]
+        default: probe
+      mysql_receipt_sha256:
+        description: "shadow 전용: MySQL PV 복원 영수증의 artifact_sha256"
+        required: false
+        type: string
+        default: ""
+      redis_receipt_sha256:
+        description: "shadow 전용: Redis PV 복원 영수증의 artifact_sha256"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+# 기존 operation/FARM Config Server 배포와 관리 데이터 전환을 동시에 실행하지 않는다.
+concurrency:
+  group: proposed-stack-operation
+  cancel-in-progress: false
+
+env:
+  FARM_NAMESPACE: ailab-operation
+  MASTER_NAMESPACE: provi-admin
+  MASTER_RELEASE: master-admin
+  MONITORING_NAMESPACE: provi-monitoring
+  MONITORING_RELEASE: master-monitoring
+  MONITORING_CHART_VERSION: 80.2.2
+  MONITORING_CHART_SHA256: 33896f603cdbbcaad03ee618cda2da61ce6549b469582682a85d715ae4aea1d3
+  MONITORING_IMAGE_VALUES_SHA256: 9cc6b513ca6d0897549f2c06cc3bd4d09a0040574f0cd2addaad899eabf9acae
+  MYSQL_REPOSITORY: docker.io/library/mysql
+  MYSQL_DIGEST: sha256:a532724022429812ec797c285c1b540a644c15e248579c6bfdf12a8fbaab4964
+  REDIS_REPOSITORY: docker.io/library/redis
+  REDIS_DIGEST: sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
+  TEMPLATE_BACKEND_REPOSITORY: docker.io/dguailab/admin-prod-exp
+  TEMPLATE_BACKEND_DIGEST: sha256:ce13258eaffa6711ad53cdf393f9e44bf97ef1f8b1718df80c257fb44b92230d
+  TEMPLATE_FRONTEND_REPOSITORY: docker.io/dguailab/ailab-frontend-exp
+  TEMPLATE_FRONTEND_DIGEST: sha256:a568e66cca84514fdba41762da435d0541939200d19e0b6fc7fb939b0cd30d24
+  FARM_READONLY_CIDR: 192.168.2.198/32
+  FARM_API_PORT: "6443"
+  FARM_CONFIG_SERVER_PORT: "30482"
+  REVIEWED_PROPOSED_SHA: 9600e377c15ed9f678ae039dd7daa72d615039b4
+  REVIEWED_FRONTEND_SHA: bb1c5f80c9313619d7897c3a25a96032d2b2f6e4
+  REVIEWED_BACKEND_SHA: d9be83b8fe699ba034fa5b3d5f50ce945d61c980
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      proposed_sha: ${{ steps.identity.outputs.proposed_sha }}
+      frontend_sha: ${{ steps.identity.outputs.frontend_sha }}
+      backend_sha: ${{ steps.identity.outputs.backend_sha }}
+    steps:
+      - name: 입력의 상호배타 경계 검증
+        env:
+          ACTION: ${{ inputs.action }}
+          MYSQL_RECEIPT_SHA256: ${{ inputs.mysql_receipt_sha256 }}
+          REDIS_RECEIPT_SHA256: ${{ inputs.redis_receipt_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/main"
+          case "$ACTION" in
+            probe|restore)
+              test -z "$MYSQL_RECEIPT_SHA256"
+              test -z "$REDIS_RECEIPT_SHA256"
+              ;;
+            shadow)
+              [[ "$MYSQL_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              [[ "$REDIS_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              ;;
+            *)
+              echo "지원하지 않는 action: $ACTION" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Master Admin chart 소스 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: 9600e377c15ed9f678ae039dd7daa72d615039b4
+          path: proposed
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Admin FE 소스 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_fe
+          ref: bb1c5f80c9313619d7897c3a25a96032d2b2f6e4
+          path: frontend
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Admin BE 소스 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_be
+          ref: d9be83b8fe699ba034fa5b3d5f50ce945d61c980
+          path: backend
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 소스 계약과 정확한 커밋 고정
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          proposed_sha=$(git -C proposed rev-parse HEAD)
+          frontend_sha=$(git -C frontend rev-parse HEAD)
+          backend_sha=$(git -C backend rev-parse HEAD)
+          for sha in "$proposed_sha" "$frontend_sha" "$backend_sha"; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]]
+          done
+          test "$proposed_sha" = "$REVIEWED_PROPOSED_SHA"
+          test "$frontend_sha" = "$REVIEWED_FRONTEND_SHA"
+          test "$backend_sha" = "$REVIEWED_BACKEND_SHA"
+
+          test -f proposed/ops/master-admin/Chart/Chart.yaml
+          test -f proposed/ops/master-admin/Chart/values.yaml
+          test -f proposed/ops/master-monitoring/values-shadow.yaml
+          test -f frontend/Dockerfile
+          test -f frontend/nginx.conf
+          test -f backend/Dockerfile
+          test -x backend/gradlew
+          test "$(find backend/src/main/java -path '*/global/config/RuntimeModeProperties.java' -type f | wc -l)" = "1"
+          test "$(find backend/src/main/java -path '*/global/config/SchedulingConfiguration.java' -type f | wc -l)" = "1"
+          test "$(find backend/src/main/java -path '*/global/auth/ShadowModeMutationFilter.java' -type f | wc -l)" = "1"
+          grep -Rqs -- 'RUNTIME_SHADOW_READ_ONLY' backend/src/main
+          grep -Rqs -- 'provi.runtime-mode' backend/src/test backend/src/main/resources
+
+          {
+            echo "proposed_sha=$proposed_sha"
+            echo "frontend_sha=$frontend_sha"
+            echo "backend_sha=$backend_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  backend-image:
+    needs: source
+    if: inputs.action == 'shadow'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    outputs:
+      repository: ${{ steps.image.outputs.repository }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: 고정된 Admin BE 소스 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_be
+          ref: ${{ needs.source.outputs.backend_sha }}
+          persist-credentials: false
+
+      - name: JDK 17 설정
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6
+        with:
+          java-version: "17"
+          distribution: temurin
+          cache: gradle
+
+      - name: Shadow 안전 계약을 포함한 전체 테스트와 빌드
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew build
+
+      - name: Docker Hub 로그인
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 이미지 이름 고정
+        id: image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$DOCKER_USERNAME" = "dguailab"
+          echo "repository=$DOCKER_USERNAME/admin-prod-master" >> "$GITHUB_OUTPUT"
+
+      - name: 빌더 준비
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Admin BE 불변 이미지 빌드 및 게시
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.repository }}:${{ needs.source.outputs.backend_sha }}
+          labels: org.opencontainers.image.revision=${{ needs.source.outputs.backend_sha }}
+          cache-from: type=gha,scope=master-admin-backend
+          cache-to: type=gha,mode=max,scope=master-admin-backend
+
+      - name: Admin BE digest 검증
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: '[[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]'
+
+  frontend-image:
+    needs: source
+    if: inputs.action == 'shadow'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    outputs:
+      repository: ${{ steps.image.outputs.repository }}
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - name: 고정된 Admin FE 소스 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_fe
+          ref: ${{ needs.source.outputs.frontend_sha }}
+          persist-credentials: false
+
+      - name: Master 내부 Admin BE만 가리키도록 nginx 계약 고정
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f nginx.conf
+          if grep -Eq 'admin-prod\.(default|ailab-operation)\.svc\.cluster\.local' nginx.conf; then
+            sed -Ei 's/admin-prod\.(default|ailab-operation)\.svc\.cluster\.local/master-admin-backend.provi-admin.svc.cluster.local/g' nginx.conf
+          else
+            grep -q 'master-admin-backend.provi-admin.svc.cluster.local' nginx.conf
+          fi
+          grep -q 'master-admin-backend.provi-admin.svc.cluster.local' nginx.conf
+          if grep -Eq 'admin-prod\.(default|ailab-operation)|containerssh-config-service|ailab-infra' nginx.conf; then
+            echo "Master FE nginx에 FARM/legacy 내부 대상이 남아 있습니다." >&2
+            exit 1
+          fi
+
+      - name: Docker Hub 로그인
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 이미지 이름 고정
+        id: image
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$DOCKER_USERNAME" = "dguailab"
+          echo "repository=$DOCKER_USERNAME/ailab-frontend-master" >> "$GITHUB_OUTPUT"
+
+      - name: 빌더 준비
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - name: Admin FE 불변 이미지 빌드 및 게시
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.image.outputs.repository }}:${{ needs.source.outputs.frontend_sha }}
+          labels: org.opencontainers.image.revision=${{ needs.source.outputs.frontend_sha }}
+          cache-from: type=gha,scope=master-admin-frontend
+          cache-to: type=gha,mode=max,scope=master-admin-frontend
+
+      - name: Admin FE digest 검증
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: '[[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]'
+
+  execute:
+    needs: [source, backend-image, frontend-image]
+    if: >-
+      ${{ always() && needs.source.result == 'success' &&
+          ((inputs.action == 'shadow' && needs.backend-image.result == 'success' && needs.frontend-image.result == 'success') ||
+           (inputs.action != 'shadow' && needs.backend-image.result == 'skipped' && needs.frontend-image.result == 'skipped')) }}
+    runs-on:
+      group: provi-master-deploy
+      labels: provi-master-deploy
+    timeout-minutes: 60
+    steps:
+      - name: 현재 main의 승인된 workflow 검증기 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_infra
+          ref: ${{ github.sha }}
+          path: workflow-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 고정된 Master Admin chart 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_infra-proposed
+          ref: ${{ needs.source.outputs.proposed_sha }}
+          path: proposed
+          persist-credentials: false
+
+      - name: 고정된 Admin BE 안전 계약 체크아웃
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: CSID-DGU/admin_be
+          ref: ${{ needs.source.outputs.backend_sha }}
+          path: backend
+          persist-credentials: false
+
+      - name: provi-master 제한 runner와 단일 노드 경계 검증
+        env:
+          KUBECONFIG: /etc/kubernetes/provi-master-ci-deployer.conf
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "CSID-DGU-Desktop"
+          test "$(id -un)" = "svmanager"
+          test -r "$KUBECONFIG"
+          test "$(stat -c '%U:%G:%a' "$KUBECONFIG")" = "root:svmanager:640"
+          test "$(kubectl config current-context)" = "provi-master"
+          test "$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.2.199:6443"
+          test "$(kubectl --request-timeout=20s get --raw=/readyz)" = "ok"
+          test "$(kubectl get nodes -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')" = "1"
+          test "$(kubectl get nodes -o json | jq '.items | length')" = "1"
+          test "$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')" = "provi-master"
+          for command in awk bash cmp diff find git helm jq kubectl mkdir mktemp sha256sum sort; do
+            command -v "$command" >/dev/null
+          done
+
+      - name: 체크아웃과 RESTORE/SHADOW chart 계약 검증
+        env:
+          PROPOSED_SHA: ${{ needs.source.outputs.proposed_sha }}
+          BACKEND_SHA: ${{ needs.source.outputs.backend_sha }}
+          FRONTEND_SHA: ${{ needs.source.outputs.frontend_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C workflow-source rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git -C proposed rev-parse HEAD)" = "$PROPOSED_SHA"
+          test "$(git -C backend rev-parse HEAD)" = "$BACKEND_SHA"
+          test "$PROPOSED_SHA" = "$REVIEWED_PROPOSED_SHA"
+          test "$FRONTEND_SHA" = "$REVIEWED_FRONTEND_SHA"
+          test "$BACKEND_SHA" = "$REVIEWED_BACKEND_SHA"
+          test -f workflow-source/.github/config/master-monitoring-image-pins.yaml
+          test -f workflow-source/.github/scripts/phase5g2b-monitoring-render-validator.sh
+          echo "$MONITORING_IMAGE_VALUES_SHA256  workflow-source/.github/config/master-monitoring-image-pins.yaml" | \
+            sha256sum --check --strict
+          bash -n workflow-source/.github/scripts/phase5g2b-monitoring-render-validator.sh
+          grep -Rqs -- 'RUNTIME_SHADOW_READ_ONLY' backend/src/main
+
+          assert_render_not_exposed() {
+            local rendered=$1 label=$2 document_dir manifest json kind
+            local service_contract_mode=${3:-admin}
+            local service_contract expected_service_contract
+            document_dir=$(mktemp -d "$RUNNER_TEMP/${label}.documents.XXXXXXXX")
+            service_contract="$document_dir/services.tsv"
+            expected_service_contract="$document_dir/services.expected.tsv"
+            : > "$service_contract"
+            awk -v directory="$document_dir" '
+              BEGIN { document=0; path=sprintf("%s/%04d.yaml",directory,document) }
+              /^---[[:space:]]*$/ {
+                close(path)
+                document++
+                path=sprintf("%s/%04d.yaml",directory,document)
+                next
+              }
+              { print > path }
+            ' "$rendered"
+            while IFS= read -r manifest; do
+              grep -Eq '^[[:space:]]*kind:[[:space:]]+' "$manifest" || continue
+              json="${manifest%.yaml}.json"
+              kubectl create --dry-run=client --validate=false -f "$manifest" -o json > "$json"
+              kind=$(jq -er '.kind' "$json")
+              case "$kind" in
+                Service)
+                  jq -e '
+                    (.spec.type // "ClusterIP") == "ClusterIP" and
+                    ((.spec.externalIPs // []) | length == 0) and
+                    ((.spec.loadBalancerSourceRanges // []) | length == 0) and
+                    (.spec.loadBalancerIP // null) == null and
+                    (.spec.loadBalancerClass // null) == null and
+                    (.spec.externalName // null) == null and
+                    all(.spec.ports[]?; (.nodePort // null) == null)
+                  ' "$json" >/dev/null
+                  jq -r '[.metadata.name, (.spec.type // "ClusterIP"),
+                           (if .spec.clusterIP == "None" then "headless" else "cluster" end)] | @tsv' \
+                    "$json" >> "$service_contract"
+                  ;;
+                Ingress|Gateway|HTTPRoute|GRPCRoute|TCPRoute|TLSRoute|UDPRoute|Route|IngressRoute|IngressRouteTCP|IngressRouteUDP|VirtualService)
+                  echo "$label render contains externally routable kind: $kind" >&2
+                  return 1
+                  ;;
+              esac
+              jq -e '
+                ([.. | objects | select(has("hostNetwork")) | .hostNetwork] | all(. != true)) and
+                ([.. | objects | select(has("hostPort")) | .hostPort] | all(. == null or . == 0))
+              ' "$json" >/dev/null
+            done < <(find "$document_dir" -maxdepth 1 -type f -name '*.yaml' | sort)
+            sort -o "$service_contract" "$service_contract"
+            case "$service_contract_mode" in
+              admin)
+                printf '%s\n' \
+                  $'master-admin-backend\tClusterIP\tcluster' \
+                  $'master-admin-frontend\tClusterIP\tcluster' \
+                  $'master-admin-mysql\tClusterIP\theadless' \
+                  $'master-admin-redis\tClusterIP\theadless' | sort > "$expected_service_contract"
+                cmp -s "$service_contract" "$expected_service_contract"
+                ;;
+              generic)
+                test -s "$service_contract"
+                ;;
+              *)
+                echo "Unknown render service contract mode: $service_contract_mode" >&2
+                return 1
+                ;;
+            esac
+          }
+
+          mysql_fixture=1111111111111111111111111111111111111111111111111111111111111111
+          redis_fixture=2222222222222222222222222222222222222222222222222222222222222222
+          helm lint proposed/ops/master-admin/Chart \
+            --namespace "$MASTER_NAMESPACE" \
+            --set-string dataMode=SHADOW \
+            --set-string runtimeMode=SHADOW \
+            --set ingress.enabled=false \
+            --set mysql.readOnly=true \
+            --set redis.readOnly=true \
+            --set adminBackend.farmReadOnlyCredential.enabled=true \
+            --set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR" \
+            --set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT" \
+            --set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT" \
+            --set networkPolicy.backendMonitoringEgress.enabled=true \
+            --set-string mysql.expectedReceiptSha256="$mysql_fixture" \
+            --set-string redis.expectedReceiptSha256="$redis_fixture" \
+            --set-string provenance.infraSha="$PROPOSED_SHA" \
+            --set-string provenance.backendSha="$BACKEND_SHA" \
+            --set-string provenance.frontendSha="$FRONTEND_SHA" \
+            --set-string adminBackend.image.repository="$TEMPLATE_BACKEND_REPOSITORY" \
+            --set-string adminBackend.image.digest="$TEMPLATE_BACKEND_DIGEST" \
+            --set-string adminFrontend.image.repository="$TEMPLATE_FRONTEND_REPOSITORY" \
+            --set-string adminFrontend.image.digest="$TEMPLATE_FRONTEND_DIGEST" \
+            --set-string mysql.image.repository="$MYSQL_REPOSITORY" \
+            --set-string mysql.image.digest="$MYSQL_DIGEST" \
+            --set-string redis.image.repository="$REDIS_REPOSITORY" \
+            --set-string redis.image.digest="$REDIS_DIGEST"
+          helm template "$MASTER_RELEASE" proposed/ops/master-admin/Chart \
+            --namespace "$MASTER_NAMESPACE" \
+            --set-string dataMode=SHADOW \
+            --set-string runtimeMode=SHADOW \
+            --set ingress.enabled=false \
+            --set mysql.readOnly=true \
+            --set redis.readOnly=true \
+            --set adminBackend.farmReadOnlyCredential.enabled=true \
+            --set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR" \
+            --set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT" \
+            --set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT" \
+            --set networkPolicy.backendMonitoringEgress.enabled=true \
+            --set-string mysql.expectedReceiptSha256="$mysql_fixture" \
+            --set-string redis.expectedReceiptSha256="$redis_fixture" \
+            --set-string provenance.infraSha="$PROPOSED_SHA" \
+            --set-string provenance.backendSha="$BACKEND_SHA" \
+            --set-string provenance.frontendSha="$FRONTEND_SHA" \
+            --set-string adminBackend.image.repository="$TEMPLATE_BACKEND_REPOSITORY" \
+            --set-string adminBackend.image.digest="$TEMPLATE_BACKEND_DIGEST" \
+            --set-string adminFrontend.image.repository="$TEMPLATE_FRONTEND_REPOSITORY" \
+            --set-string adminFrontend.image.digest="$TEMPLATE_FRONTEND_DIGEST" \
+            --set-string mysql.image.repository="$MYSQL_REPOSITORY" \
+            --set-string mysql.image.digest="$MYSQL_DIGEST" \
+            --set-string redis.image.repository="$REDIS_REPOSITORY" \
+            --set-string redis.image.digest="$REDIS_DIGEST" \
+            > "$RUNNER_TEMP/master-admin-shadow.yaml"
+          assert_render_not_exposed "$RUNNER_TEMP/master-admin-shadow.yaml" master-admin-shadow
+          grep -Eq 'value: "?SHADOW"?$' "$RUNNER_TEMP/master-admin-shadow.yaml"
+          helm template "$MASTER_RELEASE" proposed/ops/master-admin/Chart \
+            --namespace "$MASTER_NAMESPACE" \
+            --set-string dataMode=RESTORE \
+            --set-string runtimeMode=SHADOW \
+            --set adminBackend.replicas=0 \
+            --set adminFrontend.replicas=0 \
+            --set ingress.enabled=false \
+            --set mysql.readOnly=false \
+            --set redis.readOnly=false \
+            --set-string mysql.expectedReceiptSha256= \
+            --set-string redis.expectedReceiptSha256= \
+            --set-string provenance.infraSha="$PROPOSED_SHA" \
+            --set-string provenance.backendSha="$BACKEND_SHA" \
+            --set-string provenance.frontendSha="$FRONTEND_SHA" \
+            --set-string adminBackend.image.repository="$TEMPLATE_BACKEND_REPOSITORY" \
+            --set-string adminBackend.image.digest="$TEMPLATE_BACKEND_DIGEST" \
+            --set-string adminFrontend.image.repository="$TEMPLATE_FRONTEND_REPOSITORY" \
+            --set-string adminFrontend.image.digest="$TEMPLATE_FRONTEND_DIGEST" \
+            --set-string mysql.image.repository="$MYSQL_REPOSITORY" \
+            --set-string mysql.image.digest="$MYSQL_DIGEST" \
+            --set-string redis.image.repository="$REDIS_REPOSITORY" \
+            --set-string redis.image.digest="$REDIS_DIGEST" \
+            > "$RUNNER_TEMP/master-admin-restore.yaml"
+          assert_render_not_exposed "$RUNNER_TEMP/master-admin-restore.yaml" master-admin-restore
+          if grep -Eq 'name: verify-restore-receipt$' "$RUNNER_TEMP/master-admin-restore.yaml"; then
+            echo "RESTORE render unexpectedly contains a receipt gate" >&2
+            exit 1
+          fi
+          helm version --short
+
+      - name: 고정된 monitoring chart 준비 및 checksum 검증
+        if: inputs.action == 'shadow'
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
+          helm pull prometheus-community/kube-prometheus-stack \
+            --version "$MONITORING_CHART_VERSION" \
+            --destination "$RUNNER_TEMP"
+          chart="$RUNNER_TEMP/kube-prometheus-stack-${MONITORING_CHART_VERSION}.tgz"
+          test -f "$chart"
+          echo "$MONITORING_CHART_SHA256  $chart" | sha256sum --check --strict
+          helm template "$MONITORING_RELEASE" "$chart" \
+            --namespace "$MONITORING_NAMESPACE" \
+            --values proposed/ops/master-monitoring/values-shadow.yaml \
+            --values workflow-source/.github/config/master-monitoring-image-pins.yaml \
+            --set prometheus-node-exporter.hostNetwork=false \
+            --set prometheus-node-exporter.hostPID=false \
+            > "$RUNNER_TEMP/master-monitoring-shadow.yaml"
+          test -s "$RUNNER_TEMP/master-monitoring-shadow.yaml"
+          bash workflow-source/.github/scripts/phase5g2b-monitoring-render-validator.sh \
+            "$RUNNER_TEMP/master-monitoring-shadow.yaml" \
+            "$RUNNER_TEMP/master-monitoring-expected-live-images.txt" \
+            "$RUNNER_TEMP/master-monitoring-expected-operator-args.txt"
+
+      - name: Master Admin 경계 실행
+        env:
+          ACTION: ${{ inputs.action }}
+          MYSQL_RECEIPT_SHA256: ${{ inputs.mysql_receipt_sha256 }}
+          REDIS_RECEIPT_SHA256: ${{ inputs.redis_receipt_sha256 }}
+          PROPOSED_SHA: ${{ needs.source.outputs.proposed_sha }}
+          FRONTEND_SHA: ${{ needs.source.outputs.frontend_sha }}
+          BACKEND_SHA: ${{ needs.source.outputs.backend_sha }}
+          FRONTEND_REPOSITORY: ${{ needs.frontend-image.outputs.repository }}
+          FRONTEND_DIGEST: ${{ needs.frontend-image.outputs.digest }}
+          BACKEND_REPOSITORY: ${{ needs.backend-image.outputs.repository }}
+          BACKEND_DIGEST: ${{ needs.backend-image.outputs.digest }}
+          KUBECONFIG: /etc/kubernetes/provi-master-ci-deployer.conf
+        shell: bash
+        run: |
+          set -euo pipefail
+          chart=proposed/ops/master-admin/Chart
+
+          require_secret_key() {
+            local secret=$1 key=$2
+            kubectl -n "$MASTER_NAMESPACE" get secret "$secret" -o json | \
+              jq -e --arg key "$key" '.data[$key] | type == "string" and length > 0' >/dev/null
+          }
+
+          require_precreated_secrets() {
+            local farm_kubeconfig farm_ssrr farm_whoami
+            kubectl -n "$MASTER_NAMESPACE" get secret master-admin-database >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get secret master-admin-be-config >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get secret master-admin-farm-readonly >/dev/null
+            for key in mysql-root-password mysql-username mysql-password redis-password; do
+              require_secret_key master-admin-database "$key"
+            done
+            require_secret_key master-admin-farm-readonly kubeconfig
+
+            farm_kubeconfig="$RUNNER_TEMP/farm-readonly.kubeconfig"
+            kubectl -n "$MASTER_NAMESPACE" get secret master-admin-farm-readonly -o json | \
+              jq -er 'select(.immutable == true and (.data.kubeconfig | type == "string" and length > 0)) | .data.kubeconfig | @base64d' \
+              > "$farm_kubeconfig"
+            chmod 0600 "$farm_kubeconfig"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.2.198:6443"
+            farm_whoami="$RUNNER_TEMP/farm-reader-whoami.json"
+            kubectl --kubeconfig="$farm_kubeconfig" auth whoami -o json > "$farm_whoami"
+            jq -e --arg user "system:serviceaccount:${FARM_NAMESPACE}:provi-master-admin-shadow-reader" \
+              --arg namespace_group "system:serviceaccounts:${FARM_NAMESPACE}" '
+                .status.userInfo.username == $user and
+                ((.status.userInfo.groups | sort) ==
+                  (["system:authenticated", "system:serviceaccounts", $namespace_group] | sort))
+              ' "$farm_whoami" >/dev/null
+
+            farm_ssrr="$RUNNER_TEMP/farm-reader-self-subject-rules-review.json"
+            printf '%s\n' \
+              "{\"apiVersion\":\"authorization.k8s.io/v1\",\"kind\":\"SelfSubjectRulesReview\",\"spec\":{\"namespace\":\"${FARM_NAMESPACE}\"}}" | \
+              kubectl --kubeconfig="$farm_kubeconfig" create \
+                --raw='/apis/authorization.k8s.io/v1/selfsubjectrulesreviews' -f - > "$farm_ssrr"
+            test -f workflow-source/.github/scripts/phase5g2b-reader-effective-rules-validator.jq
+            jq -e --arg expected_namespace "$FARM_NAMESPACE" \
+              -f workflow-source/.github/scripts/phase5g2b-reader-effective-rules-validator.jq \
+              "$farm_ssrr" >/dev/null
+
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get pods -n "$FARM_NAMESPACE")" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i list pods -n "$FARM_NAMESPACE")" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get pods --subresource=log -n "$FARM_NAMESPACE")" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i list events -n "$FARM_NAMESPACE")" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get secrets -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i create pods -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i create pods/exec -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i create pods/attach -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i create pods/portforward -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i update pods/ephemeralcontainers -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i create jobs.batch -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i delete pods -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i patch deployments.apps -n "$FARM_NAMESPACE")" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i impersonate users)" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get nodes)" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i list pods -n default)" = "no"
+          }
+
+          require_fresh_restore_storage() {
+            test "$(helm list --all --namespace "$MASTER_NAMESPACE" --filter "^${MASTER_RELEASE}$" -o json | jq 'length')" = "0"
+            test -z "$(kubectl -n "$MASTER_NAMESPACE" get pvc \
+              master-admin-mysql master-admin-redis master-admin-backup \
+              --ignore-not-found -o name)"
+            test -z "$(kubectl get pv \
+              provi-master-admin-mysql provi-master-admin-redis provi-master-admin-backup \
+              --ignore-not-found -o name)"
+            test -z "$(kubectl get storageclass provi-master-admin-local \
+              --ignore-not-found -o name)"
+          }
+
+          assert_namespace_not_exposed() {
+            local services workloads api_resources resource
+            services="$RUNNER_TEMP/master-admin-live-services.json"
+            workloads="$RUNNER_TEMP/master-admin-live-workloads.json"
+            api_resources="$RUNNER_TEMP/provi-master-namespaced-api-resources.txt"
+            kubectl -n "$MASTER_NAMESPACE" get services -o json > "$services"
+            jq -e '
+              (.items | length) == 4 and
+              ([.items[].metadata.name] | sort) ==
+                ["master-admin-backend", "master-admin-frontend", "master-admin-mysql", "master-admin-redis"] and
+              all(.items[];
+                (.spec.type // "ClusterIP") == "ClusterIP" and
+                ((.spec.externalIPs // []) | length == 0) and
+                ((.spec.loadBalancerSourceRanges // []) | length == 0) and
+                (.spec.loadBalancerIP // null) == null and
+                (.spec.loadBalancerClass // null) == null and
+                (.spec.externalName // null) == null and
+                all(.spec.ports[]?; (.nodePort // null) == null)) and
+              ([.items[] | select(.metadata.name == "master-admin-mysql" or .metadata.name == "master-admin-redis")
+                | .spec.clusterIP] | sort) == ["None", "None"] and
+              all(.items[] | select(.metadata.name == "master-admin-backend" or .metadata.name == "master-admin-frontend");
+                .spec.clusterIP != "None")
+            ' "$services" >/dev/null
+
+            kubectl -n "$MASTER_NAMESPACE" get \
+              pods,deployments.apps,statefulsets.apps,daemonsets.apps,jobs.batch,cronjobs.batch \
+              -o json > "$workloads"
+            jq -e '
+              ([.. | objects | select(has("hostNetwork")) | .hostNetwork] | all(. != true)) and
+              ([.. | objects | select(has("hostPort")) | .hostPort] | all(. == null or . == 0))
+            ' "$workloads" >/dev/null
+
+            kubectl api-resources --namespaced -o name > "$api_resources"
+            for resource in \
+              ingresses.networking.k8s.io \
+              gateways.gateway.networking.k8s.io \
+              httproutes.gateway.networking.k8s.io \
+              grpcroutes.gateway.networking.k8s.io \
+              tcproutes.gateway.networking.k8s.io \
+              tlsroutes.gateway.networking.k8s.io \
+              udproutes.gateway.networking.k8s.io \
+              routes.route.openshift.io \
+              ingressroutes.traefik.io ingressroutetcps.traefik.io ingressrouteudps.traefik.io \
+              ingressroutes.traefik.containo.us ingressroutetcps.traefik.containo.us ingressrouteudps.traefik.containo.us \
+              virtualservices.networking.istio.io gateways.networking.istio.io \
+              mappings.getambassador.io httpproxies.projectcontour.io \
+              virtualservers.k8s.nginx.org transportservers.k8s.nginx.org; do
+              if grep -Fxq "$resource" "$api_resources"; then
+                test -z "$(kubectl -n "$MASTER_NAMESPACE" get "$resource" -o name)"
+              fi
+            done
+          }
+
+          assert_monitoring_namespace_not_exposed() {
+            local services workloads api_resources resource node_exporter pods live_images
+            local monitoring_values prometheus_json alertmanager_json operator_json operator_args
+            services="$RUNNER_TEMP/master-monitoring-live-services.json"
+            workloads="$RUNNER_TEMP/master-monitoring-live-workloads.json"
+            api_resources="$RUNNER_TEMP/provi-master-monitoring-namespaced-api-resources.txt"
+            node_exporter="$RUNNER_TEMP/master-monitoring-node-exporter.json"
+            pods="$RUNNER_TEMP/master-monitoring-live-pods.json"
+            live_images="$RUNNER_TEMP/master-monitoring-live-images.txt"
+            monitoring_values="$RUNNER_TEMP/master-monitoring-live-values.json"
+            prometheus_json="$RUNNER_TEMP/master-monitoring-prometheus.json"
+            alertmanager_json="$RUNNER_TEMP/master-monitoring-alertmanager.json"
+            operator_json="$RUNNER_TEMP/master-monitoring-operator.json"
+            operator_args="$RUNNER_TEMP/master-monitoring-live-operator-args.txt"
+            test -s "$RUNNER_TEMP/master-monitoring-expected-live-images.txt"
+            test -s "$RUNNER_TEMP/master-monitoring-expected-operator-args.txt"
+
+            kubectl -n "$MONITORING_NAMESPACE" get services -o json > "$services"
+            jq -e '
+              (.items | length) > 0 and
+              all(.items[];
+                (.spec.type // "ClusterIP") == "ClusterIP" and
+                ((.spec.externalIPs // []) | length == 0) and
+                ((.spec.loadBalancerSourceRanges // []) | length == 0) and
+                (.spec.loadBalancerIP // null) == null and
+                (.spec.loadBalancerClass // null) == null and
+                (.spec.externalName // null) == null and
+                all(.spec.ports[]?; (.nodePort // null) == null))
+            ' "$services" >/dev/null
+
+            kubectl -n "$MONITORING_NAMESPACE" get \
+              pods,deployments.apps,statefulsets.apps,daemonsets.apps,jobs.batch,cronjobs.batch \
+              -o json > "$workloads"
+            jq -e '
+              ([.. | objects | select(has("hostNetwork")) | .hostNetwork] | all(. != true)) and
+              ([.. | objects | select(has("hostPort")) | .hostPort] | all(. == null or . == 0))
+            ' "$workloads" >/dev/null
+
+            kubectl -n "$MONITORING_NAMESPACE" get daemonset \
+              "$MONITORING_RELEASE-prometheus-node-exporter" -o json > "$node_exporter"
+            jq -e --arg release "$MONITORING_RELEASE" '
+              .metadata.labels["app.kubernetes.io/instance"] == $release and
+              .spec.template.spec.hostNetwork == false and
+              .spec.template.spec.hostPID == false and
+              all(.spec.template.spec.containers[]?;
+                all(.ports[]?; (.hostPort // null) == null or .hostPort == 0))
+            ' "$node_exporter" >/dev/null
+
+            helm get values "$MONITORING_RELEASE" --namespace "$MONITORING_NAMESPACE" -o json \
+              > "$monitoring_values"
+            jq -e '
+              .grafana.testFramework.enabled == false and
+              .grafana.image.sha == "70d9599b186ce287be0d2c5ba9a78acb2e86c1a68c9c41449454d0fc3eeb84e8" and
+              .grafana.initChownData.image.sha == "95cf004f559831017cdf4628aaf1bb30133677be8702a8c5f2994629f637a209" and
+              .grafana.sidecar.image.sha == "716b0b33ff2dc938a3f2bc64e5ea791d81fb09760bcd27cec1eb896968d6e134" and
+              ."kube-state-metrics".image.sha == "sha256:2bbc915567334b13632bf62c0a97084aff72a36e13c4dabd5f2f11c898c5bacd" and
+              ."prometheus-node-exporter".image.digest == "sha256:337ff1d356b68d39cef853e8c6345de11ce7556bb34cda8bd205bcf2ed30b565" and
+              .prometheusOperator.image.sha == "6dbbbbeca6d7b94aa30723bfaa55262e41b9f8c15304c484611c696503840aac" and
+              .prometheusOperator.prometheusConfigReloader.image.sha == "257ce3543e8f45c059dab488bcf897d8cc598cabd78afba12f41d6dbe36e22d2" and
+              .prometheusOperator.admissionWebhooks.patch.image.sha == "c7f925cc3ec386e11b7393f941a8844786311fd2328943fe3e7c744c373ed864" and
+              .prometheusOperator.thanosImage.sha == "aae7b2b030ed00d88abd8c5a357d08b46f22151ca0d50d9c796223fa332389c8" and
+              .alertmanager.alertmanagerSpec.image.sha == "88743b63b3e09ea6e31e140ced5bf45f4a8e82c617c2a963f78841f4995ad1d7" and
+              .prometheus.prometheusSpec.image.sha == "d936808bdea528155c0154a922cd42fd75716b8bb7ba302641350f9f3eaeba09"
+            ' "$monitoring_values" >/dev/null
+
+            kubectl -n "$MONITORING_NAMESPACE" get pods -o json > "$pods"
+            jq -er '
+              .items[] | .spec |
+              (.initContainers[]?.image, .containers[]?.image, .ephemeralContainers[]?.image)
+            ' "$pods" | LC_ALL=C sort -u > "$live_images"
+            cmp -s "$RUNNER_TEMP/master-monitoring-expected-live-images.txt" "$live_images" || {
+              echo "Live monitoring Pod image allowlist mismatch" >&2
+              diff -u "$RUNNER_TEMP/master-monitoring-expected-live-images.txt" "$live_images" >&2 || true
+              return 1
+            }
+            while IFS= read -r image; do
+              [[ "$image" =~ @sha256:[0-9a-f]{64}$ ]] || return 1
+            done < "$live_images"
+
+            kubectl -n "$MONITORING_NAMESPACE" get prometheus -o json > "$prometheus_json"
+            jq -e '
+              (.items | length) == 1 and
+              .items[0].spec.image == "quay.io/prometheus/prometheus:v3.8.0@sha256:d936808bdea528155c0154a922cd42fd75716b8bb7ba302641350f9f3eaeba09"
+            ' "$prometheus_json" >/dev/null
+            kubectl -n "$MONITORING_NAMESPACE" get alertmanager -o json > "$alertmanager_json"
+            jq -e '
+              (.items | length) == 1 and
+              .items[0].spec.image == "quay.io/prometheus/alertmanager:v0.29.0@sha256:88743b63b3e09ea6e31e140ced5bf45f4a8e82c617c2a963f78841f4995ad1d7"
+            ' "$alertmanager_json" >/dev/null
+            kubectl -n "$MONITORING_NAMESPACE" get deployment master-monitoring-operator -o json \
+              > "$operator_json"
+            jq -e '
+              (.spec.template.spec.containers | length) == 1 and
+              .spec.template.spec.containers[0].image == "quay.io/prometheus-operator/prometheus-operator:v0.87.1@sha256:6dbbbbeca6d7b94aa30723bfaa55262e41b9f8c15304c484611c696503840aac"
+            ' "$operator_json" >/dev/null
+            jq -r '
+              .spec.template.spec.containers[0].args[] |
+              select(startswith("--prometheus-config-reloader=") or
+                     startswith("--thanos-default-base-image=")) |
+              split("=")[1]
+            ' "$operator_json" | LC_ALL=C sort -u > "$operator_args"
+            cmp -s "$RUNNER_TEMP/master-monitoring-expected-operator-args.txt" "$operator_args"
+
+            kubectl api-resources --namespaced -o name > "$api_resources"
+            for resource in \
+              ingresses.networking.k8s.io \
+              gateways.gateway.networking.k8s.io \
+              httproutes.gateway.networking.k8s.io \
+              grpcroutes.gateway.networking.k8s.io \
+              tcproutes.gateway.networking.k8s.io \
+              tlsroutes.gateway.networking.k8s.io \
+              udproutes.gateway.networking.k8s.io \
+              routes.route.openshift.io \
+              ingressroutes.traefik.io ingressroutetcps.traefik.io ingressrouteudps.traefik.io \
+              ingressroutes.traefik.containo.us ingressroutetcps.traefik.containo.us ingressrouteudps.traefik.containo.us \
+              virtualservices.networking.istio.io gateways.networking.istio.io \
+              mappings.getambassador.io httpproxies.projectcontour.io \
+              virtualservers.k8s.nginx.org transportservers.k8s.nginx.org; do
+              if grep -Fxq "$resource" "$api_resources"; then
+                test -z "$(kubectl -n "$MONITORING_NAMESPACE" get "$resource" -o name)"
+              fi
+            done
+          }
+
+          live_values() {
+            helm get values "$MASTER_RELEASE" --namespace "$MASTER_NAMESPACE" -o json
+          }
+
+          assert_live_shadow_identity() {
+            local expected_infra=${1:-$PROPOSED_SHA}
+            local expected_backend=${2:-$BACKEND_SHA}
+            local expected_frontend=${3:-$FRONTEND_SHA}
+            local expected_mysql=${4-}
+            local expected_redis=${5-}
+            local live_mysql live_redis values
+            values=$(live_values)
+            test "$(jq -r '.dataMode' <<<"$values")" = "SHADOW"
+            test "$(jq -r '.runtimeMode' <<<"$values")" = "SHADOW"
+            test "$(jq -r '.ingress.enabled' <<<"$values")" = "false"
+            test "$(jq -r '.mysql.readOnly' <<<"$values")" = "true"
+            test "$(jq -r '.redis.readOnly' <<<"$values")" = "true"
+            test "$(jq -r '.adminBackend.farmReadOnlyCredential.enabled' <<<"$values")" = "true"
+            test "$(jq -r '.networkPolicy.backendExtraEgress[0].cidr' <<<"$values")" = "$FARM_READONLY_CIDR"
+            test "$(jq -c '.networkPolicy.backendExtraEgress[0].ports | sort' <<<"$values")" = "[6443,30482]"
+            test "$(jq -r '.networkPolicy.backendMonitoringEgress.enabled' <<<"$values")" = "true"
+            live_mysql=$(jq -r '.mysql.expectedReceiptSha256' <<<"$values")
+            live_redis=$(jq -r '.redis.expectedReceiptSha256' <<<"$values")
+            [[ "$live_mysql" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$live_redis" =~ ^[0-9a-f]{64}$ ]]
+            if [ -n "$expected_mysql" ]; then
+              test "$live_mysql" = "$expected_mysql"
+            fi
+            if [ -n "$expected_redis" ]; then
+              test "$live_redis" = "$expected_redis"
+            fi
+            test "$(jq -r '.provenance.infraSha' <<<"$values")" = "$expected_infra"
+            test "$(jq -r '.provenance.backendSha' <<<"$values")" = "$expected_backend"
+            test "$(jq -r '.provenance.frontendSha' <<<"$values")" = "$expected_frontend"
+            kubectl -n "$MASTER_NAMESPACE" get deploy "$MASTER_RELEASE-backend" \
+              -o json | jq -e --arg sha "$expected_backend" \
+              '.spec.template.metadata.annotations["provi.dgu.ac.kr/backend-sha"] == $sha
+               and any(.spec.template.spec.volumes[]?;
+                 .name == "farm-readonly-kubeconfig"
+                 and .secret.secretName == "master-admin-farm-readonly"
+                 and any(.secret.items[]?; .key == "kubeconfig" and .path == "kubeconfig"))
+               and any(.spec.template.spec.containers[]? | select(.name == "backend") | .volumeMounts[]?;
+                 .name == "farm-readonly-kubeconfig"
+                 and .mountPath == "/etc/provi/kubeconfigs/farm-readonly.yaml"
+                 and .subPath == "kubeconfig"
+                 and .readOnly == true)' >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get deploy "$MASTER_RELEASE-frontend" \
+              -o json | jq -e --arg sha "$expected_frontend" \
+              '.spec.template.metadata.annotations["provi.dgu.ac.kr/frontend-sha"] == $sha' >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get statefulset "$MASTER_RELEASE-mysql" \
+              -o json | jq -e --arg sha "$live_mysql" \
+              '.spec.template.metadata.annotations["provi.dgu.ac.kr/restore-receipt-sha256"] == $sha' >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get statefulset "$MASTER_RELEASE-redis" \
+              -o json | jq -e --arg sha "$live_redis" \
+              '.spec.template.metadata.annotations["provi.dgu.ac.kr/restore-receipt-sha256"] == $sha' >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get networkpolicy "$MASTER_RELEASE-backend" \
+              -o json | jq -e --arg cidr "$FARM_READONLY_CIDR" '
+                any(.spec.egress[]?;
+                  .to == [{"ipBlock":{"cidr":$cidr}}]
+                  and ([.ports[]? | .port] | sort) == [6443,30482])
+                and any(.spec.egress[]?;
+                  .to == [{
+                    "namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"provi-monitoring"}},
+                    "podSelector":{"matchLabels":{"prometheus":"master-monitoring-kube-prometheus-prometheus"}}
+                  }]
+                  and .ports == [{"port":9090,"protocol":"TCP"}])' >/dev/null
+          }
+
+          wait_ready_pods() {
+            local selector=$1 label=$2 _attempt pods
+            for _attempt in $(seq 1 120); do
+              pods=$(kubectl -n "$MONITORING_NAMESPACE" get pods -l "$selector" -o json)
+              if jq -e \
+                '.items | length > 0 and all(.[]; .status.phase == "Succeeded" or (.status.phase == "Running" and any(.status.conditions[]?; .type == "Ready" and .status == "True")))' \
+                <<<"$pods" >/dev/null; then
+                return 0
+              fi
+              sleep 5
+            done
+            echo "Monitoring Pod readiness timed out: $label ($selector)" >&2
+            kubectl -n "$MONITORING_NAMESPACE" get pods -l "$selector" -o wide >&2
+            return 1
+          }
+
+          case "$ACTION" in
+            probe)
+              # 위의 host/API/lint/template 검사 외에는 읽기 전용이다.
+              if helm status "$MASTER_RELEASE" --namespace "$MASTER_NAMESPACE" >/dev/null 2>&1; then
+                helm status "$MASTER_RELEASE" --namespace "$MASTER_NAMESPACE" >/dev/null
+                kubectl -n "$MASTER_NAMESPACE" get pods >/dev/null
+                assert_namespace_not_exposed
+              fi
+              echo "provi-master Admin probe passed without a Kubernetes mutation"
+              ;;
+            restore)
+              test -z "$MYSQL_RECEIPT_SHA256"
+              test -z "$REDIS_RECEIPT_SHA256"
+              require_precreated_secrets
+              # RESTORE는 신규 retained PV를 데이터 복제 도구에 열어 주는 단 한 번의
+              # 초기화 단계다. 기존 Helm release를 덮어쓰거나 애플리케이션을 기동하지 않는다.
+              # Helm 이력만 없는 상태는 불충분하다. keep/Retain으로 남은 PV/PVC를
+              # 재사용하지 않도록 release·StorageClass·PV·PVC 모두의 신규성을 먼저 증명한다.
+              require_fresh_restore_storage
+              helm upgrade --install "$MASTER_RELEASE" "$chart" \
+                --namespace "$MASTER_NAMESPACE" \
+                --rollback-on-failure \
+                --wait \
+                --timeout 15m \
+                --history-max 20 \
+                --set-string dataMode=RESTORE \
+                --set-string runtimeMode=SHADOW \
+                --set adminBackend.replicas=0 \
+                --set adminFrontend.replicas=0 \
+                --set ingress.enabled=false \
+                --set mysql.readOnly=false \
+                --set redis.readOnly=false \
+                --set activation.confirmSingleWriter=false \
+                --set-string mysql.expectedReceiptSha256= \
+                --set-string redis.expectedReceiptSha256= \
+                --set-string provenance.infraSha="$PROPOSED_SHA" \
+                --set-string provenance.backendSha="$BACKEND_SHA" \
+                --set-string provenance.frontendSha="$FRONTEND_SHA" \
+                --set-string adminBackend.image.repository="$TEMPLATE_BACKEND_REPOSITORY" \
+                --set-string adminBackend.image.digest="$TEMPLATE_BACKEND_DIGEST" \
+                --set-string adminFrontend.image.repository="$TEMPLATE_FRONTEND_REPOSITORY" \
+                --set-string adminFrontend.image.digest="$TEMPLATE_FRONTEND_DIGEST" \
+                --set-string mysql.image.repository="$MYSQL_REPOSITORY" \
+                --set-string mysql.image.digest="$MYSQL_DIGEST" \
+                --set-string redis.image.repository="$REDIS_REPOSITORY" \
+                --set-string redis.image.digest="$REDIS_DIGEST"
+              values=$(live_values)
+              test "$(jq -r '.dataMode' <<<"$values")" = "RESTORE"
+              test "$(jq -r '.runtimeMode' <<<"$values")" = "SHADOW"
+              test "$(jq -r '.adminBackend.replicas' <<<"$values")" = "0"
+              test "$(jq -r '.adminFrontend.replicas' <<<"$values")" = "0"
+              test "$(jq -r '.mysql.readOnly' <<<"$values")" = "false"
+              test "$(jq -r '.redis.readOnly' <<<"$values")" = "false"
+              test -z "$(kubectl -n "$MASTER_NAMESPACE" get ingress -o name)"
+              test "$(kubectl -n "$MASTER_NAMESPACE" get pvc master-admin-mysql -o jsonpath='{.status.phase}')" = "Bound"
+              test "$(kubectl -n "$MASTER_NAMESPACE" get pvc master-admin-redis -o jsonpath='{.status.phase}')" = "Bound"
+              test "$(kubectl -n "$MASTER_NAMESPACE" get pvc master-admin-backup -o jsonpath='{.status.phase}')" = "Bound"
+              assert_namespace_not_exposed
+              ;;
+            shadow)
+              [[ "$BACKEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$FRONTEND_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+              [[ "$MYSQL_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              [[ "$REDIS_RECEIPT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+              test -n "$BACKEND_REPOSITORY"
+              test -n "$FRONTEND_REPOSITORY"
+              require_precreated_secrets
+              values=$(live_values)
+              case "$(jq -r '.dataMode' <<<"$values")" in
+                RESTORE) ;;
+                SHADOW)
+                  test "$(jq -r '.mysql.expectedReceiptSha256' <<<"$values")" = "$MYSQL_RECEIPT_SHA256"
+                  test "$(jq -r '.redis.expectedReceiptSha256' <<<"$values")" = "$REDIS_RECEIPT_SHA256"
+                  ;;
+                *)
+                  echo "shadow 전환은 기존 RESTORE 또는 동일 영수증의 SHADOW release에서만 허용됩니다." >&2
+                  exit 1
+                  ;;
+              esac
+              monitoring_chart="$RUNNER_TEMP/kube-prometheus-stack-${MONITORING_CHART_VERSION}.tgz"
+              test -f "$monitoring_chart"
+              echo "$MONITORING_CHART_SHA256  $monitoring_chart" | sha256sum --check --strict
+              # 기존 FARM monitoring release에는 접근하지 않는다. Master monitoring은
+              # 별도 namespace/release로 먼저 기동하고, 실패해도 Admin writer는 열리지 않는다.
+              helm upgrade --install "$MONITORING_RELEASE" "$monitoring_chart" \
+                --namespace "$MONITORING_NAMESPACE" \
+                --create-namespace \
+                --values proposed/ops/master-monitoring/values-shadow.yaml \
+                --values workflow-source/.github/config/master-monitoring-image-pins.yaml \
+                --set prometheus-node-exporter.hostNetwork=false \
+                --set prometheus-node-exporter.hostPID=false \
+                --rollback-on-failure \
+                --wait \
+                --timeout 15m \
+                --history-max 20
+              wait_ready_pods "app.kubernetes.io/instance=$MONITORING_RELEASE" "Helm-managed monitoring Pods"
+              prometheus_name=$(kubectl -n "$MONITORING_NAMESPACE" get prometheus -o json | \
+                jq -er '.items | select(length == 1) | .[0].metadata.name')
+              alertmanager_name=$(kubectl -n "$MONITORING_NAMESPACE" get alertmanager -o json | \
+                jq -er '.items | select(length == 1) | .[0].metadata.name')
+              wait_ready_pods "prometheus=$prometheus_name" "Prometheus operator workload"
+              wait_ready_pods "alertmanager=$alertmanager_name" "Alertmanager operator workload"
+              kubectl -n "$MONITORING_NAMESPACE" get pvc -o json | \
+                jq -e '.items | length >= 2 and all(.[]; .status.phase == "Bound")' >/dev/null
+              assert_monitoring_namespace_not_exposed
+              helm upgrade --install "$MASTER_RELEASE" "$chart" \
+                --namespace "$MASTER_NAMESPACE" \
+                --create-namespace \
+                --wait \
+                --timeout 15m \
+                --history-max 20 \
+                --set-string dataMode=SHADOW \
+                --set-string runtimeMode=SHADOW \
+                --set ingress.enabled=false \
+                --set mysql.readOnly=true \
+                --set redis.readOnly=true \
+                --set adminBackend.farmReadOnlyCredential.enabled=true \
+                --set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR" \
+                --set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT" \
+                --set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT" \
+                --set networkPolicy.backendMonitoringEgress.enabled=true \
+                --set activation.confirmSingleWriter=false \
+                --set-string mysql.expectedReceiptSha256="$MYSQL_RECEIPT_SHA256" \
+                --set-string redis.expectedReceiptSha256="$REDIS_RECEIPT_SHA256" \
+                --set-string provenance.infraSha="$PROPOSED_SHA" \
+                --set-string provenance.backendSha="$BACKEND_SHA" \
+                --set-string provenance.frontendSha="$FRONTEND_SHA" \
+                --set-string adminBackend.image.repository="$BACKEND_REPOSITORY" \
+                --set-string adminBackend.image.digest="$BACKEND_DIGEST" \
+                --set-string adminFrontend.image.repository="$FRONTEND_REPOSITORY" \
+                --set-string adminFrontend.image.digest="$FRONTEND_DIGEST" \
+                --set-string mysql.image.repository="$MYSQL_REPOSITORY" \
+                --set-string mysql.image.digest="$MYSQL_DIGEST" \
+                --set-string redis.image.repository="$REDIS_REPOSITORY" \
+                --set-string redis.image.digest="$REDIS_DIGEST"
+              assert_live_shadow_identity "$PROPOSED_SHA" "$BACKEND_SHA" "$FRONTEND_SHA" \
+                "$MYSQL_RECEIPT_SHA256" "$REDIS_RECEIPT_SHA256"
+              assert_namespace_not_exposed
+              ;;
+            *)
+              echo "지원하지 않는 action: $ACTION" >&2
+              exit 2
+              ;;
+          esac
+
+          test "$(kubectl --request-timeout=20s get --raw=/readyz)" = "ok"
+          test "$(kubectl get nodes -o json | jq '[.items[] | select(any(.status.conditions[]?; .type == "Ready" and .status == "True"))] | length')" = "1"
