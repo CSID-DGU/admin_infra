@@ -93,7 +93,7 @@ def allowed_reader_nonresource_tuple:
 
 (.apiVersion == "authorization.k8s.io/v1") and
 (.kind == "SelfSubjectRulesReview") and
-(.spec.namespace == $expected_namespace) and
+(.spec == {}) and
 (.status.incomplete == false) and
 ((.status.evaluationError // "") == "") and
 (.status.resourceRules | type == "array" and length > 0) and

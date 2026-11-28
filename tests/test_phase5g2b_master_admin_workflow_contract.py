@@ -97,7 +97,8 @@ def valid_reader_rules_review():
     return {
         "apiVersion": "authorization.k8s.io/v1",
         "kind": "SelfSubjectRulesReview",
-        "spec": {"namespace": "ailab-operation"},
+        "metadata": {},
+        "spec": {},
         "status": {
             "incomplete": False,
             "resourceRules": [
@@ -132,9 +133,6 @@ class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
             [
                 "jq",
                 "-e",
-                "--arg",
-                "expected_namespace",
-                "ailab-operation",
                 "-f",
                 str(RULES_VALIDATOR),
             ],
@@ -247,7 +245,56 @@ class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
         self.assertIn('all(.resources[]; . != "*")', validator)
         self.assertIn('all(.verbs[]; . != "*")', validator)
         self.assertIn("resourceNames", validator)
+        self.assertIn("(.spec == {})", validator)
+        self.assertNotIn("expected_namespace", validator)
         self.assertTrue(self.validator_accepts(valid_reader_rules_review()))
+
+    def test_ssrr_request_is_exact_validated_before_posting_the_same_file(self):
+        boundary = self.source.split("require_precreated_secrets()", 1)[1].split(
+            "require_fresh_restore_storage()", 1
+        )[0]
+        request_path = (
+            'farm_ssrr_request="$RUNNER_TEMP/'
+            'farm-reader-self-subject-rules-review-request.json"'
+        )
+        response_path = (
+            'farm_ssrr_response="$RUNNER_TEMP/'
+            'farm-reader-self-subject-rules-review-response.json"'
+        )
+        exact_request_check = '. == {'
+        post_same_file = '-f "$farm_ssrr_request" > "$farm_ssrr_response"'
+        response_validation = '"$farm_ssrr_response" >/dev/null'
+        exact_request_input = '"$farm_ssrr_request" >/dev/null'
+        for expected in (
+            request_path,
+            response_path,
+            'jq -n --arg namespace "$FARM_NAMESPACE"',
+            'spec: {namespace: $expected_namespace}',
+            exact_request_check,
+            post_same_file,
+            response_validation,
+            exact_request_input,
+        ):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, boundary)
+        self.assertLess(boundary.index(exact_request_check), boundary.index(post_same_file))
+        self.assertLess(boundary.index(exact_request_input), boundary.index(post_same_file))
+        self.assertLess(boundary.index(post_same_file), boundary.index(response_validation))
+
+    def test_effective_rule_validator_requires_canonical_empty_response_spec(self):
+        echoed_request_spec = valid_reader_rules_review()
+        echoed_request_spec["spec"] = {"namespace": "ailab-operation"}
+        missing_spec = valid_reader_rules_review()
+        missing_spec.pop("spec")
+        nonempty_spec = valid_reader_rules_review()
+        nonempty_spec["spec"] = {"unexpected": True}
+        for label, fixture in (
+            ("echoed-request-spec", echoed_request_spec),
+            ("missing-spec", missing_spec),
+            ("nonempty-spec", nonempty_spec),
+        ):
+            with self.subTest(label=label):
+                self.assertFalse(self.validator_accepts(fixture))
 
     def test_effective_rule_validator_rejects_incomplete_wildcard_and_extras(self):
         mutations = []

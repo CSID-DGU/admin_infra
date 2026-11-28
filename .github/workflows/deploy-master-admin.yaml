@@ -575,7 +575,7 @@ jobs:
           }
 
           require_precreated_secrets() {
-            local farm_kubeconfig farm_ssrr farm_whoami
+            local farm_kubeconfig farm_ssrr_request farm_ssrr_response farm_whoami
             kubectl -n "$MASTER_NAMESPACE" get secret master-admin-database >/dev/null
             kubectl -n "$MASTER_NAMESPACE" get secret master-admin-be-config >/dev/null
             kubectl -n "$MASTER_NAMESPACE" get secret master-admin-farm-readonly >/dev/null
@@ -599,15 +599,28 @@ jobs:
                   (["system:authenticated", "system:serviceaccounts", $namespace_group] | sort))
               ' "$farm_whoami" >/dev/null
 
-            farm_ssrr="$RUNNER_TEMP/farm-reader-self-subject-rules-review.json"
-            printf '%s\n' \
-              "{\"apiVersion\":\"authorization.k8s.io/v1\",\"kind\":\"SelfSubjectRulesReview\",\"spec\":{\"namespace\":\"${FARM_NAMESPACE}\"}}" | \
-              kubectl --kubeconfig="$farm_kubeconfig" create \
-                --raw='/apis/authorization.k8s.io/v1/selfsubjectrulesreviews' -f - > "$farm_ssrr"
+            farm_ssrr_request="$RUNNER_TEMP/farm-reader-self-subject-rules-review-request.json"
+            farm_ssrr_response="$RUNNER_TEMP/farm-reader-self-subject-rules-review-response.json"
+            jq -n --arg namespace "$FARM_NAMESPACE" '
+              {
+                apiVersion: "authorization.k8s.io/v1",
+                kind: "SelfSubjectRulesReview",
+                spec: {namespace: $namespace}
+              }
+            ' > "$farm_ssrr_request"
+            jq -e --arg expected_namespace "$FARM_NAMESPACE" '
+              . == {
+                apiVersion: "authorization.k8s.io/v1",
+                kind: "SelfSubjectRulesReview",
+                spec: {namespace: $expected_namespace}
+              }
+            ' "$farm_ssrr_request" >/dev/null
+            kubectl --kubeconfig="$farm_kubeconfig" create \
+              --raw='/apis/authorization.k8s.io/v1/selfsubjectrulesreviews' \
+              -f "$farm_ssrr_request" > "$farm_ssrr_response"
             test -f workflow-source/.github/scripts/phase5g2b-reader-effective-rules-validator.jq
-            jq -e --arg expected_namespace "$FARM_NAMESPACE" \
-              -f workflow-source/.github/scripts/phase5g2b-reader-effective-rules-validator.jq \
-              "$farm_ssrr" >/dev/null
+            jq -e -f workflow-source/.github/scripts/phase5g2b-reader-effective-rules-validator.jq \
+              "$farm_ssrr_response" >/dev/null
 
             test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get pods -n "$FARM_NAMESPACE")" = "yes"
             test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i list pods -n "$FARM_NAMESPACE")" = "yes"
