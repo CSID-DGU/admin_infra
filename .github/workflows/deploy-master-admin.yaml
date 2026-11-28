@@ -641,7 +641,11 @@ jobs:
           }
 
           require_fresh_restore_storage() {
-            test "$(helm list --all --namespace "$MASTER_NAMESPACE" --filter "^${MASTER_RELEASE}$" -o json | jq 'length')" = "0"
+            # Helm 4 lists every release status by default. Do not add the removed
+            # --all flag or status filters: combined status filters can omit releases.
+            test "$(helm list \
+              --namespace "$MASTER_NAMESPACE" --filter "^${MASTER_RELEASE}$" \
+              -o json | jq 'length')" = "0"
             test -z "$(kubectl -n "$MASTER_NAMESPACE" get pvc \
               master-admin-mysql master-admin-redis master-admin-backup \
               --ignore-not-found -o name)"
