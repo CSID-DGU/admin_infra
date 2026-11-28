@@ -84,6 +84,9 @@ env:
   TEMPLATE_BACKEND_DIGEST: sha256:ce13258eaffa6711ad53cdf393f9e44bf97ef1f8b1718df80c257fb44b92230d
   TEMPLATE_FRONTEND_REPOSITORY: docker.io/dguailab/ailab-frontend-exp
   TEMPLATE_FRONTEND_DIGEST: sha256:a568e66cca84514fdba41762da435d0541939200d19e0b6fc7fb939b0cd30d24
+  FARM_READONLY_CIDR: 192.168.2.198/32
+  FARM_API_PORT: "6443"
+  FARM_CONFIG_SERVER_PORT: "30482"
   CUTOVER_SECRET: provi-master-admin-cutover
 
 jobs:
@@ -397,6 +400,11 @@ jobs:
             --set ingress.enabled=false \
             --set mysql.readOnly=true \
             --set redis.readOnly=true \
+            --set adminBackend.farmReadOnlyCredential.enabled=true \
+            --set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR" \
+            --set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT" \
+            --set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT" \
+            --set networkPolicy.backendMonitoringEgress.enabled=true \
             --set-string mysql.expectedReceiptSha256="$mysql_fixture" \
             --set-string redis.expectedReceiptSha256="$redis_fixture" \
             --set-string provenance.infraSha="$PROPOSED_SHA" \
@@ -417,6 +425,11 @@ jobs:
             --set ingress.enabled=false \
             --set mysql.readOnly=true \
             --set redis.readOnly=true \
+            --set adminBackend.farmReadOnlyCredential.enabled=true \
+            --set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR" \
+            --set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT" \
+            --set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT" \
+            --set networkPolicy.backendMonitoringEgress.enabled=true \
             --set-string mysql.expectedReceiptSha256="$mysql_fixture" \
             --set-string redis.expectedReceiptSha256="$redis_fixture" \
             --set-string provenance.infraSha="$PROPOSED_SHA" \
@@ -514,11 +527,31 @@ jobs:
           }
 
           require_precreated_secrets() {
+            local farm_kubeconfig
             kubectl -n "$MASTER_NAMESPACE" get secret master-admin-database >/dev/null
             kubectl -n "$MASTER_NAMESPACE" get secret master-admin-be-config >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get secret master-admin-farm-readonly >/dev/null
             for key in mysql-root-password mysql-username mysql-password redis-password; do
               require_secret_key master-admin-database "$key"
             done
+            require_secret_key master-admin-farm-readonly kubeconfig
+
+            farm_kubeconfig="$RUNNER_TEMP/farm-readonly.kubeconfig"
+            kubectl -n "$MASTER_NAMESPACE" get secret master-admin-farm-readonly -o json | \
+              jq -er 'select(.immutable == true and (.data.kubeconfig | type == "string" and length > 0)) | .data.kubeconfig | @base64d' \
+              > "$farm_kubeconfig"
+            chmod 0600 "$farm_kubeconfig"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" config view --minify -o jsonpath='{.clusters[0].cluster.server}')" = "https://192.168.2.198:6443"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth whoami -o json | jq -r '.status.userInfo.username')" = "system:serviceaccount:ailab-operation:provi-master-admin-shadow-reader"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get pods -n ailab-operation)" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i list pods -n ailab-operation)" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get pods --subresource=log -n ailab-operation)" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i list events -n ailab-operation)" = "yes"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get secrets -n ailab-operation)" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i create pods -n ailab-operation)" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i patch deployments -n ailab-operation)" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i get nodes)" = "no"
+            test "$(kubectl --kubeconfig="$farm_kubeconfig" auth can-i list pods -n default)" = "no"
           }
 
           live_values() {
@@ -538,6 +571,10 @@ jobs:
             test "$(jq -r '.ingress.enabled' <<<"$values")" = "false"
             test "$(jq -r '.mysql.readOnly' <<<"$values")" = "true"
             test "$(jq -r '.redis.readOnly' <<<"$values")" = "true"
+            test "$(jq -r '.adminBackend.farmReadOnlyCredential.enabled' <<<"$values")" = "true"
+            test "$(jq -r '.networkPolicy.backendExtraEgress[0].cidr' <<<"$values")" = "$FARM_READONLY_CIDR"
+            test "$(jq -c '.networkPolicy.backendExtraEgress[0].ports | sort' <<<"$values")" = "[6443,30482]"
+            test "$(jq -r '.networkPolicy.backendMonitoringEgress.enabled' <<<"$values")" = "true"
             live_mysql=$(jq -r '.mysql.expectedReceiptSha256' <<<"$values")
             live_redis=$(jq -r '.redis.expectedReceiptSha256' <<<"$values")
             [[ "$live_mysql" =~ ^[0-9a-f]{64}$ ]]
@@ -553,7 +590,16 @@ jobs:
             test "$(jq -r '.provenance.frontendSha' <<<"$values")" = "$expected_frontend"
             kubectl -n "$MASTER_NAMESPACE" get deploy "$MASTER_RELEASE-backend" \
               -o json | jq -e --arg sha "$expected_backend" \
-              '.spec.template.metadata.annotations["provi.dgu.ac.kr/backend-sha"] == $sha' >/dev/null
+              '.spec.template.metadata.annotations["provi.dgu.ac.kr/backend-sha"] == $sha
+               and any(.spec.template.spec.volumes[]?;
+                 .name == "farm-readonly-kubeconfig"
+                 and .secret.secretName == "master-admin-farm-readonly"
+                 and any(.secret.items[]?; .key == "kubeconfig" and .path == "kubeconfig"))
+               and any(.spec.template.spec.containers[]? | select(.name == "backend") | .volumeMounts[]?;
+                 .name == "farm-readonly-kubeconfig"
+                 and .mountPath == "/etc/provi/kubeconfigs/farm-readonly.yaml"
+                 and .subPath == "kubeconfig"
+                 and .readOnly == true)' >/dev/null
             kubectl -n "$MASTER_NAMESPACE" get deploy "$MASTER_RELEASE-frontend" \
               -o json | jq -e --arg sha "$expected_frontend" \
               '.spec.template.metadata.annotations["provi.dgu.ac.kr/frontend-sha"] == $sha' >/dev/null
@@ -563,6 +609,17 @@ jobs:
             kubectl -n "$MASTER_NAMESPACE" get statefulset "$MASTER_RELEASE-redis" \
               -o json | jq -e --arg sha "$live_redis" \
               '.spec.template.metadata.annotations["provi.dgu.ac.kr/restore-receipt-sha256"] == $sha' >/dev/null
+            kubectl -n "$MASTER_NAMESPACE" get networkpolicy "$MASTER_RELEASE-backend" \
+              -o json | jq -e --arg cidr "$FARM_READONLY_CIDR" '
+                any(.spec.egress[]?;
+                  .to == [{"ipBlock":{"cidr":$cidr}}]
+                  and ([.ports[]? | .port] | sort) == [6443,30482])
+                and any(.spec.egress[]?;
+                  .to == [{
+                    "namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"provi-monitoring"}},
+                    "podSelector":{"matchLabels":{"prometheus":"master-monitoring-kube-prometheus-prometheus"}}
+                  }]
+                  and .ports == [{"port":9090,"protocol":"TCP"}])' >/dev/null
           }
 
           validate_cutover_receipt() {
@@ -717,6 +774,11 @@ jobs:
                 --set ingress.enabled=false \
                 --set mysql.readOnly=true \
                 --set redis.readOnly=true \
+                --set adminBackend.farmReadOnlyCredential.enabled=true \
+                --set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR" \
+                --set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT" \
+                --set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT" \
+                --set networkPolicy.backendMonitoringEgress.enabled=true \
                 --set activation.confirmSingleWriter=false \
                 --set-string mysql.expectedReceiptSha256="$MYSQL_RECEIPT_SHA256" \
                 --set-string redis.expectedReceiptSha256="$REDIS_RECEIPT_SHA256" \

@@ -74,6 +74,20 @@ class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
         self.assertIn('mysql.expectedReceiptSha256="$MYSQL_RECEIPT_SHA256"', shadow)
         self.assertIn('redis.expectedReceiptSha256="$REDIS_RECEIPT_SHA256"', shadow)
         self.assertIn("--set activation.confirmSingleWriter=false", shadow)
+        self.assertIn("--set adminBackend.farmReadOnlyCredential.enabled=true", shadow)
+        self.assertIn(
+            '--set-string "networkPolicy.backendExtraEgress[0].cidr=$FARM_READONLY_CIDR"',
+            shadow,
+        )
+        self.assertIn(
+            '--set "networkPolicy.backendExtraEgress[0].ports[0]=$FARM_CONFIG_SERVER_PORT"',
+            shadow,
+        )
+        self.assertIn(
+            '--set "networkPolicy.backendExtraEgress[0].ports[1]=$FARM_API_PORT"',
+            shadow,
+        )
+        self.assertIn("--set networkPolicy.backendMonitoringEgress.enabled=true", shadow)
         self.assertIn('mysql.image.digest="$MYSQL_DIGEST"', shadow)
         self.assertIn('redis.image.digest="$REDIS_DIGEST"', shadow)
         # A failed receipt/init gate must leave the new read-only/blocked
@@ -83,6 +97,33 @@ class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("--rollback-on-failure", master_upgrade)
         self.assertNotIn("kubectl delete", shadow)
         self.assertNotIn("helm uninstall", shadow)
+
+    def test_farm_credential_is_precreated_read_only_and_live_mounted(self):
+        self.assertIn("FARM_READONLY_CIDR: 192.168.2.198/32", self.source)
+        self.assertIn('FARM_API_PORT: "6443"', self.source)
+        self.assertIn('FARM_CONFIG_SERVER_PORT: "30482"', self.source)
+        self.assertIn(
+            'get secret master-admin-farm-readonly',
+            self.source,
+        )
+        self.assertIn("require_secret_key master-admin-farm-readonly kubeconfig", self.source)
+        self.assertIn("select(.immutable == true", self.source)
+        self.assertIn(
+            "system:serviceaccount:ailab-operation:provi-master-admin-shadow-reader",
+            self.source,
+        )
+        for denied in (
+            "auth can-i get secrets -n ailab-operation",
+            "auth can-i create pods -n ailab-operation",
+            "auth can-i patch deployments -n ailab-operation",
+            "auth can-i get nodes",
+            "auth can-i list pods -n default",
+        ):
+            self.assertIn(denied, self.source)
+        self.assertIn('secretName == "master-admin-farm-readonly"', self.source)
+        self.assertIn('mountPath == "/etc/provi/kubeconfigs/farm-readonly.yaml"', self.source)
+        self.assertIn('"kubernetes.io/metadata.name":"provi-monitoring"', self.source)
+        self.assertIn('"prometheus":"master-monitoring-kube-prometheus-prometheus"', self.source)
 
     def test_restore_is_initial_only_writable_datastore_with_no_apps_or_ingress(self):
         restore = self.source.rsplit("            restore)", 1)[1].split(
