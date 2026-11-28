@@ -360,7 +360,20 @@ class Phase5G2BMasterAdminWorkflowContractTests(unittest.TestCase):
         gate = self.source.split("require_fresh_restore_storage()", 1)[1].split(
             "assert_namespace_not_exposed()", 1
         )[0]
-        self.assertIn("helm list --all", gate)
+        self.assertNotIn("helm list --all", gate)
+        self.assertIn("helm list \\", gate)
+        for forbidden_status_flag in (
+            "--deployed",
+            "--failed",
+            "--pending",
+            "--superseded",
+            "--uninstalled",
+            "--uninstalling",
+        ):
+            with self.subTest(forbidden_status_flag=forbidden_status_flag):
+                self.assertNotIn(forbidden_status_flag, gate)
+        self.assertIn('--namespace "$MASTER_NAMESPACE"', gate)
+        self.assertIn('--filter "^${MASTER_RELEASE}$"', gate)
         for name in (
             "master-admin-mysql",
             "master-admin-redis",
