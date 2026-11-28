@@ -2,18 +2,19 @@ name: Deploy LAB Config Server
 run-name: "LAB config-server ${{ inputs.action }} — source ${{ inputs.ref }}"
 
 # LAB Config Server만 다룬다. 이 경로는 별도 LAB-MGMT 제한 runner에서만 실행된다.
-# Phase 7-B 전에는 entrypoint가 controller/CronJob/쓰기 기능의 API-only gate를 강제한다.
+# Phase 7-B activate는 root-owned profile과 기존 Kubernetes Secret 이름만 전달한다.
+# Secret 값은 GitHub에 복사하지 않고 LAB 클러스터 내부에서만 Pod에 mount한다.
 on:
   workflow_dispatch:
     inputs:
       action:
-        description: "probe: 읽기 전용 검증 / upgrade: API-only gate를 보존하며 기존 release 갱신"
+        description: "probe: 읽기 전용 / upgrade: API-only 유지 / activate: writer=0→canary→active"
         required: true
         type: choice
-        options: [probe, upgrade]
+        options: [probe, upgrade, activate]
         default: probe
       ref:
-        description: "probe/upgrade 공통: admin_infra-proposed의 보호된 릴리스 태그(vX.Y.Z)"
+        description: "probe/upgrade/activate 공통: admin_infra-proposed의 보호된 릴리스 태그(vX.Y.Z)"
         required: true
         type: string
 
@@ -40,13 +41,13 @@ jobs:
           set -euo pipefail
           test "$GITHUB_REF" = "refs/heads/main"
           [[ "$SOURCE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "probe와 upgrade는 모두 vX.Y.Z 릴리스 태그만 허용합니다." >&2
+            echo "probe, upgrade, activate는 모두 vX.Y.Z 릴리스 태그만 허용합니다." >&2
             exit 1
           }
           case "$ACTION" in
             probe)
               ;;
-            upgrade)
+            upgrade|activate)
               ;;
             *)
               echo "지원하지 않는 action: $ACTION" >&2
@@ -86,7 +87,7 @@ jobs:
 
   image:
     needs: source
-    if: inputs.action == 'upgrade'
+    if: inputs.action == 'upgrade' || inputs.action == 'activate'
     uses: ./.github/workflows/_build-config-server-image.yaml
     with:
       source_sha: ${{ needs.source.outputs.sha }}
@@ -118,6 +119,8 @@ jobs:
           IMAGE_TAG: ${{ needs.image.outputs.image_tag }}
           IMAGE_DIGEST: ${{ needs.image.outputs.image_digest }}
           KUBECONFIG: /etc/kubernetes/ci-deployer.conf
+          LAB_PHASE7B_PROFILE_SHA256: ${{ vars.LAB_PHASE7B_PROFILE_SHA256 }}
+          LAB_PHASE7B_EXCLUDED_BASELINE_SHA256: ${{ vars.LAB_PHASE7B_EXCLUDED_BASELINE_SHA256 }}
         run: |
           set -euo pipefail
           test "$(hostname)" = "lab-mgmt"
@@ -130,10 +133,18 @@ jobs:
           bash -n proposed/ops/cluster-config/deploy.sh
 
           args=(--target lab --action "$ACTION")
-          if [ "$ACTION" = "upgrade" ]; then
+          if [ "$ACTION" = "upgrade" ] || [ "$ACTION" = "activate" ]; then
             test "$IMAGE_TAG" = "$SOURCE_SHA"
             [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
             args+=(--image-tag "$IMAGE_TAG" --image-digest "$IMAGE_DIGEST")
+          fi
+          if [ "$ACTION" = "activate" ]; then
+            [[ "$LAB_PHASE7B_PROFILE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            [[ "$LAB_PHASE7B_EXCLUDED_BASELINE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            args+=(
+              --profile-sha256 "$LAB_PHASE7B_PROFILE_SHA256"
+              --excluded-baseline-sha256 "$LAB_PHASE7B_EXCLUDED_BASELINE_SHA256"
+            )
           fi
           bash proposed/ops/cluster-config/deploy.sh "${args[@]}"
 

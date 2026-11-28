@@ -56,14 +56,16 @@ class Phase5E1WorkflowContractTests(unittest.TestCase):
             self.assertIn("cancel-in-progress: false", source)
             self.assertIn("timeout-minutes: 120", source)
 
-    def test_probe_and_upgrade_source_is_release_tag_on_protected_main(self):
-        for filename, *_ in self.TARGETS:
+    def test_probe_upgrade_and_lab_activate_source_is_release_tag_on_protected_main(self):
+        for filename, target, *_ in self.TARGETS:
             with self.subTest(filename=filename):
                 source = (WORKFLOWS / filename).read_text()
-                self.assertIn(
-                    'description: "probe/upgrade 공통: admin_infra-proposed의 보호된 릴리스 태그(vX.Y.Z)"',
-                    source,
+                expected_description = (
+                    'description: "probe/upgrade/activate 공통: admin_infra-proposed의 보호된 릴리스 태그(vX.Y.Z)"'
+                    if target == "lab"
+                    else 'description: "probe/upgrade 공통: admin_infra-proposed의 보호된 릴리스 태그(vX.Y.Z)"'
                 )
+                self.assertIn(expected_description, source)
                 self.assertIn('[[ "$SOURCE_REF" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]', source)
                 self.assertIn(
                     'git -C proposed merge-base --is-ancestor "$sha" refs/remotes/origin/main', source
